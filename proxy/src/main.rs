@@ -63,6 +63,9 @@ struct FormatRequest {
     context: String,
     /// The editable section Haiku is allowed to reformat.
     text: String,
+    /// When true, add multi-speaker paragraph rules to the prompt.
+    #[serde(default)]
+    multi_speaker: bool,
 }
 
 const FORMAT_SYSTEM_PROMPT: &str = r#"You are a plain-text formatter for speech-to-text output.
@@ -124,10 +127,22 @@ async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
         format!("CONTEXT:\n{}\n\nEDITABLE:\n{}", body.context, body.text)
     };
 
+    let system_prompt = if body.multi_speaker {
+        format!(
+            "{}\n\nADDITIONAL RULE FOR MULTI-SPEAKER TRANSCRIPTS:\n\
+            Each speaker tag (e.g. [Name]) MUST begin a new paragraph (preceded by a blank line). \
+            Never merge text from different speakers into the same paragraph. \
+            Speaker tags look like [Name] at the start of a line and may be preceded by a timestamp like [MM:SS].",
+            FORMAT_SYSTEM_PROMPT
+        )
+    } else {
+        FORMAT_SYSTEM_PROMPT.to_string()
+    };
+
     let payload = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 4096,
-        "system": FORMAT_SYSTEM_PROMPT,
+        "system": system_prompt,
         "messages": [
             {
                 "role": "user",

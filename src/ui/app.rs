@@ -124,7 +124,11 @@ fn set_tab_title(title: &str) {
 /// Send the last unformatted chunk to Haiku.  If Haiku says formatting is
 /// needed it returns the formatted text which we splice back into the
 /// transcript.  Returns None if no change is needed or on error.
-async fn check_formatting(anthropic_key: &str, full_transcript: &str) -> Option<String> {
+async fn check_formatting(
+    anthropic_key: &str,
+    full_transcript: &str,
+    multi_speaker: bool,
+) -> Option<String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
@@ -159,10 +163,12 @@ async fn check_formatting(anthropic_key: &str, full_transcript: &str) -> Option<
 
     let total = chunks.len();
 
-    // Window: up to 3 chunks back. First 1 = context, last 2 = editable.
-    let win = total.min(3);
+    // Window size depends on speaker mode
+    let (max_win, max_editable) = if multi_speaker { (6, 4) } else { (3, 2) };
+    let win = total.min(max_win);
     let win_start = total - win;
-    let ctx_count = if win > 2 { win - 2 } else { 0 };
+    let editable = win.min(max_editable);
+    let ctx_count = win - editable;
     let edit_start = win_start + ctx_count;
 
     let context_text = if ctx_count > 0 {
@@ -199,6 +205,7 @@ async fn check_formatting(anthropic_key: &str, full_transcript: &str) -> Option<
         "anthropic_key": anthropic_key,
         "context": context_text,
         "text": editable_text,
+        "multi_speaker": multi_speaker,
     });
 
     let opts = web_sys::RequestInit::new();
@@ -263,13 +270,158 @@ enum RecState {
     Stopped,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TransferMode {
+    Copy,
+    TxtFile,
+    MdFile,
+    VsCode,
+}
+
+impl TransferMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::TxtFile => "TXT File",
+            Self::MdFile => "MD File",
+            Self::VsCode => "VS Code",
+        }
+    }
+    fn cookie_value(&self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::TxtFile => "txt",
+            Self::MdFile => "md",
+            Self::VsCode => "vscode",
+        }
+    }
+    fn from_cookie(s: &str) -> Self {
+        match s {
+            "txt" => Self::TxtFile,
+            "md" => Self::MdFile,
+            "vscode" => Self::VsCode,
+            _ => Self::Copy,
+        }
+    }
+}
+
+fn format_timestamp(elapsed_ms: f64) -> String {
+    let total_secs = (elapsed_ms / 1000.0) as u32;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("[{}:{:02}:{:02}]", h, m, s)
+    } else {
+        format!("[{:02}:{:02}]", m, s)
+    }
+}
+
+fn format_duration(elapsed_ms: f64) -> String {
+    let total_secs = (elapsed_ms / 1000.0) as u32;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
+}
+
+fn trigger_download(filename: &str, content: &str, mime_type: &str) {
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let document = match window.document() {
+        Some(d) => d,
+        None => return,
+    };
+    let parts = js_sys::Array::new();
+    parts.push(&wasm_bindgen::JsValue::from_str(content));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime_type);
+    let blob = match web_sys::Blob::new_with_str_sequence_and_options(&parts, &options) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let url = match web_sys::Url::create_object_url_with_blob(&blob) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    if let Ok(el) = document.create_element("a") {
+        let a: web_sys::HtmlAnchorElement = el.unchecked_into();
+        a.set_href(&url);
+        a.set_download(filename);
+        a.click();
+    }
+    let _ = web_sys::Url::revoke_object_url(&url);
+}
+
+fn generate_filename(ext: &str) -> String {
+    let date = js_sys::Date::new_0();
+    let y = date.get_full_year();
+    let mo = date.get_month() + 1;
+    let d = date.get_date();
+    let h = date.get_hours();
+    let mi = date.get_minutes();
+    let s = date.get_seconds();
+    format!("parley-{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}{s:02}.{ext}")
+}
+
+/// Build the committed line with optional timestamp and speaker label.
+/// Returns the new full transcript string.
+fn build_committed_text(
+    prev_transcript: &str,
+    turn_text: &str,
+    speaker_name: &str,
+    multi_speaker: bool,
+    show_labels: bool,
+    show_timestamps: bool,
+    session_start: f64,
+    last_speaker_name: &str,
+) -> String {
+    let same_speaker = last_speaker_name == speaker_name;
+    let mut line = String::new();
+    if show_timestamps && multi_speaker {
+        let elapsed = js_sys::Date::now() - session_start;
+        line.push_str(&format_timestamp(elapsed));
+        line.push(' ');
+    }
+    if show_labels && multi_speaker {
+        line.push_str(&format!("[{}] ", speaker_name));
+    }
+    line.push_str(turn_text);
+    let sep = if prev_transcript.is_empty() {
+        ""
+    } else if multi_speaker && !same_speaker {
+        "\n\n"
+    } else {
+        " "
+    };
+    format!("{prev_transcript}{sep}{line}")
+}
+
+/// Start capture for the given audio source.
+async fn start_capture_for_source(
+    source: &str,
+    on_audio: impl Fn(Vec<f32>) + 'static,
+) -> Result<BrowserCapture, wasm_bindgen::JsValue> {
+    match source {
+        "system" => BrowserCapture::start_system_audio(on_audio).await,
+        _ => BrowserCapture::start(on_audio).await,
+    }
+}
+
 // ── Root component ──────────────────────────────────────────────────
 #[component]
 pub fn App() -> Element {
-    // Signals
+    // ── Core signals ────────────────────────────────────────────────
     let mut rec_state = use_signal(|| RecState::Idle);
     let mut transcript = use_signal(String::new);
     let mut partial = use_signal(String::new);
+    let mut partial2 = use_signal(String::new);
     let mut status_msg = use_signal(|| "Ready".to_string());
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
     let mut show_settings = use_signal(|| false);
@@ -280,29 +432,76 @@ pub fn App() -> Element {
             .unwrap_or(5)
     });
     let mut anthropic_key = use_signal(|| load("parley_anthropic_key").unwrap_or_default());
-    let mut copied = use_signal(|| false);
     let mut countdown_secs: Signal<Option<u32>> = use_signal(|| None);
+    let mut auto_scroll = use_signal(|| true);
 
-    // Shared handles for audio + stt session (kept in Rc<RefCell<>>)
+    // ── Speaker settings ────────────────────────────────────────────
+    let mut speaker1_name =
+        use_signal(|| load("parley_speaker1_name").unwrap_or_else(|| "Me".to_string()));
+    let mut speaker2_name =
+        use_signal(|| load("parley_speaker2_name").unwrap_or_else(|| "Remote".to_string()));
+    let mut speaker1_source =
+        use_signal(|| load("parley_speaker1_source").unwrap_or_else(|| "mic".to_string()));
+    let mut speaker2_source =
+        use_signal(|| load("parley_speaker2_source").unwrap_or_else(|| "system".to_string()));
+    let mut speaker2_enabled = use_signal(|| {
+        load("parley_speaker2_enabled")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+    let mut show_labels = use_signal(|| {
+        load("parley_show_labels")
+            .map(|v| v == "true")
+            .unwrap_or(true)
+    });
+    let mut show_timestamps = use_signal(|| {
+        load("parley_show_timestamps")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+
+    // ── Transfer / export ───────────────────────────────────────────
+    let mut transfer_mode = use_signal(|| {
+        load("parley_transfer_mode")
+            .map(|s| TransferMode::from_cookie(&s))
+            .unwrap_or(TransferMode::Copy)
+    });
+    let mut show_transfer_menu = use_signal(|| false);
+    let mut prompt_filename = use_signal(|| {
+        load("parley_prompt_filename")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+    let mut transfer_feedback: Signal<Option<String>> = use_signal(|| None);
+
+    // ── Speaker 1 handles ───────────────────────────────────────────
     let capture_handle: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
     let session_handle: Signal<Option<Rc<RefCell<Option<AssemblyAiSession>>>>> =
         use_signal(|| None);
-
-    // Expose turn-tracking Rc handles so on_clear can reset them
     let mut current_turn_shared: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
     let mut needs_paragraph_check_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
-    let mut auto_scroll = use_signal(|| true);
 
-    // Auto-scroll the transcript textarea whenever its content changes
+    // ── Speaker 2 handles ───────────────────────────────────────────
+    let capture_handle2: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
+    let session_handle2: Signal<Option<Rc<RefCell<Option<AssemblyAiSession>>>>> =
+        use_signal(|| None);
+    let mut current_turn_shared2: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
+    let mut current_turn_order_shared2: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
+
+    // ── Shared recording state ──────────────────────────────────────
+    let mut session_start_time: Signal<Option<f64>> = use_signal(|| None);
+    let mut last_committed_speaker: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
+
+    // Auto-scroll
     use_effect(move || {
-        let _ = (transcript)(); // subscribe to transcript changes
+        let _ = (transcript)();
         if (auto_scroll)() {
             scroll_textarea_to_bottom();
         }
     });
 
-    // ── Record (core logic) ───────────────────────────────────────
+    // ── Record (core logic) ─────────────────────────────────────────
     let mut start_recording = move || {
         let key = (api_key)().trim().to_string();
         if key.is_empty() {
@@ -313,11 +512,14 @@ pub fn App() -> Element {
         status_msg.set("Connecting…".into());
         rec_state.set(RecState::Recording);
 
+        let multi = (speaker2_enabled)();
+        let s1_source = (speaker1_source)();
+        let s2_source = (speaker2_source)();
+
         spawn(async move {
-            // First, fetch a temporary streaming token from AssemblyAI.
-            // The v2 real-time endpoint requires a temp token, not the raw API key.
+            // Fetch token for speaker 1
             status_msg.set("Fetching token…".into());
-            let token = match fetch_temp_token(&key).await {
+            let token1 = match fetch_temp_token(&key).await {
                 Ok(t) => t,
                 Err(e) => {
                     error_msg.set(Some(format!("Token fetch failed: {e}")));
@@ -327,110 +529,135 @@ pub fn App() -> Element {
                 }
             };
 
+            // Fetch token for speaker 2 if multi-speaker
+            let token2 = if multi {
+                match fetch_temp_token(&key).await {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        error_msg.set(Some(format!("Token fetch (speaker 2) failed: {e}")));
+                        rec_state.set(RecState::Idle);
+                        status_msg.set("Ready".into());
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
             status_msg.set("Connecting…".into());
-            let session_rc: Rc<RefCell<Option<AssemblyAiSession>>> = Rc::new(RefCell::new(None));
 
-            // Idle timeout tracking: timestamp of last transcript event
+            // Shared state
             let last_activity = Rc::new(Cell::new(js_sys::Date::now()));
+            let start_time = js_sys::Date::now();
+            session_start_time.set(Some(start_time));
+            let last_speaker: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            last_committed_speaker.set(Some(last_speaker.clone()));
 
-            let mut transcript_clone = transcript.clone();
-            let mut partial_clone = partial.clone();
-            let last_activity2 = last_activity.clone();
+            // ── Speaker 1 session ───────────────────────────────────
+            let session1_rc: Rc<RefCell<Option<AssemblyAiSession>>> = Rc::new(RefCell::new(None));
 
-            // Track the current turn. Use turn_order from v3 to
-            // reliably detect when a new turn starts.
-            let current_turn: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-            let current_turn2 = current_turn.clone();
-            let current_turn_order: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
-            let current_turn_order2 = current_turn_order.clone();
-            let anthropic_key_val = (anthropic_key)();
-            let anthropic_key_for_ticker = anthropic_key_val.clone();
-            // Flag: when set to true, the ticker loop will fire a paragraph
-            // detection request for the current transcript text.
-            let needs_paragraph_check: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let needs_paragraph_check2 = needs_paragraph_check.clone();
+            let current_turn1: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            let current_turn_order1: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
+            let needs_para_check: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-            // Store Rc handles so on_clear can reset them
-            current_turn_shared.set(Some(current_turn.clone()));
-            current_turn_order_shared.set(Some(current_turn_order.clone()));
-            needs_paragraph_check_shared.set(Some(needs_paragraph_check.clone()));
+            current_turn_shared.set(Some(current_turn1.clone()));
+            current_turn_order_shared.set(Some(current_turn_order1.clone()));
+            needs_paragraph_check_shared.set(Some(needs_para_check.clone()));
 
-            let session = match AssemblyAiSession::connect(
-                &token,
-                move |text, _is_formatted, turn_order| {
-                    last_activity2.set(js_sys::Date::now());
-                    let text = text.replace('\n', " ").replace("  ", " ");
+            let session1 = {
+                let last_activity = last_activity.clone();
+                let last_speaker = last_speaker.clone();
+                let ct = current_turn1.clone();
+                let cto = current_turn_order1.clone();
+                let npc = needs_para_check.clone();
+                let mut t_sig = transcript.clone();
+                let mut p_sig = partial.clone();
 
-                    let prev_order = current_turn_order2.get();
-                    let is_new_turn = turn_order != prev_order;
+                match AssemblyAiSession::connect(
+                    &token1,
+                    move |text, _is_formatted, turn_order| {
+                        last_activity.set(js_sys::Date::now());
+                        let text = text.replace('\n', " ").replace("  ", " ");
 
-                    // New turn — commit old turn to transcript, then ask Haiku for paragraphs
-                    if is_new_turn && prev_order != u32::MAX {
-                        let old_turn = current_turn2.borrow().clone();
-                        if !old_turn.is_empty() {
-                            let cursor = get_cursor();
-                            let prev = (transcript_clone)();
-                            let sep = if prev.is_empty() { "" } else { " " };
-                            let combined = format!("{prev}{sep}{old_turn}");
-                            transcript_clone.set(combined.clone());
-                            if let Some((s, e)) = cursor {
-                                restore_cursor(s, e);
-                            }
-                            // Signal the ticker to fire paragraph detection
-                            if !anthropic_key_val.is_empty() {
-                                needs_paragraph_check2.set(true);
+                        let prev_order = cto.get();
+                        let is_new_turn = turn_order != prev_order;
+
+                        if is_new_turn && prev_order != u32::MAX {
+                            let old_turn = ct.borrow().clone();
+                            if !old_turn.is_empty() {
+                                let cursor = get_cursor();
+                                let prev = (t_sig)();
+                                let name = (speaker1_name)();
+                                let new_text = build_committed_text(
+                                    &prev,
+                                    &old_turn,
+                                    &name,
+                                    multi,
+                                    (show_labels)(),
+                                    (show_timestamps)(),
+                                    start_time,
+                                    &last_speaker.borrow(),
+                                );
+                                t_sig.set(new_text);
+                                *last_speaker.borrow_mut() = name;
+                                if let Some((s, e)) = cursor {
+                                    restore_cursor(s, e);
+                                }
+                                if !(anthropic_key)().is_empty() {
+                                    npc.set(true);
+                                }
                             }
                         }
-                    }
 
-                    // Update bottom box with current turn text
-                    current_turn_order2.set(turn_order);
-                    *current_turn2.borrow_mut() = text.clone();
-                    partial_clone.set(text);
-                },
-                {
-                    let mut rec_state = rec_state.clone();
-                    let mut status_msg = status_msg.clone();
-                    let mut error_msg = error_msg.clone();
-                    move |code: u16, reason: String| {
-                        rec_state.set(RecState::Stopped);
-                        if code == 4001 {
-                            error_msg.set(Some("Not authorized — check your API key".into()));
-                            status_msg.set("Auth error".into());
-                        } else if code == 1006 {
-                            let detail = if reason.is_empty() {
-                                "connection failed".to_string()
+                        cto.set(turn_order);
+                        *ct.borrow_mut() = text.clone();
+                        p_sig.set(text);
+                    },
+                    {
+                        let mut rec_state = rec_state.clone();
+                        let mut status_msg = status_msg.clone();
+                        let mut error_msg = error_msg.clone();
+                        move |code: u16, reason: String| {
+                            rec_state.set(RecState::Stopped);
+                            if code == 4001 {
+                                error_msg.set(Some("Not authorized — check your API key".into()));
+                                status_msg.set("Auth error".into());
+                            } else if code == 1006 {
+                                let detail = if reason.is_empty() {
+                                    "connection failed".to_string()
+                                } else {
+                                    reason
+                                };
+                                error_msg.set(Some(format!("WebSocket error: {detail}")));
+                                status_msg.set("Error".into());
+                            } else if code != 1000 {
+                                error_msg.set(Some(format!(
+                                    "Connection closed (code {code}): {reason}"
+                                )));
+                                status_msg.set("Disconnected".into());
                             } else {
-                                reason
-                            };
-                            error_msg.set(Some(format!("WebSocket error: {detail}")));
-                            status_msg.set("Error".into());
-                        } else if code != 1000 {
-                            error_msg
-                                .set(Some(format!("Connection closed (code {code}): {reason}")));
-                            status_msg.set("Disconnected".into());
-                        } else {
-                            status_msg.set("Disconnected".into());
+                                status_msg.set("Disconnected".into());
+                            }
                         }
+                    },
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error_msg.set(Some(format!("WS connect failed: {e:?}")));
+                        rec_state.set(RecState::Idle);
+                        status_msg.set("Ready".into());
+                        return;
                     }
-                },
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    error_msg.set(Some(format!("WS connect failed: {e:?}")));
-                    rec_state.set(RecState::Idle);
-                    status_msg.set("Ready".into());
-                    return;
                 }
             };
 
-            *session_rc.borrow_mut() = Some(session);
-            session_handle.clone().set(Some(session_rc.clone()));
+            *session1_rc.borrow_mut() = Some(session1);
+            session_handle.clone().set(Some(session1_rc.clone()));
 
-            // 3. Start audio capture
-            let session_rc2 = session_rc.clone();
-            match BrowserCapture::start(move |samples| {
-                if let Some(ref sess) = *session_rc2.borrow() {
+            // Start audio capture for speaker 1
+            let session1_rc2 = session1_rc.clone();
+            match start_capture_for_source(&s1_source, move |samples| {
+                if let Some(ref sess) = *session1_rc2.borrow() {
                     let _ = sess.send_audio(&samples);
                 }
             })
@@ -440,21 +667,163 @@ pub fn App() -> Element {
                     let cap_rc: Rc<RefCell<Option<BrowserCapture>>> =
                         Rc::new(RefCell::new(Some(cap)));
                     capture_handle.clone().set(Some(cap_rc.clone()));
+
+                    // ── Speaker 2 session (if multi-speaker) ────────
+                    let cap2_rc: Option<Rc<RefCell<Option<BrowserCapture>>>> =
+                        if let Some(ref tok2) = token2 {
+                            let session2_rc: Rc<RefCell<Option<AssemblyAiSession>>> =
+                                Rc::new(RefCell::new(None));
+
+                            let ct2: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+                            let cto2: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
+
+                            current_turn_shared2.set(Some(ct2.clone()));
+                            current_turn_order_shared2.set(Some(cto2.clone()));
+
+                            let session2 = {
+                                let last_activity = last_activity.clone();
+                                let last_speaker = last_speaker.clone();
+                                let ct = ct2.clone();
+                                let cto = cto2.clone();
+                                let npc = needs_para_check.clone();
+                                let mut t_sig = transcript.clone();
+                                let mut p2_sig = partial2.clone();
+
+                                match AssemblyAiSession::connect(
+                                    tok2,
+                                    move |text, _is_formatted, turn_order| {
+                                        last_activity.set(js_sys::Date::now());
+                                        let text = text.replace('\n', " ").replace("  ", " ");
+
+                                        let prev_order = cto.get();
+                                        let is_new_turn = turn_order != prev_order;
+
+                                        if is_new_turn && prev_order != u32::MAX {
+                                            let old_turn = ct.borrow().clone();
+                                            if !old_turn.is_empty() {
+                                                let cursor = get_cursor();
+                                                let prev = (t_sig)();
+                                                let name = (speaker2_name)();
+                                                let new_text = build_committed_text(
+                                                    &prev,
+                                                    &old_turn,
+                                                    &name,
+                                                    true,
+                                                    (show_labels)(),
+                                                    (show_timestamps)(),
+                                                    start_time,
+                                                    &last_speaker.borrow(),
+                                                );
+                                                t_sig.set(new_text);
+                                                *last_speaker.borrow_mut() = name;
+                                                if let Some((s, e)) = cursor {
+                                                    restore_cursor(s, e);
+                                                }
+                                                if !(anthropic_key)().is_empty() {
+                                                    npc.set(true);
+                                                }
+                                            }
+                                        }
+
+                                        cto.set(turn_order);
+                                        *ct.borrow_mut() = text.clone();
+                                        p2_sig.set(text);
+                                    },
+                                    {
+                                        let mut rec_state = rec_state.clone();
+                                        let mut status_msg = status_msg.clone();
+                                        let mut error_msg = error_msg.clone();
+                                        move |code: u16, reason: String| {
+                                            rec_state.set(RecState::Stopped);
+                                            if code != 1000 {
+                                                error_msg.set(Some(format!(
+                                                    "Speaker 2 disconnected (code {code}): {reason}"
+                                                )));
+                                            }
+                                            status_msg.set("Disconnected".into());
+                                        }
+                                    },
+                                ) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error_msg.set(Some(format!(
+                                            "Speaker 2 WS connect failed: {e:?}"
+                                        )));
+                                        rec_state.set(RecState::Idle);
+                                        status_msg.set("Ready".into());
+                                        // Clean up speaker 1
+                                        if let Some(cap) = cap_rc.borrow_mut().take() {
+                                            cap.stop();
+                                        }
+                                        if let Some(ref sess) = *session1_rc.borrow() {
+                                            let _ = sess.terminate();
+                                        }
+                                        return;
+                                    }
+                                }
+                            };
+
+                            *session2_rc.borrow_mut() = Some(session2);
+                            session_handle2.clone().set(Some(session2_rc.clone()));
+
+                            // Start audio capture for speaker 2
+                            let session2_rc2 = session2_rc.clone();
+                            match start_capture_for_source(&s2_source, move |samples| {
+                                if let Some(ref sess) = *session2_rc2.borrow() {
+                                    let _ = sess.send_audio(&samples);
+                                }
+                            })
+                            .await
+                            {
+                                Ok(cap2) => {
+                                    let c2rc: Rc<RefCell<Option<BrowserCapture>>> =
+                                        Rc::new(RefCell::new(Some(cap2)));
+                                    capture_handle2.clone().set(Some(c2rc.clone()));
+                                    Some(c2rc)
+                                }
+                                Err(e) => {
+                                    error_msg
+                                        .set(Some(format!("System audio capture failed: {e:?}")));
+                                    rec_state.set(RecState::Idle);
+                                    status_msg.set("Ready".into());
+                                    if let Some(cap) = cap_rc.borrow_mut().take() {
+                                        cap.stop();
+                                    }
+                                    if let Some(ref sess) = *session1_rc.borrow() {
+                                        let _ = sess.terminate();
+                                    }
+                                    if let Some(ref sess) = *session2_rc.borrow() {
+                                        let _ = sess.terminate();
+                                    }
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                     status_msg.set("Recording…".into());
 
-                    // 4. Spawn countdown ticker + idle timeout checker (1s interval)
+                    // ── Countdown ticker ─────────────────────────────
                     countdown_secs.set(Some(idle_minutes() * 60));
                     let last_activity = last_activity.clone();
-                    let session_for_timeout = session_rc.clone();
+                    let session_for_timeout = session1_rc.clone();
                     let cap_for_timeout = cap_rc;
+                    let session2_for_timeout = if multi {
+                        (session_handle2)().clone()
+                    } else {
+                        None
+                    };
+                    let cap2_for_timeout = cap2_rc;
                     let mut rec_state = rec_state.clone();
                     let mut status_msg = status_msg.clone();
-                    let mut partial = partial.clone();
-                    let mut transcript = transcript.clone();
+                    let mut partial_t = partial.clone();
+                    let mut partial2_t = partial2.clone();
+                    let mut transcript_t = transcript.clone();
                     let mut countdown_secs = countdown_secs.clone();
-                    // Share paragraph-check flag + key for ticker
-                    let ticker_needs_para = needs_paragraph_check.clone();
-                    let ticker_anthropic_key = anthropic_key_for_ticker;
+                    let ticker_needs_para = needs_para_check.clone();
+                    let ticker_last_speaker = last_speaker.clone();
+
                     spawn(async move {
                         let mut blink_on = false;
                         let mut beep_cooldown: u32 = 0;
@@ -472,16 +841,16 @@ pub fn App() -> Element {
                             let remaining_secs = (remaining_ms / 1000.0).ceil() as u32;
                             countdown_secs.set(Some(remaining_secs));
 
-                            // Check if the STT callback requested paragraph detection
+                            // Paragraph detection
                             if ticker_needs_para.get() {
                                 ticker_needs_para.set(false);
-                                let key = ticker_anthropic_key.clone();
-                                let mut t = transcript.clone();
-                                // Fire-and-forget: don't block the ticker
+                                let key = (anthropic_key)();
+                                let mut t = transcript_t.clone();
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty() {
-                                        if let Some(formatted) = check_formatting(&key, &text).await
+                                        if let Some(formatted) =
+                                            check_formatting(&key, &text, multi).await
                                         {
                                             let cursor = get_cursor();
                                             t.set(formatted);
@@ -493,7 +862,7 @@ pub fn App() -> Element {
                                 });
                             }
 
-                            // 1-minute warning: beep every 10s + tab blink
+                            // 1-minute warning
                             if remaining_secs <= 60 && remaining_secs > 0 {
                                 if beep_cooldown == 0 {
                                     play_beep();
@@ -514,20 +883,63 @@ pub fn App() -> Element {
                             }
 
                             if remaining_secs == 0 {
-                                // Auto-disconnect
                                 set_tab_title("Parley");
+                                // Stop speaker 1
                                 if let Some(cap) = cap_for_timeout.borrow_mut().take() {
                                     cap.stop();
                                 }
                                 if let Some(ref sess) = *session_for_timeout.borrow() {
                                     let _ = sess.terminate();
                                 }
-                                let p = (partial)();
-                                if !p.is_empty() {
-                                    let prev = (transcript)();
-                                    let sep = if prev.is_empty() { "" } else { " " };
-                                    transcript.set(format!("{prev}{sep}{p}"));
-                                    partial.set(String::new());
+                                // Stop speaker 2
+                                if let Some(ref c2rc) = cap2_for_timeout {
+                                    if let Some(cap2) = c2rc.borrow_mut().take() {
+                                        cap2.stop();
+                                    }
+                                }
+                                if let Some(ref s2rc) = session2_for_timeout {
+                                    if let Some(ref sess) = *s2rc.borrow() {
+                                        let _ = sess.terminate();
+                                    }
+                                }
+                                // Flush partials
+                                let p1 = (partial_t)();
+                                if !p1.is_empty() {
+                                    let prev = (transcript_t)();
+                                    let name = (speaker1_name)();
+                                    let new_text = build_committed_text(
+                                        &prev,
+                                        &p1,
+                                        &name,
+                                        multi,
+                                        (show_labels)(),
+                                        (show_timestamps)(),
+                                        start_time,
+                                        &ticker_last_speaker.borrow(),
+                                    );
+                                    transcript_t.set(new_text);
+                                    *ticker_last_speaker.borrow_mut() = name;
+                                    partial_t.set(String::new());
+                                }
+                                if multi {
+                                    let p2 = (partial2_t)();
+                                    if !p2.is_empty() {
+                                        let prev = (transcript_t)();
+                                        let name = (speaker2_name)();
+                                        let new_text = build_committed_text(
+                                            &prev,
+                                            &p2,
+                                            &name,
+                                            true,
+                                            (show_labels)(),
+                                            (show_timestamps)(),
+                                            start_time,
+                                            &ticker_last_speaker.borrow(),
+                                        );
+                                        transcript_t.set(new_text);
+                                        *ticker_last_speaker.borrow_mut() = name;
+                                        partial2_t.set(String::new());
+                                    }
                                 }
                                 rec_state.set(RecState::Stopped);
                                 status_msg.set("Idle timeout \u{2014} disconnected".into());
@@ -539,8 +951,7 @@ pub fn App() -> Element {
                 }
                 Err(e) => {
                     error_msg.set(Some(format!("Mic access denied: {e:?}")));
-                    // Clean up session
-                    if let Some(ref sess) = *session_rc.borrow() {
+                    if let Some(ref sess) = *session1_rc.borrow() {
                         let _ = sess.terminate();
                     }
                     rec_state.set(RecState::Idle);
@@ -554,8 +965,8 @@ pub fn App() -> Element {
         start_recording();
     };
 
-    // ── End Turn (force-commit current turn without stopping) ────
-    let on_end_turn = move |_| {
+    // ── End Turn (speaker 1) ────────────────────────────────────────
+    let on_end_turn1 = move |_| {
         if let Some(sess_rc) = (session_handle)().as_ref() {
             if let Some(ref sess) = *sess_rc.borrow() {
                 let _ = sess.force_endpoint();
@@ -563,12 +974,28 @@ pub fn App() -> Element {
         }
         let p = (partial)();
         if !p.is_empty() {
+            let multi = (speaker2_enabled)();
+            let name = (speaker1_name)();
             let prev = (transcript)();
-            let sep = if prev.is_empty() { "" } else { " " };
-            transcript.set(format!("{prev}{sep}{p}"));
+            let ls = (last_committed_speaker)();
+            let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+            let start = (session_start_time)().unwrap_or(0.0);
+            let new_text = build_committed_text(
+                &prev,
+                &p,
+                &name,
+                multi,
+                (show_labels)(),
+                (show_timestamps)(),
+                start,
+                &ls_name,
+            );
+            transcript.set(new_text);
+            if let Some(ref ls_rc) = ls {
+                *ls_rc.borrow_mut() = name;
+            }
             partial.set(String::new());
         }
-        // Reset shared turn state so the callback treats the next event as a fresh turn
         if let Some(ct) = (current_turn_shared)().as_ref() {
             *ct.borrow_mut() = String::new();
         }
@@ -577,36 +1004,127 @@ pub fn App() -> Element {
         }
     };
 
+    // ── End Turn (speaker 2) ────────────────────────────────────────
+    let on_end_turn2 = move |_| {
+        if let Some(sess_rc) = (session_handle2)().as_ref() {
+            if let Some(ref sess) = *sess_rc.borrow() {
+                let _ = sess.force_endpoint();
+            }
+        }
+        let p = (partial2)();
+        if !p.is_empty() {
+            let name = (speaker2_name)();
+            let prev = (transcript)();
+            let ls = (last_committed_speaker)();
+            let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+            let start = (session_start_time)().unwrap_or(0.0);
+            let new_text = build_committed_text(
+                &prev,
+                &p,
+                &name,
+                true,
+                (show_labels)(),
+                (show_timestamps)(),
+                start,
+                &ls_name,
+            );
+            transcript.set(new_text);
+            if let Some(ref ls_rc) = ls {
+                *ls_rc.borrow_mut() = name;
+            }
+            partial2.set(String::new());
+        }
+        if let Some(ct) = (current_turn_shared2)().as_ref() {
+            *ct.borrow_mut() = String::new();
+        }
+        if let Some(cto) = (current_turn_order_shared2)().as_ref() {
+            cto.set(u32::MAX);
+        }
+    };
+
     // ── Stop ────────────────────────────────────────────────────────
     let on_stop = move |_| {
-        // Stop audio capture
+        let multi = (speaker2_enabled)();
+        // Stop speaker 1 capture
         if let Some(cap_rc) = (capture_handle)().as_ref() {
             if let Some(cap) = cap_rc.borrow_mut().take() {
                 cap.stop();
             }
         }
-        // Terminate session
         if let Some(sess_rc) = (session_handle)().as_ref() {
             if let Some(ref sess) = *sess_rc.borrow() {
                 let _ = sess.terminate();
             }
         }
-        // Flush partial into transcript
-        let p = (partial)();
-        if !p.is_empty() {
+        // Stop speaker 2 capture
+        if multi {
+            if let Some(cap_rc) = (capture_handle2)().as_ref() {
+                if let Some(cap) = cap_rc.borrow_mut().take() {
+                    cap.stop();
+                }
+            }
+            if let Some(sess_rc) = (session_handle2)().as_ref() {
+                if let Some(ref sess) = *sess_rc.borrow() {
+                    let _ = sess.terminate();
+                }
+            }
+        }
+        // Flush speaker 1 partial
+        let start = (session_start_time)().unwrap_or(0.0);
+        let ls = (last_committed_speaker)();
+        let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+        let p1 = (partial)();
+        if !p1.is_empty() {
+            let name = (speaker1_name)();
             let prev = (transcript)();
-            let sep = if prev.is_empty() { "" } else { " " };
-            transcript.set(format!("{prev}{sep}{p}"));
+            let new_text = build_committed_text(
+                &prev,
+                &p1,
+                &name,
+                multi,
+                (show_labels)(),
+                (show_timestamps)(),
+                start,
+                &ls_name,
+            );
+            transcript.set(new_text);
+            if let Some(ref ls_rc) = ls {
+                *ls_rc.borrow_mut() = name;
+            }
             partial.set(String::new());
         }
-        // Run paragraph detection on the final text
+        // Flush speaker 2 partial
+        if multi {
+            let p2 = (partial2)();
+            if !p2.is_empty() {
+                let name = (speaker2_name)();
+                let prev = (transcript)();
+                let ls_name2 = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+                let new_text = build_committed_text(
+                    &prev,
+                    &p2,
+                    &name,
+                    true,
+                    (show_labels)(),
+                    (show_timestamps)(),
+                    start,
+                    &ls_name2,
+                );
+                transcript.set(new_text);
+                if let Some(ref ls_rc) = ls {
+                    *ls_rc.borrow_mut() = name;
+                }
+                partial2.set(String::new());
+            }
+        }
+        // Run paragraph detection
         let akey = (anthropic_key)();
         if !akey.is_empty() {
             let mut t = transcript.clone();
             spawn(async move {
                 let text = (t)();
                 if !text.is_empty() {
-                    if let Some(formatted) = check_formatting(&akey, &text).await {
+                    if let Some(formatted) = check_formatting(&akey, &text, multi).await {
                         let cursor = get_cursor();
                         t.set(formatted);
                         if let Some((s, e)) = cursor {
@@ -625,22 +1143,103 @@ pub fn App() -> Element {
         start_recording();
     };
 
-    // ── Copy ────────────────────────────────────────────────────────
-    let on_copy = move |_| {
+    // ── Transfer action ─────────────────────────────────────────────
+    let on_transfer = move |_| {
         let text = (transcript)();
         if text.is_empty() {
             return;
         }
-        if let Some(window) = web_sys::window() {
-            let clipboard = window.navigator().clipboard();
-            {
-                let _ = clipboard.write_text(&text);
-                copied.set(true);
-                // Reset after 2s
+        let mode = (transfer_mode)();
+        match mode {
+            TransferMode::Copy => {
+                if let Some(window) = web_sys::window() {
+                    let clipboard = window.navigator().clipboard();
+                    let _ = clipboard.write_text(&text);
+                    transfer_feedback.set(Some("✓ Copied".into()));
+                    spawn(async move {
+                        gloo_timers::future::TimeoutFuture::new(2_000).await;
+                        transfer_feedback.set(None);
+                    });
+                }
+            }
+            TransferMode::TxtFile => {
+                let filename = if (prompt_filename)() {
+                    let default = generate_filename("txt");
+                    match web_sys::window()
+                        .and_then(|w| w.prompt_with_message_and_default("Save as:", &default).ok())
+                        .flatten()
+                    {
+                        Some(f) if !f.is_empty() => f,
+                        _ => return,
+                    }
+                } else {
+                    generate_filename("txt")
+                };
+                trigger_download(&filename, &text, "text/plain");
+                let fb = if (prompt_filename)() {
+                    format!("✓ Saved as {filename}")
+                } else {
+                    "✓ Saved".into()
+                };
+                transfer_feedback.set(Some(fb));
                 spawn(async move {
                     gloo_timers::future::TimeoutFuture::new(2_000).await;
-                    copied.set(false);
+                    transfer_feedback.set(None);
                 });
+            }
+            TransferMode::MdFile => {
+                let multi = (speaker2_enabled)();
+                let duration_ms = (session_start_time)()
+                    .map(|st| js_sys::Date::now() - st)
+                    .unwrap_or(0.0);
+                let md_content = if multi {
+                    let s1 = (speaker1_name)();
+                    let s2 = (speaker2_name)();
+                    let date = js_sys::Date::new_0();
+                    let iso = date.to_iso_string();
+                    format!(
+                        "---\ntitle: Parley Transcript\ndate: {}\nspeakers:\n  - {}\n  - {}\nduration: \"{}\"\n---\n\n{}",
+                        String::from(iso),
+                        s1,
+                        s2,
+                        format_duration(duration_ms),
+                        text
+                    )
+                } else {
+                    let date = js_sys::Date::new_0();
+                    let iso = date.to_iso_string();
+                    format!(
+                        "# Parley Transcript\n\nDate: {}\n\n{}",
+                        String::from(iso),
+                        text
+                    )
+                };
+                let filename = if (prompt_filename)() {
+                    let default = generate_filename("md");
+                    match web_sys::window()
+                        .and_then(|w| w.prompt_with_message_and_default("Save as:", &default).ok())
+                        .flatten()
+                    {
+                        Some(f) if !f.is_empty() => f,
+                        _ => return,
+                    }
+                } else {
+                    generate_filename("md")
+                };
+                trigger_download(&filename, &md_content, "text/markdown");
+                let fb = if (prompt_filename)() {
+                    format!("✓ Saved as {filename}")
+                } else {
+                    "✓ Saved".into()
+                };
+                transfer_feedback.set(Some(fb));
+                spawn(async move {
+                    gloo_timers::future::TimeoutFuture::new(2_000).await;
+                    transfer_feedback.set(None);
+                });
+            }
+            TransferMode::VsCode => {
+                // Future: VS Code extension bridge
             }
         }
     };
@@ -649,11 +1248,17 @@ pub fn App() -> Element {
     let on_clear = move |_| {
         transcript.set(String::new());
         partial.set(String::new());
-        // Reset shared turn state so stale turns don't leak into transcript
+        partial2.set(String::new());
         if let Some(ct) = (current_turn_shared)().as_ref() {
             *ct.borrow_mut() = String::new();
         }
         if let Some(cto) = (current_turn_order_shared)().as_ref() {
+            cto.set(u32::MAX);
+        }
+        if let Some(ct) = (current_turn_shared2)().as_ref() {
+            *ct.borrow_mut() = String::new();
+        }
+        if let Some(cto) = (current_turn_order_shared2)().as_ref() {
             cto.set(u32::MAX);
         }
         if let Some(npc) = (needs_paragraph_check_shared)().as_ref() {
@@ -667,7 +1272,14 @@ pub fn App() -> Element {
 
     // ── Derived values ──────────────────────────────────────────────
     let state = rec_state();
-    let has_text = !(transcript)().is_empty() || !(partial)().is_empty();
+    let multi = (speaker2_enabled)();
+    let has_text = !(transcript)().is_empty()
+        || !(partial)().is_empty()
+        || (multi && !(partial2)().is_empty());
+    let s1_name_val = (speaker1_name)();
+    let s2_name_val = (speaker2_name)();
+    let tm = (transfer_mode)();
+    let fb = (transfer_feedback)();
 
     // ── Render ──────────────────────────────────────────────────────
     rsx! {
@@ -685,7 +1297,7 @@ pub fn App() -> Element {
                     class: "gear-btn",
                     title: "Settings",
                     onclick: move |_| show_settings.set(!show_settings()),
-                    "⚙️"
+                    "\u{2699}\u{fe0f}"
                 }
             }
 
@@ -696,17 +1308,17 @@ pub fn App() -> Element {
                     button {
                         class: "error-dismiss",
                         onclick: move |_| error_msg.set(None),
-                        "✕"
+                        "\u{2715}"
                     }
                 }
             }
 
-            // ── Finalized transcript (editable) ────────────────────
+            // ── Transcript (editable) ───────────────────────────────
             div { class: "transcript-area",
                 textarea {
                     id: TEXTAREA_ID,
                     class: "transcript-edit",
-                    placeholder: "Transcribed text will appear here…",
+                    placeholder: "Transcribed text will appear here\u{2026}",
                     value: "{transcript}",
                     oninput: move |evt: Event<FormData>| {
                         transcript.set(evt.value());
@@ -724,49 +1336,172 @@ pub fn App() -> Element {
                 }
             }
 
-            // ── Current turn (read-only, always visible) ─────────────
-            div { class: "current-turn",
-                if state == RecState::Recording {
-                    span { class: "current-turn-label", "Speaking…" }
-                    p { class: "current-turn-text",
-                        if (partial)().is_empty() {
-                            "…"
+            // ── Current turn boxes ──────────────────────────────────
+            if multi {
+                // Dual current-turn layout
+                div { class: "current-turns-row",
+                    div { class: "current-turn current-turn-half",
+                        if state == RecState::Recording {
+                            span { class: "current-turn-label", "{s1_name_val} speaking\u{2026}" }
+                            p { class: "current-turn-text",
+                                if (partial)().is_empty() {
+                                    "\u{2026}"
+                                } else {
+                                    "{partial}"
+                                }
+                            }
+                            button {
+                                class: "btn btn-endturn-inline",
+                                onclick: on_end_turn1,
+                                "\u{23ce} End Turn"
+                            }
                         } else {
-                            "{partial}"
+                            span { class: "current-turn-label current-turn-idle", "{s1_name_val}" }
+                            p { class: "current-turn-text current-turn-placeholder",
+                                "Not recording"
+                            }
                         }
                     }
-                } else {
-                    span { class: "current-turn-label current-turn-idle", "Current turn" }
-                    p { class: "current-turn-text current-turn-placeholder", "Not recording" }
+                    div { class: "current-turn current-turn-half",
+                        if state == RecState::Recording {
+                            span { class: "current-turn-label", "{s2_name_val} speaking\u{2026}" }
+                            p { class: "current-turn-text",
+                                if (partial2)().is_empty() {
+                                    "\u{2026}"
+                                } else {
+                                    "{partial2}"
+                                }
+                            }
+                            button {
+                                class: "btn btn-endturn-inline",
+                                onclick: on_end_turn2,
+                                "\u{23ce} End Turn"
+                            }
+                        } else {
+                            span { class: "current-turn-label current-turn-idle", "{s2_name_val}" }
+                            p { class: "current-turn-text current-turn-placeholder",
+                                "Not recording"
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Single current-turn layout
+                div { class: "current-turn",
+                    if state == RecState::Recording {
+                        span { class: "current-turn-label", "Speaking\u{2026}" }
+                        p { class: "current-turn-text",
+                            if (partial)().is_empty() {
+                                "\u{2026}"
+                            } else {
+                                "{partial}"
+                            }
+                        }
+                    } else {
+                        span { class: "current-turn-label current-turn-idle", "Current turn" }
+                        p { class: "current-turn-text current-turn-placeholder", "Not recording" }
+                    }
                 }
             }
 
             // ── Button bar ──────────────────────────────────────────
             div { class: "button-bar",
-                // Record (visible when idle, or stopped with no text)
                 if state == RecState::Idle || (state == RecState::Stopped && !has_text) {
-                    button { class: "btn btn-record", onclick: on_record, "● Record" }
+                    button { class: "btn btn-record", onclick: on_record, "\u{25cf} Record" }
                 }
-                // Stop (visible when recording)
                 if state == RecState::Recording {
-                    button { class: "btn btn-stop", onclick: on_stop, "■ Stop" }
-                    button { class: "btn btn-endturn", onclick: on_end_turn, "⏎ End Turn" }
+                    button { class: "btn btn-stop", onclick: on_stop, "\u{25a0} Stop" }
+                    if !multi {
+                        button { class: "btn btn-endturn", onclick: on_end_turn1, "\u{23ce} End Turn" }
+                    }
                 }
-                // Continue (visible when stopped and has text)
                 if state == RecState::Stopped && has_text {
-                    button { class: "btn btn-continue", onclick: on_continue, "● Continue" }
+                    button { class: "btn btn-continue", onclick: on_continue, "\u{25cf} Continue" }
                 }
-                // Copy
+                // Transfer combo button
                 if has_text {
-                    button { class: "btn btn-copy", onclick: on_copy,
-                        if copied() {
-                            "✓ Copied"
-                        } else {
-                            "Copy"
+                    div { class: "transfer-combo",
+                        button {
+                            class: "btn btn-transfer-main",
+                            onclick: on_transfer,
+                            if let Some(ref feedback) = fb {
+                                "{feedback}"
+                            } else {
+                                "{tm.label()}"
+                            }
+                        }
+                        button {
+                            class: "btn btn-transfer-arrow",
+                            onclick: move |_| show_transfer_menu.set(!(show_transfer_menu)()),
+                            "\u{25be}"
+                        }
+                        if (show_transfer_menu)() {
+                            div {
+                                class: "transfer-overlay",
+                                onclick: move |_| show_transfer_menu.set(false),
+                            }
+                            div { class: "transfer-menu",
+                                button {
+                                    class: if tm == TransferMode::Copy { "transfer-option active" } else { "transfer-option" },
+                                    onclick: move |_| {
+                                        transfer_mode.set(TransferMode::Copy);
+                                        save("parley_transfer_mode", TransferMode::Copy.cookie_value());
+                                        show_transfer_menu.set(false);
+                                    },
+                                    if tm == TransferMode::Copy {
+                                        "\u{2713} Copy"
+                                    } else {
+                                        "  Copy"
+                                    }
+                                }
+                                button {
+                                    class: if tm == TransferMode::TxtFile { "transfer-option active" } else { "transfer-option" },
+                                    onclick: move |_| {
+                                        transfer_mode.set(TransferMode::TxtFile);
+                                        save("parley_transfer_mode", TransferMode::TxtFile.cookie_value());
+                                        show_transfer_menu.set(false);
+                                    },
+                                    if tm == TransferMode::TxtFile {
+                                        "\u{2713} TXT File"
+                                    } else {
+                                        "  TXT File"
+                                    }
+                                }
+                                button {
+                                    class: if tm == TransferMode::MdFile { "transfer-option active" } else { "transfer-option" },
+                                    onclick: move |_| {
+                                        transfer_mode.set(TransferMode::MdFile);
+                                        save("parley_transfer_mode", TransferMode::MdFile.cookie_value());
+                                        show_transfer_menu.set(false);
+                                    },
+                                    if tm == TransferMode::MdFile {
+                                        "\u{2713} MD File"
+                                    } else {
+                                        "  MD File"
+                                    }
+                                }
+                                button {
+                                    class: "transfer-option disabled",
+                                    disabled: true,
+                                    "  VS Code (coming soon)"
+                                }
+                                hr { class: "transfer-divider" }
+                                label { class: "transfer-option transfer-checkbox",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: "{prompt_filename}",
+                                        onchange: move |evt: Event<FormData>| {
+                                            let v = evt.checked();
+                                            prompt_filename.set(v);
+                                            save("parley_prompt_filename", if v { "true" } else { "false" });
+                                        },
+                                    }
+                                    "Prompt for filename"
+                                }
+                            }
                         }
                     }
                 }
-                // Clear
                 if has_text {
                     button { class: "btn btn-clear", onclick: on_clear, "Clear" }
                 }
@@ -792,7 +1527,7 @@ pub fn App() -> Element {
                         id: "api-key",
                         r#type: "password",
                         class: "settings-input",
-                        placeholder: "Enter your API key…",
+                        placeholder: "Enter your API key\u{2026}",
                         value: "{api_key}",
                         oninput: move |evt: Event<FormData>| {
                             let val = evt.value();
@@ -839,6 +1574,125 @@ pub fn App() -> Element {
                         "If set, Claude Haiku will automatically detect paragraph breaks in your transcript."
                     }
 
+                    // ── Speakers section ────────────────────────────
+                    div { class: "settings-section-header", "Speakers" }
+
+                    // Speaker 1
+                    div { class: "speaker-card",
+                        div { class: "speaker-card-title", "Speaker 1 (You)" }
+                        div { class: "speaker-card-row",
+                            div { class: "speaker-field",
+                                label { "Name" }
+                                input {
+                                    r#type: "text",
+                                    class: "settings-input",
+                                    value: "{speaker1_name}",
+                                    oninput: move |evt: Event<FormData>| {
+                                        let val = evt.value();
+                                        speaker1_name.set(val.clone());
+                                        save("parley_speaker1_name", &val);
+                                    },
+                                }
+                            }
+                            div { class: "speaker-field",
+                                label { "Source" }
+                                select {
+                                    class: "settings-input",
+                                    value: "{speaker1_source}",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let val = evt.value();
+                                        speaker1_source.set(val.clone());
+                                        save("parley_speaker1_source", &val);
+                                    },
+                                    option { value: "mic", "Microphone" }
+                                    option { value: "system", "System Audio" }
+                                }
+                            }
+                        }
+                    }
+
+                    // Speaker 2
+                    div { class: "speaker-card",
+                        div { class: "speaker-card-title",
+                            span { "Speaker 2 (Remote)" }
+                            label { class: "toggle-switch",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{speaker2_enabled}",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let v = evt.checked();
+                                        speaker2_enabled.set(v);
+                                        save("parley_speaker2_enabled", if v { "true" } else { "false" });
+                                    },
+                                }
+                                span { class: "toggle-slider" }
+                            }
+                        }
+                        if (speaker2_enabled)() {
+                            div { class: "speaker-card-row",
+                                div { class: "speaker-field",
+                                    label { "Name" }
+                                    input {
+                                        r#type: "text",
+                                        class: "settings-input",
+                                        value: "{speaker2_name}",
+                                        oninput: move |evt: Event<FormData>| {
+                                            let val = evt.value();
+                                            speaker2_name.set(val.clone());
+                                            save("parley_speaker2_name", &val);
+                                        },
+                                    }
+                                }
+                                div { class: "speaker-field",
+                                    label { "Source" }
+                                    select {
+                                        class: "settings-input",
+                                        value: "{speaker2_source}",
+                                        onchange: move |evt: Event<FormData>| {
+                                            let val = evt.value();
+                                            speaker2_source.set(val.clone());
+                                            save("parley_speaker2_source", &val);
+                                        },
+                                        option { value: "mic", "Microphone" }
+                                        option { value: "system", "System Audio" }
+                                    }
+                                }
+                            }
+
+                            // Options
+                            div { class: "speaker-options",
+                                label { class: "option-row",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: "{show_labels}",
+                                        onchange: move |evt: Event<FormData>| {
+                                            let v = evt.checked();
+                                            show_labels.set(v);
+                                            save("parley_show_labels", if v { "true" } else { "false" });
+                                        },
+                                    }
+                                    "Speaker labels ([Name] prefix)"
+                                }
+                                label { class: "option-row",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: "{show_timestamps}",
+                                        onchange: move |evt: Event<FormData>| {
+                                            let v = evt.checked();
+                                            show_timestamps.set(v);
+                                            save("parley_show_timestamps", if v { "true" } else { "false" });
+                                        },
+                                    }
+                                    "Timestamps ([MM:SS] prefix)"
+                                }
+                            }
+
+                            p { class: "settings-hint settings-warn",
+                                "\u{26a0} Two speakers = 2\u{00d7} AssemblyAI usage"
+                            }
+                        }
+                    }
+
                     button {
                         class: "btn btn-close-settings",
                         onclick: move |_| show_settings.set(false),
@@ -862,7 +1716,6 @@ body {
 }
 
 .parley-root {
-    max-width: 720px;
     margin: 0 auto;
     padding: 2rem 1.5rem;
     display: flex;
@@ -896,7 +1749,7 @@ body {
 }
 .gear-btn:hover { color: #e0e0e0; background: #16213e; }
 
-/* Countdown (inline in header) */
+/* Countdown */
 .countdown {
     font-size: 1.3rem;
     font-weight: 600;
@@ -950,10 +1803,6 @@ body {
     line-height: 1.7;
     font-size: 1.05rem;
 }
-.placeholder {
-    color: #8888aa;
-    font-style: italic;
-}
 .transcript-edit {
     flex: 1;
     width: 100%;
@@ -968,18 +1817,8 @@ body {
     line-height: inherit;
     cursor: text;
 }
-.final-text p {
-    margin-bottom: 0.8rem;
-}
-.partial-text {
-    color: #8888aa;
-    font-style: italic;
-    border-left: 3px solid #0f3460;
-    padding-left: 0.8rem;
-    margin-top: 0.5rem;
-}
 
-/* Current turn box */
+/* Current turn boxes */
 .current-turn {
     background: #0f3460;
     border-radius: 10px;
@@ -990,6 +1829,15 @@ body {
     border-left: 3px solid #4ecca3;
     max-height: 30vh;
     overflow-y: auto;
+}
+.current-turns-row {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+.current-turn-half {
+    flex: 1;
+    margin-bottom: 0;
 }
 .current-turn-label {
     display: block;
@@ -1004,12 +1852,21 @@ body {
     color: #c0c0d0;
     font-style: italic;
 }
-.current-turn-idle {
-    color: #8888aa;
+.current-turn-idle { color: #8888aa; }
+.current-turn-placeholder { color: #555570; }
+.btn-endturn-inline {
+    margin-top: 0.6rem;
+    padding: 0.35rem 0.8rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    background: #16213e;
+    color: #4ecca3;
+    transition: background 0.15s;
 }
-.current-turn-placeholder {
-    color: #555570;
-}
+.btn-endturn-inline:hover { background: #1a4a7a; }
 
 /* Auto-scroll toggle */
 .auto-scroll-toggle {
@@ -1033,6 +1890,7 @@ body {
     gap: 0.75rem;
     margin-bottom: 1rem;
     flex-wrap: wrap;
+    align-items: flex-start;
 }
 .btn {
     padding: 0.65rem 1.4rem;
@@ -1047,18 +1905,90 @@ body {
 
 .btn-record { background: #e94560; color: #fff; }
 .btn-record:hover { background: #ff6b81; }
-
 .btn-stop { background: #e94560; color: #fff; }
 .btn-stop:hover { background: #ff6b81; }
-
 .btn-continue { background: #4ecca3; color: #1a1a2e; }
 .btn-continue:hover { background: #6ee6bb; }
-
-.btn-copy { background: #0f3460; color: #e0e0e0; }
-.btn-copy:hover { background: #1a4a7a; }
-
+.btn-endturn { background: #0f3460; color: #e0e0e0; }
+.btn-endturn:hover { background: #1a4a7a; }
 .btn-clear { background: transparent; color: #8888aa; border: 1px solid #8888aa; }
 .btn-clear:hover { color: #e0e0e0; border-color: #e0e0e0; }
+
+/* Transfer combo button */
+.transfer-combo {
+    position: relative;
+    display: inline-flex;
+}
+.btn-transfer-main {
+    background: #0f3460;
+    color: #e0e0e0;
+    border-radius: 8px 0 0 8px;
+    padding: 0.65rem 1rem;
+}
+.btn-transfer-main:hover { background: #1a4a7a; }
+.btn-transfer-arrow {
+    background: #0f3460;
+    color: #e0e0e0;
+    border-radius: 0 8px 8px 0;
+    padding: 0.65rem 0.5rem;
+    border-left: 1px solid #1a1a2e;
+    font-size: 0.85rem;
+}
+.btn-transfer-arrow:hover { background: #1a4a7a; }
+.transfer-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 90;
+}
+.transfer-menu {
+    position: absolute;
+    bottom: 110%;
+    left: 0;
+    min-width: 200px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    z-index: 91;
+    padding: 0.3rem 0;
+    overflow: hidden;
+}
+.transfer-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: #e0e0e0;
+    padding: 0.5rem 1rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    font-family: monospace;
+    white-space: pre;
+}
+.transfer-option:hover { background: #0f3460; }
+.transfer-option.active { color: #4ecca3; }
+.transfer-option.disabled {
+    color: #555570;
+    cursor: default;
+}
+.transfer-option.disabled:hover { background: none; }
+.transfer-divider {
+    border: none;
+    border-top: 1px solid #0f3460;
+    margin: 0.3rem 0;
+}
+.transfer-checkbox {
+    display: flex !important;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-family: inherit;
+}
+.transfer-checkbox input {
+    accent-color: #4ecca3;
+    cursor: pointer;
+}
 
 /* Status bar */
 .status-bar {
@@ -1094,7 +2024,7 @@ body {
     position: fixed;
     top: 0;
     right: 0;
-    width: 340px;
+    width: 380px;
     max-width: 90vw;
     height: 100vh;
     background: #16213e;
@@ -1127,11 +2057,115 @@ body {
     transition: border-color 0.15s;
 }
 .settings-input:focus { border-color: #4ecca3; }
+select.settings-input {
+    cursor: pointer;
+    appearance: auto;
+}
 .settings-hint {
     font-size: 0.8rem;
     color: #8888aa;
     margin-top: 0.5rem;
 }
+.settings-warn { color: #e9a545; }
+
+/* Settings section header */
+.settings-section-header {
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #4ecca3;
+    margin-top: 2rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #0f3460;
+}
+
+/* Speaker cards */
+.speaker-card {
+    background: #1a1a2e;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: 1rem;
+}
+.speaker-card-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #e0e0e0;
+    margin-bottom: 0.75rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.speaker-card-row {
+    display: flex;
+    gap: 0.75rem;
+}
+.speaker-field {
+    flex: 1;
+}
+.speaker-field label {
+    margin-top: 0;
+}
+
+/* Toggle switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    margin: 0;
+}
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: #333;
+    border-radius: 22px;
+    transition: 0.2s;
+}
+.toggle-slider::before {
+    content: "";
+    position: absolute;
+    height: 16px;
+    width: 16px;
+    left: 3px;
+    bottom: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: 0.2s;
+}
+.toggle-switch input:checked + .toggle-slider {
+    background: #4ecca3;
+}
+.toggle-switch input:checked + .toggle-slider::before {
+    transform: translateX(18px);
+}
+
+/* Speaker options */
+.speaker-options {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid #0f3460;
+}
+.option-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: #c0c0d0;
+    margin-top: 0.5rem;
+    cursor: pointer;
+}
+.option-row input {
+    accent-color: #4ecca3;
+    cursor: pointer;
+}
+
 .btn-close-settings {
     margin-top: 2rem;
     background: #0f3460;
