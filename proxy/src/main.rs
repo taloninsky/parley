@@ -129,10 +129,29 @@ async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
 
     let system_prompt = if body.multi_speaker {
         format!(
-            "{}\n\nADDITIONAL RULE FOR MULTI-SPEAKER TRANSCRIPTS:\n\
-            Each speaker tag (e.g. [Name]) MUST begin a new paragraph (preceded by a blank line). \
-            Never merge text from different speakers into the same paragraph. \
-            Speaker tags look like [Name] at the start of a line and may be preceded by a timestamp like [MM:SS].",
+            "{}\n\n\
+            ADDITIONAL RULES FOR MULTI-SPEAKER DIALOG:\n\
+            This transcript is a DIALOG between two or more people, not a monolog.\n\
+            Each paragraph may begin with structural markers that you must preserve exactly:\n\
+            - Speaker tags: [Name] — identifies who is speaking (e.g. [Gavin], [Dave]).\n\
+            - Timestamps: [MM:SS] or [H:MM:SS] — when the turn was spoken.\n\
+            A typical line looks like: [05:23] [Gavin] So I was thinking about the architecture…\n\
+            Or without timestamps: [Dave] Yeah, that makes sense.\n\n\
+            CRITICAL: Speaker tags appear ONLY at speaker transitions — the first time a different person speaks.\n\
+            Consecutive text from the same speaker does NOT repeat the [Name] tag. For example:\n\
+            [Gavin] First point about the architecture. And here is a follow-up thought.\n\
+            NOT: [Gavin] First point. [Gavin] And here is a follow-up.\n\n\
+            Rules:\n\
+            1. NEVER remove, rewrite, or reorder speaker tags or timestamps. They are structural, not content.\n\
+            2. Each speaker tag MUST begin a new paragraph (preceded by a blank line). \
+            Never merge text from different speakers into the same paragraph.\n\
+            3. Consecutive turns from the SAME speaker join into one paragraph WITHOUT repeating the tag or timestamp.\n\
+            4. If you add a paragraph break WITHIN a single speaker's text, do NOT add a [Name] tag \
+            to the continuation paragraph — the speaker context carries implicitly until a new tag appears.\n\
+            5. If you encounter redundant same-speaker tags mid-paragraph (e.g. [Gavin] text [Gavin] more text), \
+            remove the duplicate tag so only the first one remains.\n\
+            6. Apply paragraph breaks, punctuation, and formatting ONLY within a speaker's text — \
+            the words after the [Name] tag.",
             FORMAT_SYSTEM_PROMPT
         )
     } else {

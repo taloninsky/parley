@@ -370,6 +370,58 @@ fn generate_filename(ext: &str) -> String {
     format!("parley-{y:04}-{mo:02}-{d:02}-{h:02}{mi:02}{s:02}.{ext}")
 }
 
+/// Estimated milliseconds per word at conversational pace (~170 wpm).
+const MS_PER_WORD: f64 = 350.0;
+
+/// A single word in the live zone with an estimated timestamp.
+#[derive(Clone)]
+struct LiveWord {
+    estimated_ms: f64,
+    speaker: String,
+    word: String,
+}
+
+/// Split a completed turn into word-level entries with estimated timestamps.
+fn split_turn_to_words(speech_start_ms: f64, speaker: &str, text: &str) -> Vec<LiveWord> {
+    text.split_whitespace()
+        .enumerate()
+        .map(|(i, w)| LiveWord {
+            estimated_ms: speech_start_ms + (i as f64) * MS_PER_WORD,
+            speaker: speaker.to_string(),
+            word: w.to_string(),
+        })
+        .collect()
+}
+
+/// Group consecutive same-speaker words into display lines for the live zone.
+fn render_live_zone(words: &[LiveWord], show_labels: bool, show_timestamps: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let speaker = &words[i].speaker;
+        let start_ms = words[i].estimated_ms;
+        let mut phrase = String::new();
+        while i < words.len() && words[i].speaker == *speaker {
+            if !phrase.is_empty() {
+                phrase.push(' ');
+            }
+            phrase.push_str(&words[i].word);
+            i += 1;
+        }
+        let mut line = String::new();
+        if show_timestamps {
+            line.push_str(&format_timestamp(start_ms));
+            line.push(' ');
+        }
+        if show_labels {
+            line.push_str(&format!("[{}] ", speaker));
+        }
+        line.push_str(&phrase);
+        lines.push(line);
+    }
+    lines
+}
+
 /// Build the committed line with optional timestamp and speaker label.
 /// Returns the new full transcript string.
 fn build_committed_text(
@@ -379,18 +431,20 @@ fn build_committed_text(
     multi_speaker: bool,
     show_labels: bool,
     show_timestamps: bool,
-    session_start: f64,
+    elapsed_ms: f64,
     last_speaker_name: &str,
 ) -> String {
-    let same_speaker = last_speaker_name == speaker_name;
+    let same_speaker = !last_speaker_name.is_empty() && last_speaker_name == speaker_name;
     let mut line = String::new();
-    if show_timestamps && multi_speaker {
-        let elapsed = js_sys::Date::now() - session_start;
-        line.push_str(&format_timestamp(elapsed));
-        line.push(' ');
-    }
-    if show_labels && multi_speaker {
-        line.push_str(&format!("[{}] ", speaker_name));
+    // Only add tags/timestamps at speaker transitions, not mid-paragraph
+    if !same_speaker {
+        if show_timestamps && multi_speaker {
+            line.push_str(&format_timestamp(elapsed_ms));
+            line.push(' ');
+        }
+        if show_labels && multi_speaker {
+            line.push_str(&format!("[{}] ", speaker_name));
+        }
     }
     line.push_str(turn_text);
     let sep = if prev_transcript.is_empty() {
@@ -401,6 +455,88 @@ fn build_committed_text(
         " "
     };
     format!("{prev_transcript}{sep}{line}")
+}
+
+/// Graduate safe words from the live zone into the transcript.
+/// A word is safe when both speakers' current turn started after it,
+/// or it's older than `max_age_ms`. Consecutive same-speaker words
+/// are grouped into phrases before committing.
+fn graduate_live_words(
+    live_words: &Rc<RefCell<Vec<LiveWord>>>,
+    transcript: &mut Signal<String>,
+    last_speaker: &Rc<RefCell<String>>,
+    turn_start1: f64,
+    turn_start2: f64,
+    session_start: f64,
+    show_labels: bool,
+    show_timestamps: bool,
+) {
+    let threshold = turn_start1.min(turn_start2);
+    let max_age_ms = 15_000.0;
+    let now_elapsed = js_sys::Date::now() - session_start;
+
+    let mut words = live_words.borrow_mut();
+    let mut graduated = 0;
+    for word in words.iter() {
+        let age = now_elapsed - word.estimated_ms;
+        if word.estimated_ms < threshold || age > max_age_ms {
+            graduated += 1;
+        } else {
+            break; // vec is sorted, so no more will qualify
+        }
+    }
+    if graduated == 0 {
+        return;
+    }
+
+    let cursor = get_cursor();
+    let mut prev = (transcript)();
+    let ls = last_speaker.borrow().clone();
+    let mut last = ls;
+
+    // Group consecutive same-speaker words into phrases
+    let drained: Vec<LiveWord> = words.drain(..graduated).collect();
+    let mut i = 0;
+    while i < drained.len() {
+        let speaker = &drained[i].speaker;
+        let start_ms = drained[i].estimated_ms;
+        let mut phrase = String::new();
+        while i < drained.len() && drained[i].speaker == *speaker {
+            if !phrase.is_empty() {
+                phrase.push(' ');
+            }
+            phrase.push_str(&drained[i].word);
+            i += 1;
+        }
+
+        let same_speaker = !last.is_empty() && last == *speaker;
+        let mut line = String::new();
+        if !same_speaker {
+            if show_timestamps {
+                line.push_str(&format_timestamp(start_ms));
+                line.push(' ');
+            }
+            if show_labels {
+                line.push_str(&format!("[{}] ", speaker));
+            }
+        }
+        line.push_str(&phrase);
+        let sep = if prev.is_empty() {
+            ""
+        } else if !same_speaker {
+            "\n\n"
+        } else {
+            " "
+        };
+        prev = format!("{prev}{sep}{line}");
+        last = speaker.clone();
+    }
+
+    *last_speaker.borrow_mut() = last;
+    transcript.set(prev);
+    if let Some((s, e)) = cursor {
+        restore_cursor(s, e);
+    }
 }
 
 /// Start capture for the given audio source.
@@ -489,6 +625,13 @@ pub fn App() -> Element {
     let mut current_turn_shared2: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared2: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
 
+    // ── Live zone (multi-speaker chrono insertion) ───────────────────
+    let mut live_turns_shared: Signal<Option<Rc<RefCell<Vec<LiveWord>>>>> = use_signal(|| None);
+    let mut turn_start_time1_shared: Signal<Option<Rc<Cell<f64>>>> = use_signal(|| None);
+    let mut turn_start_time2_shared: Signal<Option<Rc<Cell<f64>>>> = use_signal(|| None);
+    // Reactive signal that mirrors live_turns length so UI re-renders
+    let mut live_turns_version = use_signal(|| 0u32);
+
     // ── Shared recording state ──────────────────────────────────────
     let mut session_start_time: Signal<Option<f64>> = use_signal(|| None);
     let mut last_committed_speaker: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
@@ -553,12 +696,25 @@ pub fn App() -> Element {
             let last_speaker: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             last_committed_speaker.set(Some(last_speaker.clone()));
 
+            // Live zone state (only meaningful in multi mode, but always created)
+            let live_turns_rc: Rc<RefCell<Vec<LiveWord>>> = Rc::new(RefCell::new(Vec::new()));
+            live_turns_shared.set(Some(live_turns_rc.clone()));
+            let turn_start1: Rc<Cell<f64>> = Rc::new(Cell::new(f64::MAX));
+            let turn_start2: Rc<Cell<f64>> = Rc::new(Cell::new(f64::MAX));
+            turn_start_time1_shared.set(Some(turn_start1.clone()));
+            turn_start_time2_shared.set(Some(turn_start2.clone()));
+
             // ── Speaker 1 session ───────────────────────────────────
             let session1_rc: Rc<RefCell<Option<AssemblyAiSession>>> = Rc::new(RefCell::new(None));
+            // Session 2 ref for cross-session force endpoint
+            let session2_rc_for_s1: Rc<RefCell<Option<AssemblyAiSession>>> =
+                Rc::new(RefCell::new(None));
 
             let current_turn1: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             let current_turn_order1: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
             let needs_para_check: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            // Track when the current turn started speaking
+            let speech_start1: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
 
             current_turn_shared.set(Some(current_turn1.clone()));
             current_turn_order_shared.set(Some(current_turn_order1.clone()));
@@ -572,6 +728,11 @@ pub fn App() -> Element {
                 let npc = needs_para_check.clone();
                 let mut t_sig = transcript.clone();
                 let mut p_sig = partial.clone();
+                let ss1 = speech_start1.clone();
+                let ts1 = turn_start1.clone();
+                let live_rc = live_turns_rc.clone();
+                let s2_for_force = session2_rc_for_s1.clone();
+                let mut ltv = live_turns_version.clone();
 
                 match AssemblyAiSession::connect(
                     &token1,
@@ -585,28 +746,55 @@ pub fn App() -> Element {
                         if is_new_turn && prev_order != u32::MAX {
                             let old_turn = ct.borrow().clone();
                             if !old_turn.is_empty() {
-                                let cursor = get_cursor();
-                                let prev = (t_sig)();
                                 let name = (speaker1_name)();
-                                let new_text = build_committed_text(
-                                    &prev,
-                                    &old_turn,
-                                    &name,
-                                    multi,
-                                    (show_labels)(),
-                                    (show_timestamps)(),
-                                    start_time,
-                                    &last_speaker.borrow(),
-                                );
-                                t_sig.set(new_text);
-                                *last_speaker.borrow_mut() = name;
-                                if let Some((s, e)) = cursor {
-                                    restore_cursor(s, e);
+                                if multi {
+                                    // Cross-session force endpoint
+                                    if let Some(ref sess) = *s2_for_force.borrow() {
+                                        let _ = sess.force_endpoint();
+                                    }
+                                    // Insert words into live zone at chrono positions
+                                    let elapsed = ss1.get();
+                                    let new_words = split_turn_to_words(elapsed, &name, &old_turn);
+                                    let mut words = live_rc.borrow_mut();
+                                    for w in new_words {
+                                        let pos = words
+                                            .partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                                        words.insert(pos, w);
+                                    }
+                                    drop(words);
+                                    ltv.set(ltv() + 1);
+                                } else {
+                                    // Single speaker: direct to transcript
+                                    let cursor = get_cursor();
+                                    let prev = (t_sig)();
+                                    let elapsed = js_sys::Date::now() - start_time;
+                                    let new_text = build_committed_text(
+                                        &prev,
+                                        &old_turn,
+                                        &name,
+                                        false,
+                                        (show_labels)(),
+                                        (show_timestamps)(),
+                                        elapsed,
+                                        &last_speaker.borrow(),
+                                    );
+                                    t_sig.set(new_text);
+                                    *last_speaker.borrow_mut() = name;
+                                    if let Some((s, e)) = cursor {
+                                        restore_cursor(s, e);
+                                    }
                                 }
                                 if !(anthropic_key)().is_empty() {
                                     npc.set(true);
                                 }
                             }
+                        }
+
+                        if is_new_turn {
+                            // Record when this new turn started speaking
+                            let elapsed = js_sys::Date::now() - start_time;
+                            ss1.set(elapsed);
+                            ts1.set(elapsed);
                         }
 
                         cto.set(turn_order);
@@ -671,23 +859,28 @@ pub fn App() -> Element {
                     // ── Speaker 2 session (if multi-speaker) ────────
                     let cap2_rc: Option<Rc<RefCell<Option<BrowserCapture>>>> =
                         if let Some(ref tok2) = token2 {
-                            let session2_rc: Rc<RefCell<Option<AssemblyAiSession>>> =
-                                Rc::new(RefCell::new(None));
+                            // Use session2_rc_for_s1 as the actual session2 holder
+                            // (speaker 1's callback already has a reference to it)
+                            let session2_rc = session2_rc_for_s1.clone();
 
                             let ct2: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
                             let cto2: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
+                            let speech_start2: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
 
                             current_turn_shared2.set(Some(ct2.clone()));
                             current_turn_order_shared2.set(Some(cto2.clone()));
 
                             let session2 = {
                                 let last_activity = last_activity.clone();
-                                let last_speaker = last_speaker.clone();
                                 let ct = ct2.clone();
                                 let cto = cto2.clone();
                                 let npc = needs_para_check.clone();
-                                let mut t_sig = transcript.clone();
                                 let mut p2_sig = partial2.clone();
+                                let ss2 = speech_start2.clone();
+                                let ts2 = turn_start2.clone();
+                                let live_rc = live_turns_rc.clone();
+                                let s1_for_force = session1_rc.clone();
+                                let mut ltv = live_turns_version.clone();
 
                                 match AssemblyAiSession::connect(
                                     tok2,
@@ -701,28 +894,34 @@ pub fn App() -> Element {
                                         if is_new_turn && prev_order != u32::MAX {
                                             let old_turn = ct.borrow().clone();
                                             if !old_turn.is_empty() {
-                                                let cursor = get_cursor();
-                                                let prev = (t_sig)();
                                                 let name = (speaker2_name)();
-                                                let new_text = build_committed_text(
-                                                    &prev,
-                                                    &old_turn,
-                                                    &name,
-                                                    true,
-                                                    (show_labels)(),
-                                                    (show_timestamps)(),
-                                                    start_time,
-                                                    &last_speaker.borrow(),
-                                                );
-                                                t_sig.set(new_text);
-                                                *last_speaker.borrow_mut() = name;
-                                                if let Some((s, e)) = cursor {
-                                                    restore_cursor(s, e);
+                                                // Cross-session force endpoint
+                                                if let Some(ref sess) = *s1_for_force.borrow() {
+                                                    let _ = sess.force_endpoint();
                                                 }
+                                                // Insert words into live zone at chrono positions
+                                                let elapsed = ss2.get();
+                                                let new_words =
+                                                    split_turn_to_words(elapsed, &name, &old_turn);
+                                                let mut words = live_rc.borrow_mut();
+                                                for w in new_words {
+                                                    let pos = words.partition_point(|x| {
+                                                        x.estimated_ms <= w.estimated_ms
+                                                    });
+                                                    words.insert(pos, w);
+                                                }
+                                                drop(words);
+                                                ltv.set(ltv() + 1);
                                                 if !(anthropic_key)().is_empty() {
                                                     npc.set(true);
                                                 }
                                             }
+                                        }
+
+                                        if is_new_turn {
+                                            let elapsed = js_sys::Date::now() - start_time;
+                                            ss2.set(elapsed);
+                                            ts2.set(elapsed);
                                         }
 
                                         cto.set(turn_order);
@@ -823,6 +1022,10 @@ pub fn App() -> Element {
                     let mut countdown_secs = countdown_secs.clone();
                     let ticker_needs_para = needs_para_check.clone();
                     let ticker_last_speaker = last_speaker.clone();
+                    let ticker_live_turns = live_turns_rc.clone();
+                    let ticker_ts1 = turn_start1.clone();
+                    let ticker_ts2 = turn_start2.clone();
+                    let mut ticker_ltv = live_turns_version.clone();
 
                     spawn(async move {
                         let mut blink_on = false;
@@ -860,6 +1063,25 @@ pub fn App() -> Element {
                                         }
                                     }
                                 });
+                            }
+
+                            // Graduate live turns (multi-speaker only)
+                            if multi {
+                                let before = ticker_live_turns.borrow().len();
+                                graduate_live_words(
+                                    &ticker_live_turns,
+                                    &mut transcript_t,
+                                    &ticker_last_speaker,
+                                    ticker_ts1.get(),
+                                    ticker_ts2.get(),
+                                    start_time,
+                                    (show_labels)(),
+                                    (show_timestamps)(),
+                                );
+                                let after = ticker_live_turns.borrow().len();
+                                if before != after {
+                                    ticker_ltv.set(ticker_ltv() + 1);
+                                }
                             }
 
                             // 1-minute warning
@@ -905,41 +1127,66 @@ pub fn App() -> Element {
                                 // Flush partials
                                 let p1 = (partial_t)();
                                 if !p1.is_empty() {
-                                    let prev = (transcript_t)();
-                                    let name = (speaker1_name)();
-                                    let new_text = build_committed_text(
-                                        &prev,
-                                        &p1,
-                                        &name,
-                                        multi,
-                                        (show_labels)(),
-                                        (show_timestamps)(),
-                                        start_time,
-                                        &ticker_last_speaker.borrow(),
-                                    );
-                                    transcript_t.set(new_text);
-                                    *ticker_last_speaker.borrow_mut() = name;
+                                    if multi {
+                                        let elapsed = js_sys::Date::now() - start_time;
+                                        let new_words =
+                                            split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
+                                        let mut words = ticker_live_turns.borrow_mut();
+                                        for w in new_words {
+                                            let pos = words.partition_point(|x| {
+                                                x.estimated_ms <= w.estimated_ms
+                                            });
+                                            words.insert(pos, w);
+                                        }
+                                    } else {
+                                        let prev = (transcript_t)();
+                                        let name = (speaker1_name)();
+                                        let elapsed = js_sys::Date::now() - start_time;
+                                        let new_text = build_committed_text(
+                                            &prev,
+                                            &p1,
+                                            &name,
+                                            false,
+                                            (show_labels)(),
+                                            (show_timestamps)(),
+                                            elapsed,
+                                            &ticker_last_speaker.borrow(),
+                                        );
+                                        transcript_t.set(new_text);
+                                        *ticker_last_speaker.borrow_mut() = name;
+                                    }
                                     partial_t.set(String::new());
                                 }
                                 if multi {
                                     let p2 = (partial2_t)();
                                     if !p2.is_empty() {
-                                        let prev = (transcript_t)();
-                                        let name = (speaker2_name)();
-                                        let new_text = build_committed_text(
-                                            &prev,
-                                            &p2,
-                                            &name,
-                                            true,
-                                            (show_labels)(),
-                                            (show_timestamps)(),
-                                            start_time,
-                                            &ticker_last_speaker.borrow(),
-                                        );
-                                        transcript_t.set(new_text);
-                                        *ticker_last_speaker.borrow_mut() = name;
+                                        let elapsed = js_sys::Date::now() - start_time;
+                                        let new_words =
+                                            split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
+                                        let mut words = ticker_live_turns.borrow_mut();
+                                        for w in new_words {
+                                            let pos = words.partition_point(|x| {
+                                                x.estimated_ms <= w.estimated_ms
+                                            });
+                                            words.insert(pos, w);
+                                        }
+                                        drop(words);
                                         partial2_t.set(String::new());
                                     }
+                                    // Force-graduate all remaining live words
+                                    ticker_ts1.set(0.0);
+                                    ticker_ts2.set(0.0);
+                                    graduate_live_words(
+                                        &ticker_live_turns,
+                                        &mut transcript_t,
+                                        &ticker_last_speaker,
+                                        f64::MAX,
+                                        f64::MAX,
+                                        start_time,
+                                        (show_labels)(),
+                                        (show_timestamps)(),
+                                    );
+                                    ticker_ltv.set(ticker_ltv() + 1);
                                 }
                                 rec_state.set(RecState::Stopped);
                                 status_msg.set("Idle timeout \u{2014} disconnected".into());
@@ -976,23 +1223,38 @@ pub fn App() -> Element {
         if !p.is_empty() {
             let multi = (speaker2_enabled)();
             let name = (speaker1_name)();
-            let prev = (transcript)();
-            let ls = (last_committed_speaker)();
-            let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
             let start = (session_start_time)().unwrap_or(0.0);
-            let new_text = build_committed_text(
-                &prev,
-                &p,
-                &name,
-                multi,
-                (show_labels)(),
-                (show_timestamps)(),
-                start,
-                &ls_name,
-            );
-            transcript.set(new_text);
-            if let Some(ref ls_rc) = ls {
-                *ls_rc.borrow_mut() = name;
+            if multi {
+                if let Some(ref live_rc) = (live_turns_shared)() {
+                    let elapsed = js_sys::Date::now() - start;
+                    let new_words = split_turn_to_words(elapsed, &name, &p);
+                    let mut words = live_rc.borrow_mut();
+                    for w in new_words {
+                        let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                        words.insert(pos, w);
+                    }
+                    drop(words);
+                    live_turns_version.set(live_turns_version() + 1);
+                }
+            } else {
+                let prev = (transcript)();
+                let ls = (last_committed_speaker)();
+                let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+                let elapsed = js_sys::Date::now() - start;
+                let new_text = build_committed_text(
+                    &prev,
+                    &p,
+                    &name,
+                    false,
+                    (show_labels)(),
+                    (show_timestamps)(),
+                    elapsed,
+                    &ls_name,
+                );
+                transcript.set(new_text);
+                if let Some(ref ls_rc) = ls {
+                    *ls_rc.borrow_mut() = name;
+                }
             }
             partial.set(String::new());
         }
@@ -1014,23 +1276,17 @@ pub fn App() -> Element {
         let p = (partial2)();
         if !p.is_empty() {
             let name = (speaker2_name)();
-            let prev = (transcript)();
-            let ls = (last_committed_speaker)();
-            let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
             let start = (session_start_time)().unwrap_or(0.0);
-            let new_text = build_committed_text(
-                &prev,
-                &p,
-                &name,
-                true,
-                (show_labels)(),
-                (show_timestamps)(),
-                start,
-                &ls_name,
-            );
-            transcript.set(new_text);
-            if let Some(ref ls_rc) = ls {
-                *ls_rc.borrow_mut() = name;
+            if let Some(ref live_rc) = (live_turns_shared)() {
+                let elapsed = js_sys::Date::now() - start;
+                let new_words = split_turn_to_words(elapsed, &name, &p);
+                let mut words = live_rc.borrow_mut();
+                for w in new_words {
+                    let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                    words.insert(pos, w);
+                }
+                drop(words);
+                live_turns_version.set(live_turns_version() + 1);
             }
             partial2.set(String::new());
         }
@@ -1072,24 +1328,37 @@ pub fn App() -> Element {
         // Flush speaker 1 partial
         let start = (session_start_time)().unwrap_or(0.0);
         let ls = (last_committed_speaker)();
-        let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
         let p1 = (partial)();
         if !p1.is_empty() {
-            let name = (speaker1_name)();
-            let prev = (transcript)();
-            let new_text = build_committed_text(
-                &prev,
-                &p1,
-                &name,
-                multi,
-                (show_labels)(),
-                (show_timestamps)(),
-                start,
-                &ls_name,
-            );
-            transcript.set(new_text);
-            if let Some(ref ls_rc) = ls {
-                *ls_rc.borrow_mut() = name;
+            if multi {
+                if let Some(ref live_rc) = (live_turns_shared)() {
+                    let elapsed = js_sys::Date::now() - start;
+                    let new_words = split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
+                    let mut words = live_rc.borrow_mut();
+                    for w in new_words {
+                        let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                        words.insert(pos, w);
+                    }
+                }
+            } else {
+                let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+                let name = (speaker1_name)();
+                let prev = (transcript)();
+                let elapsed = js_sys::Date::now() - start;
+                let new_text = build_committed_text(
+                    &prev,
+                    &p1,
+                    &name,
+                    false,
+                    (show_labels)(),
+                    (show_timestamps)(),
+                    elapsed,
+                    &ls_name,
+                );
+                transcript.set(new_text);
+                if let Some(ref ls_rc) = ls {
+                    *ls_rc.borrow_mut() = name;
+                }
             }
             partial.set(String::new());
         }
@@ -1097,24 +1366,33 @@ pub fn App() -> Element {
         if multi {
             let p2 = (partial2)();
             if !p2.is_empty() {
-                let name = (speaker2_name)();
-                let prev = (transcript)();
-                let ls_name2 = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
-                let new_text = build_committed_text(
-                    &prev,
-                    &p2,
-                    &name,
-                    true,
-                    (show_labels)(),
-                    (show_timestamps)(),
-                    start,
-                    &ls_name2,
-                );
-                transcript.set(new_text);
-                if let Some(ref ls_rc) = ls {
-                    *ls_rc.borrow_mut() = name;
+                if let Some(ref live_rc) = (live_turns_shared)() {
+                    let elapsed = js_sys::Date::now() - start;
+                    let new_words = split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
+                    let mut words = live_rc.borrow_mut();
+                    for w in new_words {
+                        let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                        words.insert(pos, w);
+                    }
                 }
                 partial2.set(String::new());
+            }
+            // Force-graduate all remaining live words
+            if let Some(ref live_rc) = (live_turns_shared)() {
+                let ls_rc = ls
+                    .clone()
+                    .unwrap_or_else(|| Rc::new(RefCell::new(String::new())));
+                graduate_live_words(
+                    live_rc,
+                    &mut transcript,
+                    &ls_rc,
+                    f64::MAX,
+                    f64::MAX,
+                    start,
+                    (show_labels)(),
+                    (show_timestamps)(),
+                );
+                live_turns_version.set(live_turns_version() + 1);
             }
         }
         // Run paragraph detection
@@ -1264,6 +1542,11 @@ pub fn App() -> Element {
         if let Some(npc) = (needs_paragraph_check_shared)().as_ref() {
             npc.set(false);
         }
+        // Clear live zone
+        if let Some(ref live_rc) = (live_turns_shared)() {
+            live_rc.borrow_mut().clear();
+            live_turns_version.set(live_turns_version() + 1);
+        }
         if rec_state() == RecState::Stopped {
             rec_state.set(RecState::Idle);
             status_msg.set("Ready".into());
@@ -1273,9 +1556,24 @@ pub fn App() -> Element {
     // ── Derived values ──────────────────────────────────────────────
     let state = rec_state();
     let multi = (speaker2_enabled)();
+
+    // Build live zone text for rendering (only in multi mode)
+    let _ltv = (live_turns_version)(); // subscribe to changes
+    let live_zone_lines: Vec<String> = if multi {
+        if let Some(ref live_rc) = (live_turns_shared)() {
+            render_live_zone(&live_rc.borrow(), (show_labels)(), (show_timestamps)())
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let has_live = !live_zone_lines.is_empty();
+
     let has_text = !(transcript)().is_empty()
         || !(partial)().is_empty()
-        || (multi && !(partial2)().is_empty());
+        || (multi && !(partial2)().is_empty())
+        || has_live;
     let s1_name_val = (speaker1_name)();
     let s2_name_val = (speaker2_name)();
     let tm = (transfer_mode)();
@@ -1333,6 +1631,16 @@ pub fn App() -> Element {
                         },
                     }
                     "Auto-scroll"
+                }
+            }
+
+            // ── Live zone (multi-speaker chrono-sorted pending turns) ──
+            if has_live {
+                div { class: "live-zone",
+                    div { class: "live-zone-label", "Live \u{2014} sorting\u{2026}" }
+                    for line in live_zone_lines.iter() {
+                        p { class: "live-zone-line", "{line}" }
+                    }
                 }
             }
 
@@ -1816,6 +2124,32 @@ body {
     font-size: inherit;
     line-height: inherit;
     cursor: text;
+}
+
+/* Live zone */
+.live-zone {
+    background: #12284a;
+    border-radius: 10px;
+    padding: 0.75rem 1.25rem;
+    margin-bottom: 1rem;
+    border-left: 3px solid #e9a545;
+    max-height: 20vh;
+    overflow-y: auto;
+    line-height: 1.7;
+    font-size: 1.05rem;
+}
+.live-zone-label {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #e9a545;
+    margin-bottom: 0.3rem;
+}
+.live-zone-line {
+    color: #c0c0d0;
+    margin: 0.15rem 0;
 }
 
 /* Current turn boxes */
