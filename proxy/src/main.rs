@@ -66,6 +66,13 @@ struct FormatRequest {
     /// When true, add multi-speaker paragraph rules to the prompt.
     #[serde(default)]
     multi_speaker: bool,
+    /// Anthropic model ID. Defaults to Haiku 4.5 if omitted.
+    #[serde(default = "default_model")]
+    model: String,
+}
+
+fn default_model() -> String {
+    "claude-haiku-4-5-20251001".to_string()
 }
 
 const FORMAT_SYSTEM_PROMPT: &str = r#"You are a plain-text formatter for speech-to-text output.
@@ -159,7 +166,7 @@ async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
     };
 
     let payload = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": body.model,
         "max_tokens": 4096,
         "system": system_prompt,
         "messages": [

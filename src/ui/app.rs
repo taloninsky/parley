@@ -128,13 +128,74 @@ async fn check_formatting(
     anthropic_key: &str,
     full_transcript: &str,
     multi_speaker: bool,
+    model: &str,
+    depth: usize,
 ) -> Option<String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
-    // ── Parse transcript into "chunks" ──────────────────────────────
+    // ── Full-transcript mode (depth == 0) ───────────────────────────
+    if depth == 0 {
+        if full_transcript.trim().is_empty() {
+            return None;
+        }
+
+        web_sys::console::log_1(
+            &format!(
+                "[parley] format check (full): {} chars, model={}",
+                full_transcript.len(),
+                model,
+            )
+            .into(),
+        );
+
+        let body = serde_json::json!({
+            "anthropic_key": anthropic_key,
+            "context": "",
+            "text": full_transcript,
+            "multi_speaker": multi_speaker,
+            "model": model,
+        });
+
+        let opts = web_sys::RequestInit::new();
+        opts.set_method("POST");
+        opts.set_mode(web_sys::RequestMode::Cors);
+        let body_str = serde_json::to_string(&body).ok()?;
+        opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
+
+        let headers = web_sys::Headers::new().ok()?;
+        headers.set("Content-Type", "application/json").ok()?;
+        opts.set_headers(&headers);
+
+        let request =
+            web_sys::Request::new_with_str_and_init("http://127.0.0.1:3033/format", &opts).ok()?;
+
+        let window = web_sys::window()?;
+        let resp_val = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .ok()?;
+        let resp: web_sys::Response = resp_val.dyn_into().ok()?;
+
+        if !resp.ok() {
+            return None;
+        }
+
+        let json_val = JsFuture::from(resp.json().ok()?).await.ok()?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&js_sys::JSON::stringify(&json_val).ok()?.as_string()?).ok()?;
+
+        if !parsed["changed"].as_bool().unwrap_or(false) {
+            web_sys::console::log_1(&"[parley] Reformat: no changes needed".into());
+            return None;
+        }
+
+        let formatted = parsed["formatted"].as_str()?.to_string();
+        web_sys::console::log_1(&"[parley] Reformat: applied formatting".into());
+        return Some(formatted);
+    }
+
+    // ── Windowed mode (depth > 0) ───────────────────────────────────
     // A chunk = a paragraph block + any list blocks immediately following it.
-    // Split on blank lines first, then merge list blocks into the preceding chunk.
     let blocks: Vec<&str> = full_transcript.split("\n\n").collect();
 
     fn is_list_block(block: &str) -> bool {
@@ -154,7 +215,6 @@ async fn check_formatting(
         if chunks.is_empty() || !is_list_block(block) {
             chunks.push(block.to_string());
         } else {
-            // Append list block to previous chunk
             let last = chunks.last_mut().unwrap();
             last.push_str("\n\n");
             last.push_str(block);
@@ -163,8 +223,10 @@ async fn check_formatting(
 
     let total = chunks.len();
 
-    // Window size depends on speaker mode
-    let (max_win, max_editable) = if multi_speaker { (6, 4) } else { (3, 2) };
+    // Window size: editable = depth, context padding depends on speaker mode
+    let context_padding: usize = if multi_speaker { 2 } else { 1 };
+    let max_editable = depth;
+    let max_win = depth + context_padding;
     let win = total.min(max_win);
     let win_start = total - win;
     let editable = win.min(max_editable);
@@ -193,10 +255,11 @@ async fn check_formatting(
 
     web_sys::console::log_1(
         &format!(
-            "[parley] format check: {} chunks total, {} context chars, {} editable chars",
+            "[parley] format check: {} chunks total, {} context chars, {} editable chars, model={}",
             total,
             context_text.len(),
-            editable_text.len()
+            editable_text.len(),
+            model,
         )
         .into(),
     );
@@ -206,6 +269,7 @@ async fn check_formatting(
         "context": context_text,
         "text": editable_text,
         "multi_speaker": multi_speaker,
+        "model": model,
     });
 
     let opts = web_sys::RequestInit::new();
@@ -301,6 +365,45 @@ impl TransferMode {
             "md" => Self::MdFile,
             "vscode" => Self::VsCode,
             _ => Self::Copy,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FormatTrigger {
+    EveryTurn,
+    EveryNth,
+    OnStop,
+    Manual,
+    Off,
+}
+
+impl FormatTrigger {
+    fn cookie_value(&self) -> &'static str {
+        match self {
+            Self::EveryTurn => "every-turn",
+            Self::EveryNth => "every-nth",
+            Self::OnStop => "on-stop",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+    fn from_cookie(s: &str) -> Self {
+        match s {
+            "every-turn" => Self::EveryTurn,
+            "on-stop" => Self::OnStop,
+            "manual" => Self::Manual,
+            "off" => Self::Off,
+            _ => Self::EveryNth,
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::EveryTurn => "Every turn",
+            Self::EveryNth => "Every Nth turn",
+            Self::OnStop => "On stop only",
+            Self::Manual => "Manual only",
+            Self::Off => "Off",
         }
     }
 }
@@ -610,6 +713,27 @@ pub fn App() -> Element {
     });
     let mut transfer_feedback: Signal<Option<String>> = use_signal(|| None);
 
+    // ── Formatting settings ─────────────────────────────────────────
+    let mut format_model = use_signal(|| {
+        load("parley_format_model").unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string())
+    });
+    let mut format_trigger = use_signal(|| {
+        load("parley_format_trigger")
+            .map(|s| FormatTrigger::from_cookie(&s))
+            .unwrap_or(FormatTrigger::EveryNth)
+    });
+    let mut format_nth = use_signal(|| {
+        load("parley_format_nth")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(3)
+    });
+    let mut format_depth = use_signal(|| {
+        load("parley_format_depth")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+    });
+    let reformatting = use_signal(|| false);
+
     // ── Speaker 1 handles ───────────────────────────────────────────
     let capture_handle: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
     let session_handle: Signal<Option<Rc<RefCell<Option<AssemblyAiSession>>>>> =
@@ -713,6 +837,7 @@ pub fn App() -> Element {
             let current_turn1: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             let current_turn_order1: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
             let needs_para_check: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let turn_commit_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
             // Track when the current turn started speaking
             let speech_start1: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
 
@@ -726,6 +851,7 @@ pub fn App() -> Element {
                 let ct = current_turn1.clone();
                 let cto = current_turn_order1.clone();
                 let npc = needs_para_check.clone();
+                let tcc = turn_commit_counter.clone();
                 let mut t_sig = transcript.clone();
                 let mut p_sig = partial.clone();
                 let ss1 = speech_start1.clone();
@@ -785,7 +911,17 @@ pub fn App() -> Element {
                                     }
                                 }
                                 if !(anthropic_key)().is_empty() {
-                                    npc.set(true);
+                                    tcc.set(tcc.get() + 1);
+                                    let trigger = (format_trigger)();
+                                    match trigger {
+                                        FormatTrigger::EveryTurn => npc.set(true),
+                                        FormatTrigger::EveryNth => {
+                                            if tcc.get() % (format_nth)() == 0 {
+                                                npc.set(true);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -875,6 +1011,7 @@ pub fn App() -> Element {
                                 let ct = ct2.clone();
                                 let cto = cto2.clone();
                                 let npc = needs_para_check.clone();
+                                let tcc = turn_commit_counter.clone();
                                 let mut p2_sig = partial2.clone();
                                 let ss2 = speech_start2.clone();
                                 let ts2 = turn_start2.clone();
@@ -913,7 +1050,17 @@ pub fn App() -> Element {
                                                 drop(words);
                                                 ltv.set(ltv() + 1);
                                                 if !(anthropic_key)().is_empty() {
-                                                    npc.set(true);
+                                                    tcc.set(tcc.get() + 1);
+                                                    let trigger = (format_trigger)();
+                                                    match trigger {
+                                                        FormatTrigger::EveryTurn => npc.set(true),
+                                                        FormatTrigger::EveryNth => {
+                                                            if tcc.get() % (format_nth)() == 0 {
+                                                                npc.set(true);
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
                                                 }
                                             }
                                         }
@@ -1048,12 +1195,15 @@ pub fn App() -> Element {
                             if ticker_needs_para.get() {
                                 ticker_needs_para.set(false);
                                 let key = (anthropic_key)();
+                                let model = (format_model)();
+                                let depth = (format_depth)();
                                 let mut t = transcript_t.clone();
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty() {
                                         if let Some(formatted) =
-                                            check_formatting(&key, &text, multi).await
+                                            check_formatting(&key, &text, multi, &model, depth)
+                                                .await
                                         {
                                             let cursor = get_cursor();
                                             t.set(formatted);
@@ -1395,14 +1545,24 @@ pub fn App() -> Element {
                 live_turns_version.set(live_turns_version() + 1);
             }
         }
-        // Run paragraph detection
+        // Run paragraph detection (gated by trigger strategy)
         let akey = (anthropic_key)();
-        if !akey.is_empty() {
+        let trigger = (format_trigger)();
+        if !akey.is_empty()
+            && matches!(
+                trigger,
+                FormatTrigger::EveryTurn | FormatTrigger::EveryNth | FormatTrigger::OnStop
+            )
+        {
+            let model = (format_model)();
+            let depth = (format_depth)();
             let mut t = transcript.clone();
             spawn(async move {
                 let text = (t)();
                 if !text.is_empty() {
-                    if let Some(formatted) = check_formatting(&akey, &text, multi).await {
+                    if let Some(formatted) =
+                        check_formatting(&akey, &text, multi, &model, depth).await
+                    {
                         let cursor = get_cursor();
                         t.set(formatted);
                         if let Some((s, e)) = cursor {
@@ -1551,6 +1711,29 @@ pub fn App() -> Element {
             rec_state.set(RecState::Idle);
             status_msg.set("Ready".into());
         }
+    };
+
+    // ── Reformat (on-demand, full transcript) ───────────────────────
+    let on_reformat = move |_: Event<MouseData>| {
+        let key = (anthropic_key)();
+        let model = (format_model)();
+        let multi = (speaker2_enabled)();
+        let mut t = transcript.clone();
+        let mut r = reformatting.clone();
+        spawn(async move {
+            r.set(true);
+            let text = (t)();
+            if !text.is_empty() && !key.is_empty() {
+                if let Some(formatted) = check_formatting(&key, &text, multi, &model, 0).await {
+                    let cursor = get_cursor();
+                    t.set(formatted);
+                    if let Some((s, e)) = cursor {
+                        restore_cursor(s, e);
+                    }
+                }
+            }
+            r.set(false);
+        });
     };
 
     // ── Derived values ──────────────────────────────────────────────
@@ -1813,6 +1996,18 @@ pub fn App() -> Element {
                 if has_text {
                     button { class: "btn btn-clear", onclick: on_clear, "Clear" }
                 }
+                if has_text && !(anthropic_key)().is_empty() {
+                    button {
+                        class: "btn btn-reformat",
+                        onclick: on_reformat,
+                        disabled: reformatting(),
+                        if reformatting() {
+                            "Reformatting\u{2026}"
+                        } else {
+                            "\u{00b6} Reformat"
+                        }
+                    }
+                }
             }
 
             // ── Status bar ──────────────────────────────────────────
@@ -1879,7 +2074,82 @@ pub fn App() -> Element {
                     }
 
                     p { class: "settings-hint",
-                        "If set, Claude Haiku will automatically detect paragraph breaks in your transcript."
+                        "If set, Claude will automatically detect paragraph breaks in your transcript."
+                    }
+
+                    // ── Formatting section ──────────────────────────
+                    if !anthropic_key().is_empty() {
+                        div { class: "settings-section-header", "Formatting" }
+
+                        label { r#for: "format-model", "Model" }
+                        select {
+                            id: "format-model",
+                            class: "settings-input",
+                            value: "{format_model}",
+                            onchange: move |evt: Event<FormData>| {
+                                let val = evt.value();
+                                format_model.set(val.clone());
+                                save("parley_format_model", &val);
+                            },
+                            option { value: "claude-haiku-4-5-20251001", "Haiku 4.5 (fast, cheap)" }
+                            option { value: "claude-sonnet-4-6-20250514", "Sonnet 4.6 (better)" }
+                        }
+
+                        label { r#for: "format-trigger", "Auto-format" }
+                        select {
+                            id: "format-trigger",
+                            class: "settings-input",
+                            value: "{format_trigger().cookie_value()}",
+                            onchange: move |evt: Event<FormData>| {
+                                let t = FormatTrigger::from_cookie(&evt.value());
+                                format_trigger.set(t);
+                                save("parley_format_trigger", t.cookie_value());
+                            },
+                            option { value: "every-turn", "Every turn" }
+                            option { value: "every-nth", "Every Nth turn" }
+                            option { value: "on-stop", "On stop only" }
+                            option { value: "manual", "Manual only" }
+                            option { value: "off", "Off" }
+                        }
+
+                        if format_trigger() == FormatTrigger::EveryNth {
+                            label { r#for: "format-nth", "N (every Nth turn)" }
+                            input {
+                                id: "format-nth",
+                                r#type: "number",
+                                class: "settings-input",
+                                min: "2",
+                                max: "20",
+                                value: "{format_nth}",
+                                oninput: move |evt: Event<FormData>| {
+                                    if let Ok(v) = evt.value().parse::<u32>() {
+                                        let v = v.max(2);
+                                        format_nth.set(v);
+                                        save("parley_format_nth", &v.to_string());
+                                    }
+                                },
+                            }
+                        }
+
+                        label { r#for: "format-depth", "Reformat depth (chunks)" }
+                        input {
+                            id: "format-depth",
+                            r#type: "number",
+                            class: "settings-input",
+                            min: "1",
+                            max: "6",
+                            value: "{format_depth}",
+                            oninput: move |evt: Event<FormData>| {
+                                if let Ok(v) = evt.value().parse::<usize>() {
+                                    let v = v.clamp(1, 6);
+                                    format_depth.set(v);
+                                    save("parley_format_depth", &v.to_string());
+                                }
+                            },
+                        }
+                        p { class: "settings-hint",
+                            "Number of recent chunks sent for formatting. The ¶ Reformat button always reformats the entire transcript."
+                        }
                     }
 
                     // ── Speakers section ────────────────────────────
@@ -2247,6 +2517,9 @@ body {
 .btn-endturn:hover { background: #1a4a7a; }
 .btn-clear { background: transparent; color: #8888aa; border: 1px solid #8888aa; }
 .btn-clear:hover { color: #e0e0e0; border-color: #e0e0e0; }
+.btn-reformat { background: transparent; color: #b8a9c9; border: 1px solid #b8a9c9; }
+.btn-reformat:hover { color: #e0d0f0; border-color: #e0d0f0; }
+.btn-reformat:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Transfer combo button */
 .transfer-combo {
