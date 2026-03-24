@@ -706,6 +706,7 @@ pub fn App() -> Element {
             .unwrap_or(TransferMode::Copy)
     });
     let mut show_transfer_menu = use_signal(|| false);
+    let mut show_format_menu = use_signal(|| false);
     let mut prompt_filename = use_signal(|| {
         load("parley_prompt_filename")
             .map(|v| v == "true")
@@ -1716,7 +1717,7 @@ pub fn App() -> Element {
     // ── Reformat (on-demand, full transcript) ───────────────────────
     let on_reformat = move |_: Event<MouseData>| {
         let key = (anthropic_key)();
-        let model = (format_model)();
+        let model = "claude-sonnet-4-6-20250514".to_string();
         let multi = (speaker2_enabled)();
         let mut t = transcript.clone();
         let mut r = reformatting.clone();
@@ -1996,15 +1997,101 @@ pub fn App() -> Element {
                 if has_text {
                     button { class: "btn btn-clear", onclick: on_clear, "Clear" }
                 }
-                if has_text && !(anthropic_key)().is_empty() {
-                    button {
-                        class: "btn btn-reformat",
-                        onclick: on_reformat,
-                        disabled: reformatting(),
-                        if reformatting() {
-                            "Reformatting\u{2026}"
-                        } else {
-                            "\u{00b6} Reformat"
+                if !(anthropic_key)().is_empty() {
+                    div { class: "format-combo",
+                        button {
+                            class: "btn btn-reformat-main",
+                            onclick: on_reformat,
+                            disabled: !has_text || reformatting(),
+                            if reformatting() {
+                                "Reformatting\u{2026}"
+                            } else {
+                                "\u{00b6} Reformat"
+                            }
+                        }
+                        button {
+                            class: "btn btn-reformat-arrow",
+                            onclick: move |_| show_format_menu.set(!(show_format_menu)()),
+                            "\u{25be}"
+                        }
+                        if (show_format_menu)() {
+                            div {
+                                class: "format-overlay",
+                                onclick: move |_| show_format_menu.set(false),
+                            }
+                            div { class: "format-menu",
+                                div { class: "format-menu-title", "Formatting Settings" }
+
+                                label { r#for: "fmt-model", "Auto-format model" }
+                                select {
+                                    id: "fmt-model",
+                                    class: "settings-input",
+                                    value: "{format_model}",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let val = evt.value();
+                                        format_model.set(val.clone());
+                                        save("parley_format_model", &val);
+                                    },
+                                    option { value: "claude-haiku-4-5-20251001", "Haiku 4.5 (fast, cheap)" }
+                                    option { value: "claude-sonnet-4-6-20250514", "Sonnet 4.6 (better)" }
+                                }
+
+                                label { r#for: "fmt-trigger", "Auto-format trigger" }
+                                select {
+                                    id: "fmt-trigger",
+                                    class: "settings-input",
+                                    value: "{format_trigger().cookie_value()}",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let t = FormatTrigger::from_cookie(&evt.value());
+                                        format_trigger.set(t);
+                                        save("parley_format_trigger", t.cookie_value());
+                                    },
+                                    option { value: "every-turn", "Every turn" }
+                                    option { value: "every-nth", "Every Nth turn" }
+                                    option { value: "on-stop", "On stop only" }
+                                    option { value: "manual", "Manual only" }
+                                    option { value: "off", "Off" }
+                                }
+
+                                if format_trigger() == FormatTrigger::EveryNth {
+                                    label { r#for: "fmt-nth", "N (every Nth turn)" }
+                                    input {
+                                        id: "fmt-nth",
+                                        r#type: "number",
+                                        class: "settings-input",
+                                        min: "2",
+                                        max: "20",
+                                        value: "{format_nth}",
+                                        oninput: move |evt: Event<FormData>| {
+                                            if let Ok(v) = evt.value().parse::<u32>() {
+                                                let v = v.max(2);
+                                                format_nth.set(v);
+                                                save("parley_format_nth", &v.to_string());
+                                            }
+                                        },
+                                    }
+                                }
+
+                                label { r#for: "fmt-depth", "Reformat depth (chunks)" }
+                                input {
+                                    id: "fmt-depth",
+                                    r#type: "number",
+                                    class: "settings-input",
+                                    min: "1",
+                                    max: "6",
+                                    value: "{format_depth}",
+                                    oninput: move |evt: Event<FormData>| {
+                                        if let Ok(v) = evt.value().parse::<usize>() {
+                                            let v = v.clamp(1, 6);
+                                            format_depth.set(v);
+                                            save("parley_format_depth", &v.to_string());
+                                        }
+                                    },
+                                }
+                                p { class: "settings-hint",
+                                    "Chunks for auto-format. \u{00b6} Reformat always uses Sonnet on the full transcript."
+                                }
+                            }
                         }
                     }
                 }
@@ -2075,81 +2162,6 @@ pub fn App() -> Element {
 
                     p { class: "settings-hint",
                         "If set, Claude will automatically detect paragraph breaks in your transcript."
-                    }
-
-                    // ── Formatting section ──────────────────────────
-                    if !anthropic_key().is_empty() {
-                        div { class: "settings-section-header", "Formatting" }
-
-                        label { r#for: "format-model", "Model" }
-                        select {
-                            id: "format-model",
-                            class: "settings-input",
-                            value: "{format_model}",
-                            onchange: move |evt: Event<FormData>| {
-                                let val = evt.value();
-                                format_model.set(val.clone());
-                                save("parley_format_model", &val);
-                            },
-                            option { value: "claude-haiku-4-5-20251001", "Haiku 4.5 (fast, cheap)" }
-                            option { value: "claude-sonnet-4-6-20250514", "Sonnet 4.6 (better)" }
-                        }
-
-                        label { r#for: "format-trigger", "Auto-format" }
-                        select {
-                            id: "format-trigger",
-                            class: "settings-input",
-                            value: "{format_trigger().cookie_value()}",
-                            onchange: move |evt: Event<FormData>| {
-                                let t = FormatTrigger::from_cookie(&evt.value());
-                                format_trigger.set(t);
-                                save("parley_format_trigger", t.cookie_value());
-                            },
-                            option { value: "every-turn", "Every turn" }
-                            option { value: "every-nth", "Every Nth turn" }
-                            option { value: "on-stop", "On stop only" }
-                            option { value: "manual", "Manual only" }
-                            option { value: "off", "Off" }
-                        }
-
-                        if format_trigger() == FormatTrigger::EveryNth {
-                            label { r#for: "format-nth", "N (every Nth turn)" }
-                            input {
-                                id: "format-nth",
-                                r#type: "number",
-                                class: "settings-input",
-                                min: "2",
-                                max: "20",
-                                value: "{format_nth}",
-                                oninput: move |evt: Event<FormData>| {
-                                    if let Ok(v) = evt.value().parse::<u32>() {
-                                        let v = v.max(2);
-                                        format_nth.set(v);
-                                        save("parley_format_nth", &v.to_string());
-                                    }
-                                },
-                            }
-                        }
-
-                        label { r#for: "format-depth", "Reformat depth (chunks)" }
-                        input {
-                            id: "format-depth",
-                            r#type: "number",
-                            class: "settings-input",
-                            min: "1",
-                            max: "6",
-                            value: "{format_depth}",
-                            oninput: move |evt: Event<FormData>| {
-                                if let Ok(v) = evt.value().parse::<usize>() {
-                                    let v = v.clamp(1, 6);
-                                    format_depth.set(v);
-                                    save("parley_format_depth", &v.to_string());
-                                }
-                            },
-                        }
-                        p { class: "settings-hint",
-                            "Number of recent chunks sent for formatting. The ¶ Reformat button always reformats the entire transcript."
-                        }
                     }
 
                     // ── Speakers section ────────────────────────────
@@ -2517,9 +2529,69 @@ body {
 .btn-endturn:hover { background: #1a4a7a; }
 .btn-clear { background: transparent; color: #8888aa; border: 1px solid #8888aa; }
 .btn-clear:hover { color: #e0e0e0; border-color: #e0e0e0; }
-.btn-reformat { background: transparent; color: #b8a9c9; border: 1px solid #b8a9c9; }
-.btn-reformat:hover { color: #e0d0f0; border-color: #e0d0f0; }
-.btn-reformat:disabled { opacity: 0.5; cursor: not-allowed; }
+/* Format combo button */
+.format-combo {
+    position: relative;
+    display: inline-flex;
+}
+.btn-reformat-main {
+    background: transparent;
+    color: #b8a9c9;
+    border: 1px solid #b8a9c9;
+    border-radius: 8px 0 0 8px;
+    padding: 0.65rem 1rem;
+}
+.btn-reformat-main:hover { color: #e0d0f0; border-color: #e0d0f0; }
+.btn-reformat-main:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-reformat-arrow {
+    background: transparent;
+    color: #b8a9c9;
+    border: 1px solid #b8a9c9;
+    border-left: none;
+    border-radius: 0 8px 8px 0;
+    padding: 0.65rem 0.5rem;
+    font-size: 0.85rem;
+}
+.btn-reformat-arrow:hover { color: #e0d0f0; border-color: #e0d0f0; }
+.format-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 90;
+}
+.format-menu {
+    position: absolute;
+    bottom: 110%;
+    right: 0;
+    min-width: 260px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    z-index: 91;
+    padding: 0.8rem 1rem;
+}
+.format-menu-title {
+    font-weight: 700;
+    color: #e0e0e0;
+    margin-bottom: 0.6rem;
+    font-size: 0.95rem;
+}
+.format-menu label {
+    display: block;
+    color: #b0b0cc;
+    font-size: 0.82rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.2rem;
+}
+.format-menu .settings-input {
+    width: 100%;
+    box-sizing: border-box;
+}
+.format-menu .settings-hint {
+    color: #888;
+    font-size: 0.78rem;
+    margin-top: 0.4rem;
+}
 
 /* Transfer combo button */
 .transfer-combo {
