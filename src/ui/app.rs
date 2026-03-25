@@ -1253,9 +1253,10 @@ pub fn App() -> Element {
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty() {
-                                        if let Some(result) =
-                                            check_formatting(&key, &text, multi, &model, depth, ctx_depth)
-                                                .await
+                                        if let Some(result) = check_formatting(
+                                            &key, &text, multi, &model, depth, ctx_depth,
+                                        )
+                                        .await
                                         {
                                             // Accumulate LLM cost
                                             let model_val = (format_model)();
@@ -1523,192 +1524,225 @@ pub fn App() -> Element {
         spawn(async move {
             let multi = (speaker2_enabled)();
 
-        // 1. Stop audio capture — no more audio sent to STT
-        if let Some(cap_rc) = (capture_handle)().as_ref() {
-            if let Some(cap) = cap_rc.borrow_mut().take() {
-                cap.stop();
-            }
-        }
-        if multi {
-            if let Some(cap_rc) = (capture_handle2)().as_ref() {
+            // 1. Stop audio capture — no more audio sent to STT
+            if let Some(cap_rc) = (capture_handle)().as_ref() {
                 if let Some(cap) = cap_rc.borrow_mut().take() {
                     cap.stop();
                 }
             }
-        }
-
-        // 2. Force endpoint on active sessions and reset formatted flags
-        let s1_has_partial = !(partial)().is_empty();
-        let s2_has_partial = multi && !(partial2)().is_empty();
-
-        if s1_has_partial {
-            if let Some(ref ff) = (turn_is_formatted1_shared)() {
-                ff.set(false);
+            if multi {
+                if let Some(cap_rc) = (capture_handle2)().as_ref() {
+                    if let Some(cap) = cap_rc.borrow_mut().take() {
+                        cap.stop();
+                    }
+                }
             }
-        }
-        if s2_has_partial {
-            if let Some(ref ff) = (turn_is_formatted2_shared)() {
-                ff.set(false);
-            }
-        }
 
-        if let Some(sess_rc) = (session_handle)().as_ref() {
-            if let Some(ref sess) = *sess_rc.borrow() {
-                let _ = sess.force_endpoint();
+            // 2. Force endpoint on active sessions and reset formatted flags
+            let s1_has_partial = !(partial)().is_empty();
+            let s2_has_partial = multi && !(partial2)().is_empty();
+
+            if s1_has_partial {
+                if let Some(ref ff) = (turn_is_formatted1_shared)() {
+                    ff.set(false);
+                }
             }
-        }
-        if multi {
-            if let Some(sess_rc) = (session_handle2)().as_ref() {
+            if s2_has_partial {
+                if let Some(ref ff) = (turn_is_formatted2_shared)() {
+                    ff.set(false);
+                }
+            }
+
+            if let Some(sess_rc) = (session_handle)().as_ref() {
                 if let Some(ref sess) = *sess_rc.borrow() {
                     let _ = sess.force_endpoint();
                 }
             }
-        }
-
-        // 3. Wait for formatted responses (5s safety timeout)
-        let deadline = js_sys::Date::now() + 5_000.0;
-        loop {
-            let s1_done = !s1_has_partial
-                || (turn_is_formatted1_shared)()
-                    .as_ref()
-                    .map(|f| f.get())
-                    .unwrap_or(true);
-            let s2_done = !s2_has_partial
-                || (turn_is_formatted2_shared)()
-                    .as_ref()
-                    .map(|f| f.get())
-                    .unwrap_or(true);
-            if (s1_done && s2_done) || js_sys::Date::now() >= deadline {
-                break;
+            if multi {
+                if let Some(sess_rc) = (session_handle2)().as_ref() {
+                    if let Some(ref sess) = *sess_rc.borrow() {
+                        let _ = sess.force_endpoint();
+                    }
+                }
             }
-            gloo_timers::future::TimeoutFuture::new(50).await;
-        }
 
-        // 4. Terminate sessions
-        if let Some(sess_rc) = (session_handle)().as_ref() {
-            if let Some(ref sess) = *sess_rc.borrow() {
-                let _ = sess.terminate();
+            // 3. Wait for formatted responses (5s safety timeout)
+            let deadline = js_sys::Date::now() + 5_000.0;
+            loop {
+                let s1_done = !s1_has_partial
+                    || (turn_is_formatted1_shared)()
+                        .as_ref()
+                        .map(|f| f.get())
+                        .unwrap_or(true);
+                let s2_done = !s2_has_partial
+                    || (turn_is_formatted2_shared)()
+                        .as_ref()
+                        .map(|f| f.get())
+                        .unwrap_or(true);
+                if (s1_done && s2_done) || js_sys::Date::now() >= deadline {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(50).await;
             }
-        }
-        if multi {
-            if let Some(sess_rc) = (session_handle2)().as_ref() {
+
+            // 4. Terminate sessions
+            if let Some(sess_rc) = (session_handle)().as_ref() {
                 if let Some(ref sess) = *sess_rc.borrow() {
                     let _ = sess.terminate();
                 }
             }
-        }
-
-        // 5. Flush speaker 1 partial
-        let start = (session_start_time)().unwrap_or(0.0);
-        let ls = (last_committed_speaker)();
-        let p1 = (partial)();
-        if !p1.is_empty() {
             if multi {
-                if let Some(ref live_rc) = (live_turns_shared)() {
-                    let elapsed = js_sys::Date::now() - start;
-                    let new_words = split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
-                    let mut words = live_rc.borrow_mut();
-                    for w in new_words {
-                        let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
-                        words.insert(pos, w);
+                if let Some(sess_rc) = (session_handle2)().as_ref() {
+                    if let Some(ref sess) = *sess_rc.borrow() {
+                        let _ = sess.terminate();
                     }
                 }
-            } else {
-                let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
-                let name = (speaker1_name)();
-                let prev = (transcript)();
-                let elapsed = js_sys::Date::now() - start;
-                let new_text = build_committed_text(
-                    &prev,
-                    &p1,
-                    &name,
-                    false,
-                    (show_labels)(),
-                    (show_timestamps)(),
-                    elapsed,
-                    &ls_name,
-                );
-                transcript.set(new_text);
-                if let Some(ref ls_rc) = ls {
-                    *ls_rc.borrow_mut() = name;
-                }
             }
-            partial.set(String::new());
-        }
-        // Flush speaker 2 partial
-        if multi {
-            let p2 = (partial2)();
-            if !p2.is_empty() {
-                if let Some(ref live_rc) = (live_turns_shared)() {
+
+            // 5. Flush speaker 1 partial
+            let start = (session_start_time)().unwrap_or(0.0);
+            let ls = (last_committed_speaker)();
+            let p1 = (partial)();
+            if !p1.is_empty() {
+                if multi {
+                    if let Some(ref live_rc) = (live_turns_shared)() {
+                        let elapsed = js_sys::Date::now() - start;
+                        let new_words = split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
+                        let mut words = live_rc.borrow_mut();
+                        for w in new_words {
+                            let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                            words.insert(pos, w);
+                        }
+                    }
+                } else {
+                    let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
+                    let name = (speaker1_name)();
+                    let prev = (transcript)();
                     let elapsed = js_sys::Date::now() - start;
-                    let new_words = split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
-                    let mut words = live_rc.borrow_mut();
-                    for w in new_words {
-                        let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
-                        words.insert(pos, w);
+                    let new_text = build_committed_text(
+                        &prev,
+                        &p1,
+                        &name,
+                        false,
+                        (show_labels)(),
+                        (show_timestamps)(),
+                        elapsed,
+                        &ls_name,
+                    );
+                    transcript.set(new_text);
+                    if let Some(ref ls_rc) = ls {
+                        *ls_rc.borrow_mut() = name;
                     }
                 }
-                partial2.set(String::new());
+                partial.set(String::new());
             }
-            // Force-graduate all remaining live words
-            if let Some(ref live_rc) = (live_turns_shared)() {
-                let ls_rc = ls
-                    .clone()
-                    .unwrap_or_else(|| Rc::new(RefCell::new(String::new())));
-                graduate_live_words(
-                    live_rc,
-                    &mut transcript,
-                    &ls_rc,
-                    f64::MAX,
-                    f64::MAX,
-                    start,
-                    (show_labels)(),
-                    (show_timestamps)(),
-                );
-                live_turns_version.set(live_turns_version() + 1);
+            // Flush speaker 2 partial
+            if multi {
+                let p2 = (partial2)();
+                if !p2.is_empty() {
+                    if let Some(ref live_rc) = (live_turns_shared)() {
+                        let elapsed = js_sys::Date::now() - start;
+                        let new_words = split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
+                        let mut words = live_rc.borrow_mut();
+                        for w in new_words {
+                            let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
+                            words.insert(pos, w);
+                        }
+                    }
+                    partial2.set(String::new());
+                }
+                // Force-graduate all remaining live words
+                if let Some(ref live_rc) = (live_turns_shared)() {
+                    let ls_rc = ls
+                        .clone()
+                        .unwrap_or_else(|| Rc::new(RefCell::new(String::new())));
+                    graduate_live_words(
+                        live_rc,
+                        &mut transcript,
+                        &ls_rc,
+                        f64::MAX,
+                        f64::MAX,
+                        start,
+                        (show_labels)(),
+                        (show_timestamps)(),
+                    );
+                    live_turns_version.set(live_turns_version() + 1);
+                }
             }
-        }
-        // Run paragraph detection (gated by trigger strategy)
-        let akey = (anthropic_key)();
-        let do_auto_format = (auto_format_enabled)();
-        let do_format_on_stop = (format_on_stop)();
-        if !akey.is_empty() && do_auto_format
-        {
-            let model = (format_model)();
-            let depth = (format_depth)();
-            let ctx_depth = (format_context_depth)();
-            let mut t = transcript.clone();
-            let mut llm = llm_cost.clone();
-            spawn(async move {
-                let text = (t)();
-                if !text.is_empty() {
-                    if let Some(result) = check_formatting(&akey, &text, multi, &model, depth, ctx_depth).await
-                    {
-                        let (in_rate, out_rate) = llm_rates(&model);
-                        llm.set(
-                            llm()
-                                + token_cost(
-                                    result.input_tokens,
-                                    result.output_tokens,
-                                    in_rate,
-                                    out_rate,
-                                ),
-                        );
-                        if let Some(formatted) = result.formatted {
-                            let cursor = get_cursor();
-                            t.set(formatted);
-                            if let Some((s, e)) = cursor {
-                                restore_cursor(s, e);
+            // Run paragraph detection (gated by trigger strategy)
+            let akey = (anthropic_key)();
+            let do_auto_format = (auto_format_enabled)();
+            let do_format_on_stop = (format_on_stop)();
+            if !akey.is_empty() && do_auto_format {
+                let model = (format_model)();
+                let depth = (format_depth)();
+                let ctx_depth = (format_context_depth)();
+                let mut t = transcript.clone();
+                let mut llm = llm_cost.clone();
+                spawn(async move {
+                    let text = (t)();
+                    if !text.is_empty() {
+                        if let Some(result) =
+                            check_formatting(&akey, &text, multi, &model, depth, ctx_depth).await
+                        {
+                            let (in_rate, out_rate) = llm_rates(&model);
+                            llm.set(
+                                llm()
+                                    + token_cost(
+                                        result.input_tokens,
+                                        result.output_tokens,
+                                        in_rate,
+                                        out_rate,
+                                    ),
+                            );
+                            if let Some(formatted) = result.formatted {
+                                let cursor = get_cursor();
+                                t.set(formatted);
+                                if let Some((s, e)) = cursor {
+                                    restore_cursor(s, e);
+                                }
                             }
                         }
                     }
-                }
-                // Full-transcript Sonnet pass on stop
-                if do_format_on_stop {
+                    // Full-transcript Sonnet pass on stop
+                    if do_format_on_stop {
+                        let sonnet = "claude-sonnet-4-6-20250514";
+                        let text = (t)();
+                        if !text.is_empty() {
+                            if let Some(result) =
+                                check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                            {
+                                let (in_rate, out_rate) = llm_rates(sonnet);
+                                llm.set(
+                                    llm()
+                                        + token_cost(
+                                            result.input_tokens,
+                                            result.output_tokens,
+                                            in_rate,
+                                            out_rate,
+                                        ),
+                                );
+                                if let Some(formatted) = result.formatted {
+                                    let cursor = get_cursor();
+                                    t.set(formatted);
+                                    if let Some((s, e)) = cursor {
+                                        restore_cursor(s, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            } else if !akey.is_empty() && do_format_on_stop {
+                // Auto-format disabled — skip incremental but still do the full Sonnet pass
+                let mut t = transcript.clone();
+                let mut llm = llm_cost.clone();
+                spawn(async move {
                     let sonnet = "claude-sonnet-4-6-20250514";
                     let text = (t)();
                     if !text.is_empty() {
-                        if let Some(result) = check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                        if let Some(result) =
+                            check_formatting(&akey, &text, multi, sonnet, 0, 0).await
                         {
                             let (in_rate, out_rate) = llm_rates(sonnet);
                             llm.set(
@@ -1729,40 +1763,10 @@ pub fn App() -> Element {
                             }
                         }
                     }
-                }
-            });
-        } else if !akey.is_empty() && do_format_on_stop {
-            // Auto-format disabled — skip incremental but still do the full Sonnet pass
-            let mut t = transcript.clone();
-            let mut llm = llm_cost.clone();
-            spawn(async move {
-                let sonnet = "claude-sonnet-4-6-20250514";
-                let text = (t)();
-                if !text.is_empty() {
-                    if let Some(result) = check_formatting(&akey, &text, multi, sonnet, 0, 0).await {
-                        let (in_rate, out_rate) = llm_rates(sonnet);
-                        llm.set(
-                            llm()
-                                + token_cost(
-                                    result.input_tokens,
-                                    result.output_tokens,
-                                    in_rate,
-                                    out_rate,
-                                ),
-                        );
-                        if let Some(formatted) = result.formatted {
-                            let cursor = get_cursor();
-                            t.set(formatted);
-                            if let Some((s, e)) = cursor {
-                                restore_cursor(s, e);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        rec_state.set(RecState::Stopped);
-        status_msg.set("Stopped".into());
+                });
+            }
+            rec_state.set(RecState::Stopped);
+            status_msg.set("Stopped".into());
         }); // end spawn
     };
 
@@ -2207,7 +2211,12 @@ pub fn App() -> Element {
                     }
                 }
                 if has_text {
-                    button { class: "btn btn-clear", disabled: state == RecState::Stopping, onclick: on_clear, "Clear" }
+                    button {
+                        class: "btn btn-clear",
+                        disabled: state == RecState::Stopping,
+                        onclick: on_clear,
+                        "Clear"
+                    }
                 }
                 if !(anthropic_key)().is_empty() {
                     div { class: "format-combo",
