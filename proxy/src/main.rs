@@ -213,6 +213,10 @@ async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
     // Extract Haiku's response and prepend the prefilled "{"
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(json) => {
+            // Extract token usage from the Anthropic response
+            let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+            let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
+
             let raw = json["content"]
                 .as_array()
                 .and_then(|arr| arr.first())
@@ -227,15 +231,33 @@ async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
                     if let Some(formatted) = parsed["formatted"].as_str() {
                         if !words_match(&body.text, formatted) {
                             eprintln!("[proxy] Haiku changed words — rejecting response");
-                            return (StatusCode::OK, Json(serde_json::json!({"changed": false})));
+                            return (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "changed": false,
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                })),
+                            );
                         }
                     }
-                    (StatusCode::OK, Json(parsed))
+                    // Merge token usage into the response
+                    let mut result = parsed;
+                    result["input_tokens"] = serde_json::json!(input_tokens);
+                    result["output_tokens"] = serde_json::json!(output_tokens);
+                    (StatusCode::OK, Json(result))
                 }
                 Err(_) => {
                     // Haiku returned invalid JSON — treat as no change
                     eprintln!("[proxy] Haiku returned invalid JSON: {full_json}");
-                    (StatusCode::OK, Json(serde_json::json!({"changed": false})))
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "changed": false,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                        })),
+                    )
                 }
             }
         }

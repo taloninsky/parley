@@ -120,6 +120,13 @@ fn set_tab_title(title: &str) {
     }
 }
 
+/// Result from a formatting check, including optional token usage for cost tracking.
+struct FormatResult {
+    formatted: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
 // ── Formatting detection via proxy → Claude Haiku ────────────────────
 /// Send the last unformatted chunk to Haiku.  If Haiku says formatting is
 /// needed it returns the formatted text which we splice back into the
@@ -130,7 +137,8 @@ async fn check_formatting(
     multi_speaker: bool,
     model: &str,
     depth: usize,
-) -> Option<String> {
+    context_depth: usize,
+) -> Option<FormatResult> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
@@ -184,14 +192,25 @@ async fn check_formatting(
         let parsed: serde_json::Value =
             serde_json::from_str(&js_sys::JSON::stringify(&json_val).ok()?.as_string()?).ok()?;
 
+        let input_tokens = parsed["input_tokens"].as_u64().unwrap_or(0);
+        let output_tokens = parsed["output_tokens"].as_u64().unwrap_or(0);
+
         if !parsed["changed"].as_bool().unwrap_or(false) {
             web_sys::console::log_1(&"[parley] Reformat: no changes needed".into());
-            return None;
+            return Some(FormatResult {
+                formatted: None,
+                input_tokens,
+                output_tokens,
+            });
         }
 
         let formatted = parsed["formatted"].as_str()?.to_string();
         web_sys::console::log_1(&"[parley] Reformat: applied formatting".into());
-        return Some(formatted);
+        return Some(FormatResult {
+            formatted: Some(formatted),
+            input_tokens,
+            output_tokens,
+        });
     }
 
     // ── Windowed mode (depth > 0) ───────────────────────────────────
@@ -223,8 +242,8 @@ async fn check_formatting(
 
     let total = chunks.len();
 
-    // Window size: editable = depth, context padding depends on speaker mode
-    let context_padding: usize = if multi_speaker { 2 } else { 1 };
+    // Window size: editable = depth, context padding is user-configurable
+    let context_padding: usize = context_depth;
     let max_editable = depth;
     let max_win = depth + context_padding;
     let win = total.min(max_win);
@@ -307,10 +326,17 @@ async fn check_formatting(
     let parsed: serde_json::Value =
         serde_json::from_str(&js_sys::JSON::stringify(&json_val).ok()?.as_string()?).ok()?;
 
+    let input_tokens = parsed["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = parsed["output_tokens"].as_u64().unwrap_or(0);
+
     let changed = parsed["changed"].as_bool().unwrap_or(false);
     if !changed {
         web_sys::console::log_1(&"[parley] Haiku says no formatting needed".into());
-        return None;
+        return Some(FormatResult {
+            formatted: None,
+            input_tokens,
+            output_tokens,
+        });
     }
 
     let formatted_tail = parsed["formatted"].as_str()?.to_string();
@@ -323,7 +349,40 @@ async fn check_formatting(
         result.push_str("\n\n");
     }
     result.push_str(&formatted_tail);
-    Some(result)
+    Some(FormatResult {
+        formatted: Some(result),
+        input_tokens,
+        output_tokens,
+    })
+}
+
+// ── Cost helpers ────────────────────────────────────────────────────
+/// Return (input_rate, output_rate) in $/token for the given Anthropic model ID.
+fn llm_rates(model: &str) -> (f64, f64) {
+    if model.contains("sonnet") {
+        // Sonnet 4.6: $3/MTok input, $15/MTok output
+        (3.0 / 1_000_000.0, 15.0 / 1_000_000.0)
+    } else {
+        // Haiku 4.5: $1/MTok input, $5/MTok output
+        (1.0 / 1_000_000.0, 5.0 / 1_000_000.0)
+    }
+}
+
+/// Compute dollar cost from token counts and per-token rates.
+fn token_cost(input_tokens: u64, output_tokens: u64, in_rate: f64, out_rate: f64) -> f64 {
+    (input_tokens as f64) * in_rate + (output_tokens as f64) * out_rate
+}
+
+/// Format a dollar amount for display. Shows 4 decimal places, or
+/// fewer if the amount is large enough.
+fn format_cost(dollars: f64) -> String {
+    if dollars < 0.01 {
+        format!("{:.4}", dollars)
+    } else if dollars < 1.0 {
+        format!("{:.3}", dollars)
+    } else {
+        format!("{:.2}", dollars)
+    }
 }
 
 // ── State ───────────────────────────────────────────────────────────
@@ -331,6 +390,7 @@ async fn check_formatting(
 enum RecState {
     Idle,
     Recording,
+    Stopping,
     Stopped,
 }
 
@@ -369,44 +429,7 @@ impl TransferMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum FormatTrigger {
-    EveryTurn,
-    EveryNth,
-    OnStop,
-    Manual,
-    Off,
-}
-
-impl FormatTrigger {
-    fn cookie_value(&self) -> &'static str {
-        match self {
-            Self::EveryTurn => "every-turn",
-            Self::EveryNth => "every-nth",
-            Self::OnStop => "on-stop",
-            Self::Manual => "manual",
-            Self::Off => "off",
-        }
-    }
-    fn from_cookie(s: &str) -> Self {
-        match s {
-            "every-turn" => Self::EveryTurn,
-            "on-stop" => Self::OnStop,
-            "manual" => Self::Manual,
-            "off" => Self::Off,
-            _ => Self::EveryNth,
-        }
-    }
-    fn label(&self) -> &'static str {
-        match self {
-            Self::EveryTurn => "Every turn",
-            Self::EveryNth => "Every Nth turn",
-            Self::OnStop => "On stop only",
-            Self::Manual => "Manual only",
-            Self::Off => "Off",
-        }
-    }
-}
+// (FormatTrigger enum removed — replaced by auto_format_enabled bool signal)
 
 fn format_timestamp(elapsed_ms: f64) -> String {
     let total_secs = (elapsed_ms / 1000.0) as u32;
@@ -718,10 +741,10 @@ pub fn App() -> Element {
     let mut format_model = use_signal(|| {
         load("parley_format_model").unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string())
     });
-    let mut format_trigger = use_signal(|| {
-        load("parley_format_trigger")
-            .map(|s| FormatTrigger::from_cookie(&s))
-            .unwrap_or(FormatTrigger::EveryNth)
+    let mut auto_format_enabled = use_signal(|| {
+        load("parley_auto_format")
+            .map(|s| s != "false")
+            .unwrap_or(true)
     });
     let mut format_nth = use_signal(|| {
         load("parley_format_nth")
@@ -733,7 +756,28 @@ pub fn App() -> Element {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(2)
     });
+    let mut format_context_depth = use_signal(|| {
+        load("parley_format_context_depth")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+    });
+    let mut format_on_stop = use_signal(|| {
+        load("parley_format_on_stop")
+            .map(|s| s == "true")
+            .unwrap_or(true)
+    });
     let reformatting = use_signal(|| false);
+
+    // ── Cost tracking ───────────────────────────────────────────────
+    let mut show_cost_meter = use_signal(|| {
+        load("parley_show_cost_meter")
+            .map(|v| v != "false")
+            .unwrap_or(true) // on by default
+    });
+    // Accumulated STT cost in dollars (updated by ticker based on elapsed time)
+    let mut stt_cost = use_signal(|| 0.0_f64);
+    // Accumulated LLM cost in dollars (updated after each formatting call)
+    let mut llm_cost = use_signal(|| 0.0_f64);
 
     // ── Speaker 1 handles ───────────────────────────────────────────
     let capture_handle: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
@@ -742,6 +786,7 @@ pub fn App() -> Element {
     let mut current_turn_shared: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
     let mut needs_paragraph_check_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
+    let mut turn_is_formatted1_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
 
     // ── Speaker 2 handles ───────────────────────────────────────────
     let capture_handle2: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
@@ -749,6 +794,7 @@ pub fn App() -> Element {
         use_signal(|| None);
     let mut current_turn_shared2: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared2: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
+    let mut turn_is_formatted2_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
 
     // ── Live zone (multi-speaker chrono insertion) ───────────────────
     let mut live_turns_shared: Signal<Option<Rc<RefCell<Vec<LiveWord>>>>> = use_signal(|| None);
@@ -841,10 +887,12 @@ pub fn App() -> Element {
             let turn_commit_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
             // Track when the current turn started speaking
             let speech_start1: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+            let formatted_flag1: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
             current_turn_shared.set(Some(current_turn1.clone()));
             current_turn_order_shared.set(Some(current_turn_order1.clone()));
             needs_paragraph_check_shared.set(Some(needs_para_check.clone()));
+            turn_is_formatted1_shared.set(Some(formatted_flag1.clone()));
 
             let session1 = {
                 let last_activity = last_activity.clone();
@@ -860,10 +908,11 @@ pub fn App() -> Element {
                 let live_rc = live_turns_rc.clone();
                 let s2_for_force = session2_rc_for_s1.clone();
                 let mut ltv = live_turns_version.clone();
+                let ff1 = formatted_flag1.clone();
 
                 match AssemblyAiSession::connect(
                     &token1,
-                    move |text, _is_formatted, turn_order| {
+                    move |text, is_formatted, turn_order| {
                         last_activity.set(js_sys::Date::now());
                         let text = text.replace('\n', " ").replace("  ", " ");
 
@@ -911,17 +960,10 @@ pub fn App() -> Element {
                                         restore_cursor(s, e);
                                     }
                                 }
-                                if !(anthropic_key)().is_empty() {
+                                if !(anthropic_key)().is_empty() && (auto_format_enabled)() {
                                     tcc.set(tcc.get() + 1);
-                                    let trigger = (format_trigger)();
-                                    match trigger {
-                                        FormatTrigger::EveryTurn => npc.set(true),
-                                        FormatTrigger::EveryNth => {
-                                            if tcc.get() % (format_nth)() == 0 {
-                                                npc.set(true);
-                                            }
-                                        }
-                                        _ => {}
+                                    if tcc.get() % (format_nth)() == 0 {
+                                        npc.set(true);
                                     }
                                 }
                             }
@@ -937,6 +979,7 @@ pub fn App() -> Element {
                         cto.set(turn_order);
                         *ct.borrow_mut() = text.clone();
                         p_sig.set(text);
+                        ff1.set(is_formatted);
                     },
                     {
                         let mut rec_state = rec_state.clone();
@@ -1003,9 +1046,11 @@ pub fn App() -> Element {
                             let ct2: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
                             let cto2: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
                             let speech_start2: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+                            let formatted_flag2: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
                             current_turn_shared2.set(Some(ct2.clone()));
                             current_turn_order_shared2.set(Some(cto2.clone()));
+                            turn_is_formatted2_shared.set(Some(formatted_flag2.clone()));
 
                             let session2 = {
                                 let last_activity = last_activity.clone();
@@ -1019,10 +1064,11 @@ pub fn App() -> Element {
                                 let live_rc = live_turns_rc.clone();
                                 let s1_for_force = session1_rc.clone();
                                 let mut ltv = live_turns_version.clone();
+                                let ff2 = formatted_flag2.clone();
 
                                 match AssemblyAiSession::connect(
                                     tok2,
-                                    move |text, _is_formatted, turn_order| {
+                                    move |text, is_formatted, turn_order| {
                                         last_activity.set(js_sys::Date::now());
                                         let text = text.replace('\n', " ").replace("  ", " ");
 
@@ -1050,17 +1096,12 @@ pub fn App() -> Element {
                                                 }
                                                 drop(words);
                                                 ltv.set(ltv() + 1);
-                                                if !(anthropic_key)().is_empty() {
+                                                if !(anthropic_key)().is_empty()
+                                                    && (auto_format_enabled)()
+                                                {
                                                     tcc.set(tcc.get() + 1);
-                                                    let trigger = (format_trigger)();
-                                                    match trigger {
-                                                        FormatTrigger::EveryTurn => npc.set(true),
-                                                        FormatTrigger::EveryNth => {
-                                                            if tcc.get() % (format_nth)() == 0 {
-                                                                npc.set(true);
-                                                            }
-                                                        }
-                                                        _ => {}
+                                                    if tcc.get() % (format_nth)() == 0 {
+                                                        npc.set(true);
                                                     }
                                                 }
                                             }
@@ -1075,6 +1116,7 @@ pub fn App() -> Element {
                                         cto.set(turn_order);
                                         *ct.borrow_mut() = text.clone();
                                         p2_sig.set(text);
+                                        ff2.set(is_formatted);
                                     },
                                     {
                                         let mut rec_state = rec_state.clone();
@@ -1192,24 +1234,47 @@ pub fn App() -> Element {
                             let remaining_secs = (remaining_ms / 1000.0).ceil() as u32;
                             countdown_secs.set(Some(remaining_secs));
 
+                            // STT cost accumulation (runs every second while recording)
+                            {
+                                // $0.45/hr per session = $0.000125/sec
+                                let rate_per_sec = if multi { 0.000125 * 2.0 } else { 0.000125 };
+                                stt_cost.set(stt_cost() + rate_per_sec);
+                            }
+
                             // Paragraph detection
                             if ticker_needs_para.get() {
                                 ticker_needs_para.set(false);
                                 let key = (anthropic_key)();
                                 let model = (format_model)();
                                 let depth = (format_depth)();
+                                let ctx_depth = (format_context_depth)();
                                 let mut t = transcript_t.clone();
+                                let mut llm = llm_cost.clone();
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty() {
-                                        if let Some(formatted) =
-                                            check_formatting(&key, &text, multi, &model, depth)
+                                        if let Some(result) =
+                                            check_formatting(&key, &text, multi, &model, depth, ctx_depth)
                                                 .await
                                         {
-                                            let cursor = get_cursor();
-                                            t.set(formatted);
-                                            if let Some((s, e)) = cursor {
-                                                restore_cursor(s, e);
+                                            // Accumulate LLM cost
+                                            let model_val = (format_model)();
+                                            let (in_rate, out_rate) = llm_rates(&model_val);
+                                            llm.set(
+                                                llm()
+                                                    + token_cost(
+                                                        result.input_tokens,
+                                                        result.output_tokens,
+                                                        in_rate,
+                                                        out_rate,
+                                                    ),
+                                            );
+                                            if let Some(formatted) = result.formatted {
+                                                let cursor = get_cursor();
+                                                t.set(formatted);
+                                                if let Some((s, e)) = cursor {
+                                                    restore_cursor(s, e);
+                                                }
                                             }
                                         }
                                     }
@@ -1451,32 +1516,89 @@ pub fn App() -> Element {
 
     // ── Stop ────────────────────────────────────────────────────────
     let on_stop = move |_| {
-        let multi = (speaker2_enabled)();
-        // Stop speaker 1 capture
+        // Immediately enter Stopping state — disables all buttons
+        rec_state.set(RecState::Stopping);
+        status_msg.set("Waiting for final transcript\u{2026}".into());
+
+        spawn(async move {
+            let multi = (speaker2_enabled)();
+
+        // 1. Stop audio capture — no more audio sent to STT
         if let Some(cap_rc) = (capture_handle)().as_ref() {
             if let Some(cap) = cap_rc.borrow_mut().take() {
                 cap.stop();
             }
         }
-        if let Some(sess_rc) = (session_handle)().as_ref() {
-            if let Some(ref sess) = *sess_rc.borrow() {
-                let _ = sess.terminate();
-            }
-        }
-        // Stop speaker 2 capture
         if multi {
             if let Some(cap_rc) = (capture_handle2)().as_ref() {
                 if let Some(cap) = cap_rc.borrow_mut().take() {
                     cap.stop();
                 }
             }
+        }
+
+        // 2. Force endpoint on active sessions and reset formatted flags
+        let s1_has_partial = !(partial)().is_empty();
+        let s2_has_partial = multi && !(partial2)().is_empty();
+
+        if s1_has_partial {
+            if let Some(ref ff) = (turn_is_formatted1_shared)() {
+                ff.set(false);
+            }
+        }
+        if s2_has_partial {
+            if let Some(ref ff) = (turn_is_formatted2_shared)() {
+                ff.set(false);
+            }
+        }
+
+        if let Some(sess_rc) = (session_handle)().as_ref() {
+            if let Some(ref sess) = *sess_rc.borrow() {
+                let _ = sess.force_endpoint();
+            }
+        }
+        if multi {
+            if let Some(sess_rc) = (session_handle2)().as_ref() {
+                if let Some(ref sess) = *sess_rc.borrow() {
+                    let _ = sess.force_endpoint();
+                }
+            }
+        }
+
+        // 3. Wait for formatted responses (5s safety timeout)
+        let deadline = js_sys::Date::now() + 5_000.0;
+        loop {
+            let s1_done = !s1_has_partial
+                || (turn_is_formatted1_shared)()
+                    .as_ref()
+                    .map(|f| f.get())
+                    .unwrap_or(true);
+            let s2_done = !s2_has_partial
+                || (turn_is_formatted2_shared)()
+                    .as_ref()
+                    .map(|f| f.get())
+                    .unwrap_or(true);
+            if (s1_done && s2_done) || js_sys::Date::now() >= deadline {
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+
+        // 4. Terminate sessions
+        if let Some(sess_rc) = (session_handle)().as_ref() {
+            if let Some(ref sess) = *sess_rc.borrow() {
+                let _ = sess.terminate();
+            }
+        }
+        if multi {
             if let Some(sess_rc) = (session_handle2)().as_ref() {
                 if let Some(ref sess) = *sess_rc.borrow() {
                     let _ = sess.terminate();
                 }
             }
         }
-        // Flush speaker 1 partial
+
+        // 5. Flush speaker 1 partial
         let start = (session_start_time)().unwrap_or(0.0);
         let ls = (last_committed_speaker)();
         let p1 = (partial)();
@@ -1548,26 +1670,92 @@ pub fn App() -> Element {
         }
         // Run paragraph detection (gated by trigger strategy)
         let akey = (anthropic_key)();
-        let trigger = (format_trigger)();
-        if !akey.is_empty()
-            && matches!(
-                trigger,
-                FormatTrigger::EveryTurn | FormatTrigger::EveryNth | FormatTrigger::OnStop
-            )
+        let do_auto_format = (auto_format_enabled)();
+        let do_format_on_stop = (format_on_stop)();
+        if !akey.is_empty() && do_auto_format
         {
             let model = (format_model)();
             let depth = (format_depth)();
+            let ctx_depth = (format_context_depth)();
             let mut t = transcript.clone();
+            let mut llm = llm_cost.clone();
             spawn(async move {
                 let text = (t)();
                 if !text.is_empty() {
-                    if let Some(formatted) =
-                        check_formatting(&akey, &text, multi, &model, depth).await
+                    if let Some(result) = check_formatting(&akey, &text, multi, &model, depth, ctx_depth).await
                     {
-                        let cursor = get_cursor();
-                        t.set(formatted);
-                        if let Some((s, e)) = cursor {
-                            restore_cursor(s, e);
+                        let (in_rate, out_rate) = llm_rates(&model);
+                        llm.set(
+                            llm()
+                                + token_cost(
+                                    result.input_tokens,
+                                    result.output_tokens,
+                                    in_rate,
+                                    out_rate,
+                                ),
+                        );
+                        if let Some(formatted) = result.formatted {
+                            let cursor = get_cursor();
+                            t.set(formatted);
+                            if let Some((s, e)) = cursor {
+                                restore_cursor(s, e);
+                            }
+                        }
+                    }
+                }
+                // Full-transcript Sonnet pass on stop
+                if do_format_on_stop {
+                    let sonnet = "claude-sonnet-4-6-20250514";
+                    let text = (t)();
+                    if !text.is_empty() {
+                        if let Some(result) = check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                        {
+                            let (in_rate, out_rate) = llm_rates(sonnet);
+                            llm.set(
+                                llm()
+                                    + token_cost(
+                                        result.input_tokens,
+                                        result.output_tokens,
+                                        in_rate,
+                                        out_rate,
+                                    ),
+                            );
+                            if let Some(formatted) = result.formatted {
+                                let cursor = get_cursor();
+                                t.set(formatted);
+                                if let Some((s, e)) = cursor {
+                                    restore_cursor(s, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        } else if !akey.is_empty() && do_format_on_stop {
+            // Auto-format disabled — skip incremental but still do the full Sonnet pass
+            let mut t = transcript.clone();
+            let mut llm = llm_cost.clone();
+            spawn(async move {
+                let sonnet = "claude-sonnet-4-6-20250514";
+                let text = (t)();
+                if !text.is_empty() {
+                    if let Some(result) = check_formatting(&akey, &text, multi, sonnet, 0, 0).await {
+                        let (in_rate, out_rate) = llm_rates(sonnet);
+                        llm.set(
+                            llm()
+                                + token_cost(
+                                    result.input_tokens,
+                                    result.output_tokens,
+                                    in_rate,
+                                    out_rate,
+                                ),
+                        );
+                        if let Some(formatted) = result.formatted {
+                            let cursor = get_cursor();
+                            t.set(formatted);
+                            if let Some((s, e)) = cursor {
+                                restore_cursor(s, e);
+                            }
                         }
                     }
                 }
@@ -1575,6 +1763,7 @@ pub fn App() -> Element {
         }
         rec_state.set(RecState::Stopped);
         status_msg.set("Stopped".into());
+        }); // end spawn
     };
 
     // ── Continue ────────────────────────────────────────────────────
@@ -1708,6 +1897,9 @@ pub fn App() -> Element {
             live_rc.borrow_mut().clear();
             live_turns_version.set(live_turns_version() + 1);
         }
+        // Reset cost counters
+        stt_cost.set(0.0);
+        llm_cost.set(0.0);
         if rec_state() == RecState::Stopped {
             rec_state.set(RecState::Idle);
             status_msg.set("Ready".into());
@@ -1721,15 +1913,28 @@ pub fn App() -> Element {
         let multi = (speaker2_enabled)();
         let mut t = transcript.clone();
         let mut r = reformatting.clone();
+        let mut llm = llm_cost.clone();
         spawn(async move {
             r.set(true);
             let text = (t)();
             if !text.is_empty() && !key.is_empty() {
-                if let Some(formatted) = check_formatting(&key, &text, multi, &model, 0).await {
-                    let cursor = get_cursor();
-                    t.set(formatted);
-                    if let Some((s, e)) = cursor {
-                        restore_cursor(s, e);
+                if let Some(result) = check_formatting(&key, &text, multi, &model, 0, 0).await {
+                    let (in_rate, out_rate) = llm_rates(&model);
+                    llm.set(
+                        llm()
+                            + token_cost(
+                                result.input_tokens,
+                                result.output_tokens,
+                                in_rate,
+                                out_rate,
+                            ),
+                    );
+                    if let Some(formatted) = result.formatted {
+                        let cursor = get_cursor();
+                        t.set(formatted);
+                        if let Some((s, e)) = cursor {
+                            restore_cursor(s, e);
+                        }
                     }
                 }
             }
@@ -1907,6 +2112,12 @@ pub fn App() -> Element {
                         button { class: "btn btn-endturn", onclick: on_end_turn1, "\u{23ce} End Turn" }
                     }
                 }
+                if state == RecState::Stopping {
+                    button { class: "btn btn-stop", disabled: true, "\u{25a0} Stop" }
+                    if !multi {
+                        button { class: "btn btn-endturn", disabled: true, "\u{23ce} End Turn" }
+                    }
+                }
                 if state == RecState::Stopped && has_text {
                     button { class: "btn btn-continue", onclick: on_continue, "\u{25cf} Continue" }
                 }
@@ -1915,6 +2126,7 @@ pub fn App() -> Element {
                     div { class: "transfer-combo",
                         button {
                             class: "btn btn-transfer-main",
+                            disabled: state == RecState::Stopping,
                             onclick: on_transfer,
                             if let Some(ref feedback) = fb {
                                 "{feedback}"
@@ -1995,14 +2207,14 @@ pub fn App() -> Element {
                     }
                 }
                 if has_text {
-                    button { class: "btn btn-clear", onclick: on_clear, "Clear" }
+                    button { class: "btn btn-clear", disabled: state == RecState::Stopping, onclick: on_clear, "Clear" }
                 }
                 if !(anthropic_key)().is_empty() {
                     div { class: "format-combo",
                         button {
                             class: "btn btn-reformat-main",
                             onclick: on_reformat,
-                            disabled: !has_text || reformatting(),
+                            disabled: !has_text || reformatting() || state == RecState::Stopping,
                             if reformatting() {
                                 "Reformatting\u{2026}"
                             } else {
@@ -2022,7 +2234,7 @@ pub fn App() -> Element {
                             div { class: "format-menu",
                                 div { class: "format-menu-title", "Formatting Settings" }
 
-                                label { r#for: "fmt-model", "Auto-format model" }
+                                label { r#for: "fmt-model", "Incremental auto-format model" }
                                 select {
                                     id: "fmt-model",
                                     class: "settings-input",
@@ -2036,35 +2248,31 @@ pub fn App() -> Element {
                                     option { value: "claude-sonnet-4-6-20250514", "Sonnet 4.6 (better)" }
                                 }
 
-                                label { r#for: "fmt-trigger", "Auto-format trigger" }
-                                select {
-                                    id: "fmt-trigger",
-                                    class: "settings-input",
-                                    value: "{format_trigger().cookie_value()}",
-                                    onchange: move |evt: Event<FormData>| {
-                                        let t = FormatTrigger::from_cookie(&evt.value());
-                                        format_trigger.set(t);
-                                        save("parley_format_trigger", t.cookie_value());
-                                    },
-                                    option { value: "every-turn", "Every turn" }
-                                    option { value: "every-nth", "Every Nth turn" }
-                                    option { value: "on-stop", "On stop only" }
-                                    option { value: "manual", "Manual only" }
-                                    option { value: "off", "Off" }
+                                label { class: "checkbox-label",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: auto_format_enabled(),
+                                        onchange: move |evt: Event<FormData>| {
+                                            let val = evt.value() == "true";
+                                            auto_format_enabled.set(val);
+                                            save("parley_auto_format", if val { "true" } else { "false" });
+                                        },
+                                    }
+                                    " Auto-format every N turns"
                                 }
 
-                                if format_trigger() == FormatTrigger::EveryNth {
+                                if auto_format_enabled() {
                                     label { r#for: "fmt-nth", "N (every Nth turn)" }
                                     input {
                                         id: "fmt-nth",
                                         r#type: "number",
                                         class: "settings-input",
-                                        min: "2",
+                                        min: "1",
                                         max: "20",
                                         value: "{format_nth}",
                                         oninput: move |evt: Event<FormData>| {
                                             if let Ok(v) = evt.value().parse::<u32>() {
-                                                let v = v.max(2);
+                                                let v = v.max(1);
                                                 format_nth.set(v);
                                                 save("parley_format_nth", &v.to_string());
                                             }
@@ -2088,8 +2296,39 @@ pub fn App() -> Element {
                                         }
                                     },
                                 }
+
+                                label { r#for: "fmt-ctx-depth", "Additional visibility depth (chunks)" }
+                                input {
+                                    id: "fmt-ctx-depth",
+                                    r#type: "number",
+                                    class: "settings-input",
+                                    min: "1",
+                                    max: "6",
+                                    value: "{format_context_depth}",
+                                    oninput: move |evt: Event<FormData>| {
+                                        if let Ok(v) = evt.value().parse::<usize>() {
+                                            let v = v.clamp(1, 6);
+                                            format_context_depth.set(v);
+                                            save("parley_format_context_depth", &v.to_string());
+                                        }
+                                    },
+                                }
+
                                 p { class: "settings-hint",
-                                    "Chunks for auto-format. \u{00b6} Reformat always uses Sonnet on the full transcript."
+                                    "\u{00b6} Reformat always uses Sonnet 4.6 on the full transcript."
+                                }
+
+                                label { class: "checkbox-label",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: format_on_stop(),
+                                        onchange: move |evt: Event<FormData>| {
+                                            let val = evt.value() == "true";
+                                            format_on_stop.set(val);
+                                            save("parley_format_on_stop", if val { "true" } else { "false" });
+                                        },
+                                    }
+                                    " Also format on stop (full pass, Sonnet 4.6)"
                                 }
                             }
                         }
@@ -2099,8 +2338,18 @@ pub fn App() -> Element {
 
             // ── Status bar ──────────────────────────────────────────
             div { class: "status-bar",
-                span { class: if state == RecState::Recording { "status-dot recording" } else { "status-dot" } }
-                span { "{status_msg}" }
+                div { class: "status-left",
+                    span { class: if state == RecState::Recording { "status-dot recording" } else { "status-dot" } }
+                    span { "{status_msg}" }
+                }
+                if (show_cost_meter)() && (stt_cost() > 0.0 || llm_cost() > 0.0) {
+                    div {
+                        class: "cost-meter",
+                        title: "STT: ${format_cost(stt_cost())} + LLM: ${format_cost(llm_cost())}",
+                        span { class: "cost-meter-label", "$" }
+                        span { class: "cost-meter-value", "{format_cost(stt_cost() + llm_cost())}" }
+                    }
+                }
             }
 
             // ── Settings drawer ─────────────────────────────────────
@@ -2162,6 +2411,23 @@ pub fn App() -> Element {
 
                     p { class: "settings-hint",
                         "If set, Claude will automatically detect paragraph breaks in your transcript."
+                    }
+
+                    // ── Cost meter toggle ────────────────────────────
+                    label { class: "option-row settings-option-row",
+                        input {
+                            r#type: "checkbox",
+                            checked: "{show_cost_meter}",
+                            onchange: move |evt: Event<FormData>| {
+                                let v = evt.checked();
+                                show_cost_meter.set(v);
+                                save("parley_show_cost_meter", if v { "true" } else { "false" });
+                            },
+                        }
+                        "Show cost meter"
+                    }
+                    p { class: "settings-hint",
+                        "Display a running estimate of API costs (STT + LLM) in the status bar."
                     }
 
                     // ── Speakers section ────────────────────────────
@@ -2673,9 +2939,15 @@ body {
 .status-bar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 0.5rem;
     font-size: 0.85rem;
     color: #8888aa;
+}
+.status-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
 }
 .status-dot {
     width: 8px;
@@ -2690,6 +2962,41 @@ body {
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
+}
+
+/* Cost meter */
+.cost-meter {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    color: #4ecca3;
+    cursor: default;
+}
+.cost-meter-label {
+    font-weight: 600;
+    color: #4ecca3;
+    opacity: 0.7;
+}
+.cost-meter-value {
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* Settings option row (outside speaker cards) */
+.settings-option-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: #c0c0d0;
+    margin-top: 1.2rem;
+    cursor: pointer;
+}
+.settings-option-row input {
+    accent-color: #4ecca3;
+    cursor: pointer;
 }
 
 /* Settings overlay + drawer */
