@@ -1,8 +1,8 @@
 # Word Graph Data Model — Specification
 
-> Status: **Draft**
+> Status: **Design**
 > Author: Gavin + Copilot
-> Date: 2026-03-25
+> Date: 2026-03-25 (Draft) → 2026-03-25 (Design)
 
 ---
 
@@ -113,10 +113,13 @@ Cross-cutting boolean properties that can apply to any node regardless of kind. 
 ```rust
 type NodeFlags = u16;
 
-const FLAG_FILLER: NodeFlags = 1 << 0;  // word is a filler (um, uh, er, ah, etc.)
+const FLAG_FILLER: NodeFlags      = 1 << 0;  // word is a filler (um, uh, er, ah, etc.)
+const FLAG_TURN_LOCKED: NodeFlags = 1 << 1;  // node belongs to an in-progress turn (not yet editable)
 ```
 
 When all bits are zero, the node has no special flags — this is the default, zero-cost case.
+
+`FLAG_TURN_LOCKED` marks nodes that are still part of an active STT turn. While set, the UI renders the node normally (inline in the transcript) but prevents user editing. When the turn commits (`end_of_turn: true`), the flag is cleared on all nodes belonging to that turn, making them editable. This eliminates the need for a separate "live zone" — all words live in the graph from the moment they arrive.
 
 Future flag candidates (not defined until needed): proper noun, technical term, bold, italic, underline, strikethrough.
 
@@ -143,9 +146,13 @@ struct Node {
 
 ```rust
 impl Node {
-    fn is_filler(&self) -> bool  { self.flags & FLAG_FILLER != 0 }
-    fn set_filler(&mut self)     { self.flags |= FLAG_FILLER; }
-    fn clear_filler(&mut self)   { self.flags &= !FLAG_FILLER; }
+    fn is_filler(&self) -> bool       { self.flags & FLAG_FILLER != 0 }
+    fn set_filler(&mut self)          { self.flags |= FLAG_FILLER; }
+    fn clear_filler(&mut self)        { self.flags &= !FLAG_FILLER; }
+
+    fn is_turn_locked(&self) -> bool  { self.flags & FLAG_TURN_LOCKED != 0 }
+    fn set_turn_locked(&mut self)     { self.flags |= FLAG_TURN_LOCKED; }
+    fn clear_turn_locked(&mut self)   { self.flags &= !FLAG_TURN_LOCKED; }
 }
 ```
 
@@ -225,6 +232,19 @@ struct WordGraph {
 
 Arena-based: `NodeId` is an index into `nodes`. No `Rc`, no pointer cycles, no borrow checker issues. Cache-friendly iteration. Trivially serializable.
 
+**Adjacency index:** For O(1) edge lookup by source node, the graph maintains a secondary index:
+
+```rust
+use std::collections::HashMap;
+
+/// Maps NodeId → indices into the `edges` vec for outgoing edges from that node.
+outgoing: HashMap<NodeId, Vec<usize>>,
+/// Maps NodeId → indices into the `edges` vec for incoming edges to that node.
+incoming: HashMap<NodeId, Vec<usize>>,
+```
+
+The flat `Vec<Edge>` remains the source of truth. The `HashMap` indices are maintained on insert/remove and enable `edges_from()` and `edges_to()` to run in O(degree) rather than O(|E|).
+
 ### 3.2 Core operations
 
 ```rust
@@ -233,8 +253,10 @@ impl WordGraph {
     fn new() -> Self;
 
     // ── Ingest ──
-    /// Add nodes from an STT turn event. Appends to the speaker's lane.
-    fn ingest_turn(&mut self, speaker: u8, words: &[SttWord]);
+    /// Add or update nodes from an STT turn event.
+    /// Partial turns (end_of_turn=false): updates existing turn-locked nodes in place.
+    /// Final turns (end_of_turn=true): finalizes nodes, clears FLAG_TURN_LOCKED.
+    fn ingest_turn(&mut self, speaker: u8, words: &[SttWord], end_of_turn: bool);
 
     // ── Query ──
     /// Walk the primary spine for a speaker, return node IDs in order.
@@ -242,6 +264,9 @@ impl WordGraph {
 
     /// Get outgoing edges of a specific kind from a node.
     fn edges_from(&self, node: NodeId, kind: EdgeKind) -> Vec<&Edge>;
+
+    /// Get incoming edges of a specific kind to a node.
+    fn edges_to(&self, node: NodeId, kind: EdgeKind) -> Vec<&Edge>;
 
     /// Get all nodes below a confidence threshold.
     fn low_confidence_nodes(&self, threshold: f32) -> Vec<NodeId>;
@@ -251,7 +276,7 @@ impl WordGraph {
     fn project(&self, opts: &ProjectionOpts) -> String;
 
     /// Interleaved multi-speaker projection using Temporal edges.
-    fn project_interleaved(&self, opts: &ProjectionOpts) -> String;
+    fn project_interleaved(&self, opts: &ProjectionOpts) -> Vec<ProjectedBlock>;
 
     // ── Editing ──
     /// Replace a span of nodes with new text. Old nodes are bypassed,
@@ -275,6 +300,13 @@ impl WordGraph {
     // ── Filler detection ──
     /// Scan all Word nodes against a filler word list and set FLAG_FILLER.
     fn detect_fillers(&mut self, filler_words: &[&str]);
+
+    // ── LLM exchange ──
+    /// Serialize a span of nodes into an array of LlmExchangeEntry for LLM input.
+    fn to_llm_exchange(&self, start: NodeId, end: NodeId) -> Vec<LlmExchangeEntry>;
+
+    /// Apply LLM output back to the graph. Maps returned entries by node_id.
+    fn apply_llm_exchange(&mut self, entries: &[LlmExchangeEntry]);
 }
 ```
 
@@ -286,10 +318,45 @@ struct SttWord {
     start_ms: f64,
     end_ms: f64,
     confidence: f32,
+    word_is_final: bool,
 }
 ```
 
-This is what the AssemblyAI v3 `words` array provides per word in a Turn event. The `ingest_turn` method converts these into `Node` entries with `origin: Stt`, detects fillers, creates punctuation nodes for trailing punctuation, and wires `Next` edges.
+This maps directly to the AssemblyAI v3 `words` array in a Turn event. Each Turn message includes a `words` array with the following JSON structure per word:
+
+```json
+{
+  "start": 2160,       // start time in ms (integer)
+  "end": 2560,         // end time in ms (integer)
+  "text": "Hi,",       // word text (may include trailing punctuation)
+  "confidence": 0.868, // 0.0–1.0 recognition confidence
+  "word_is_final": true // true = finalized, false = may still change
+}
+```
+
+The full Turn event contains these top-level fields (11 properties):
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | `"Turn"` | Message type discriminator |
+| `turn_order` | `u32` | Incrementing turn counter (0, 1, 2, …) |
+| `turn_is_formatted` | `bool` | Always `true` for u3-rt-pro |
+| `end_of_turn` | `bool` | `true` = turn complete; `false` = partial |
+| `end_of_turn_confidence` | `f64` | Model's confidence the turn has ended (0.0–1.0) |
+| `transcript` | `String` | Running transcript for the current turn |
+| `utterance` | `String` | Finalized utterance text (empty unless utterance boundary) |
+| `words` | `Vec<SttWord>` | Word-level data: text, timing, confidence, finality |
+| `speaker_label` | `String?` | Speaker label (only when `speaker_labels=true`) |
+| `language_code` | `String?` | Detected language (only when `language_detection=true`) |
+| `language_confidence` | `f64?` | Language detection confidence |
+
+**Key observations from the v3 API:**
+- Timestamps are integers (milliseconds), not floats. We store as `f64` internally for future sub-ms precision.
+- `word_is_final: false` means the word may still change in subsequent Turn messages. Non-final words should update existing graph nodes in-place rather than appending new ones.
+- Punctuation is **attached to the word text** by the model (e.g., `"Hi,"`, `"Sonny."`, `"agent."`). The `ingest_turn` method splits trailing punctuation into separate `Punctuation` nodes.
+- Partial words appear during transcription (e.g., `"Son"` → `"Sonny"` → `"Sonny."`). The graph tracks which nodes belong to the current turn via `FLAG_TURN_LOCKED` and updates them as new Turn messages arrive.
+
+The `ingest_turn` method converts `SttWord` entries into `Node` entries with `origin: Stt`, detects fillers, splits trailing punctuation into separate nodes, and wires `Next` edges.
 
 ### 3.4 ProjectionOpts — filters for display
 
@@ -351,9 +418,9 @@ graph LR
 
 The bypassed nodes (dashed borders) remain in the arena. The `Correction` edge allows undo and provenance tracking.
 
-### 4.2 Undo
+### 4.2 Undo (deferred)
 
-Undo reverses the spine rewiring: restore the original `Next` edges, remove the new nodes from the spine. The `Correction` edge allows finding the old nodes. For multi-word edits, all nodes involved in a single user action share a logical edit group (an incrementing edit counter stored on the `Correction` edge or as a side-table).
+Undo is not in scope for v0.5. The `Correction` edge infrastructure supports undo structurally (walk edges backward, restore bypassed nodes), but the UI integration and edit grouping logic will be designed later. The graph's additive model ensures nothing is lost — undo can be added without data model changes.
 
 ### 4.3 LLM formatting as an edit
 
@@ -404,6 +471,86 @@ When `ingest_turn` processes STT words, each word's lowercased `text` is checked
 ### 5.3 User-configurable fillers
 
 The filler list is a setting (stored as a cookie, comma-separated). Users can add words. The detection runs at ingest time, so changing the list only affects new words. A `redetect_fillers` operation can re-scan existing nodes if the user changes the list mid-session.
+
+---
+
+## 5A. Punctuation Splitting
+
+### 5A.1 Splitting rules
+
+AssemblyAI v3 attaches punctuation to word text (e.g., `"Hi,"`, `"Sonny."`, `"agent."`). During `ingest_turn`, trailing punctuation is split from each word into a separate `Punctuation` node.
+
+**Built-in punctuation characters** (split from word trailing edge):
+
+```rust
+const DEFAULT_PUNCTUATION: &[char] = &['.', ',', ';', ':', '!', '?', '\u{2014}', '"', '\''];
+// \u{2014} is em-dash
+```
+
+**Splitting regex:**
+
+```rust
+/// Match one or more trailing punctuation characters at the end of a word.
+let punct_re = Regex::new(r"([.,;:!?\u{2014}\"']+)$").unwrap();
+```
+
+**Algorithm:**
+
+For each `SttWord` during ingest:
+1. Check if `word.text` ends with one or more characters from the punctuation set.
+2. If yes: strip the trailing punctuation, create a `Word` node with the remaining text, then create a `Punctuation` node with the stripped characters. Wire them with a `Next` edge.
+3. If no trailing punctuation: create a `Word` node with the full text.
+
+**Edge cases:**
+- **Contractions** (`"don't"`, `"it's"`): The apostrophe is mid-word. The regex only matches *trailing* punctuation, so contractions are kept as a single `Word` node. ✅
+- **Abbreviations** (`"Mr."`, `"U.S.A."`): The trailing period is split off. `"Mr"` + `"."`. This may incorrectly split some abbreviations but is acceptable — the word text is still correct, and the punctuation node is adjacent.
+- **Multiple trailing** (`"really?!"`): All trailing punctuation becomes one `Punctuation` node: `"really"` + `"?!"`.
+- **Pure punctuation** (`"---"`): If the entire text is punctuation, it becomes a `Punctuation` node with no preceding `Word` node.
+
+### 5A.2 Custom punctuation
+
+Like filler words, the punctuation set is user-configurable:
+
+| Setting | Type | Default | Cookie |
+|---|---|---|---|
+| Custom punctuation | text (comma-separated) | *(empty)* | `parley_custom_punctuation` |
+
+Custom punctuation characters are merged with `DEFAULT_PUNCTUATION` at ingest time.
+
+---
+
+## 5B. Silence and Break Nodes
+
+### 5B.1 Silence detection
+
+When `ingest_turn` processes consecutive words, it checks the gap between `word[i].end_ms` and `word[i+1].start_ms`. If the gap exceeds the silence threshold, a `Silence` node is inserted between them on the spine.
+
+```rust
+const DEFAULT_SILENCE_THRESHOLD_MS: f64 = 5000.0; // 5 seconds
+```
+
+The `Silence` node has:
+- `kind: Silence`
+- `text: ""` (empty)
+- `start_ms` / `end_ms` set to the gap boundaries
+- `confidence: 1.0` (silence is certain)
+- Same `speaker` as the surrounding words
+
+### 5B.2 Break insertion
+
+Breaks are structural separators. They are created in these situations:
+
+1. **Turn boundaries:** When a new turn arrives (`turn_order` increments), a `Break` node (`text: "\n"`) is inserted between the last node of the previous turn and the first node of the new turn.
+2. **LLM formatting:** The LLM may insert paragraph breaks (`text: "\n\n"`) via the exchange format (see §11).
+3. **User action:** The user presses Enter in the transcript to insert a manual break.
+
+No automatic silence-to-break promotion. If a gap exceeds the silence threshold, only a `Silence` node is created. The LLM formatting pass can choose to promote silences to paragraph breaks based on content analysis.
+
+### 5B.3 Configurable thresholds
+
+| Setting | Type | Default | Cookie |
+|---|---|---|---|
+| Silence threshold (ms) | number | 5000 | `parley_silence_threshold` |
 
 ---
 
@@ -604,23 +751,167 @@ New settings in the settings drawer, under a **"Transcript Quality"** section (v
 |---|---|---|---|
 | Strip filler words | checkbox | on | `parley_strip_fillers` |
 | Custom filler words | text (comma-separated) | *(empty)* | `parley_custom_fillers` |
+| Custom punctuation | text (comma-separated) | *(empty)* | `parley_custom_punctuation` |
 | Highlight low-confidence words | checkbox | on | `parley_highlight_confidence` |
 | Confidence threshold | number (0.0–1.0) | 0.85 | `parley_confidence_threshold` |
+| Silence threshold (ms) | number | 5000 | `parley_silence_threshold` |
 | Verbatim mode | checkbox | off | `parley_verbatim` |
 
 **Verbatim mode** is a master override: when on, it forces `include_fillers: true` in the projection and disables auto-formatting. The other settings are grayed out. The confidence highlighting can remain active in verbatim mode (it's informational, not a cleanup action).
 
 ---
 
-## 10. Implementation Sequence
+## 10. Partials in the Graph
 
-1. **Define `Node`, `Edge`, `WordGraph` structs** — pure data, no UI dependency. New module: `src/graph/mod.rs`.
-2. **Parse word-level data from AssemblyAI Turn events** — extend `on_transcript` callback to receive `Vec<SttWord>` alongside the flat transcript string.
-3. **`ingest_turn`** — populate the graph from STT words. Detect fillers. Create punctuation nodes.
+### 10.1 Design: no separate live zone
+
+In previous versions, partial (in-progress) turns lived in a separate `LiveWord` vector and rendered in a distinct "Live — sorting…" zone between the transcript and the current-turn boxes. This created a three-tier data model (transcript string, live word vector, current turn string) and forced the user to visually chase text between three locations.
+
+In v0.5, **all words live in the graph from the moment they arrive**. There is no live zone. The transcript display is a single, unified projection of the graph.
+
+### 10.2 How it works
+
+1. **Partial Turn arrives** (`end_of_turn: false`): `ingest_turn` creates/updates nodes in the graph with `FLAG_TURN_LOCKED` set. These nodes appear in the transcript projection but are rendered with a visual indicator (e.g., slightly dimmed or with a subtle background) and are not user-editable.
+
+2. **Subsequent partials arrive** (same `turn_order`): `ingest_turn` detects that turn-locked nodes for this speaker already exist and updates them in-place — text changes (e.g., `"Son"` → `"Sonny"`), timing updates, confidence updates. The `word_is_final` field from the API helps: final words are stable; non-final words may change.
+
+3. **Turn commits** (`end_of_turn: true`): `ingest_turn` processes the final word array, updates all nodes to their final state, and clears `FLAG_TURN_LOCKED` on all nodes belonging to this turn. The nodes are now fully part of the permanent spine and are user-editable.
+
+### 10.3 What this replaces
+
+The following are removed in v0.5:
+- `LiveWord` struct
+- `live_turns_shared: Signal<Option<Rc<RefCell<Vec<LiveWord>>>>>`
+- `render_live_zone()` function
+- `split_turn_to_words()` helper
+- `turn_start_time1_shared` / `turn_start_time2_shared` signals
+- `live_turns_version` signal
+- The "Live — sorting…" UI zone
+- The graduation system (partition_point, 15s safety valve)
+
+The `partial: Signal<String>` and `partial2: Signal<String>` signals are also removed. The current turn's text is simply the turn-locked region of the graph, visible in the unified projection.
+
+### 10.4 Multi-speaker ordering
+
+With partials in the graph, multi-speaker ordering happens naturally via temporal edges. When speaker 1's turn arrives while speaker 0 is still talking, both sets of turn-locked nodes exist on their respective spines. The `analyze_temporal` pass creates cross-lane edges as words arrive, establishing the interleaving order. No separate graduation or chronological insertion logic is needed.
+
+---
+
+## 11. LLM Exchange Format
+
+### 11.1 The problem
+
+The LLM formatting pass receives text and returns text. But the graph stores structured nodes with IDs, confidence, timing, and origin metadata. We need a bidirectional mapping between the graph and the LLM's input/output.
+
+### 11.2 Exchange struct
+
+```rust
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LlmExchangeEntry {
+    node_id: NodeId,          // graph node this entry maps to
+    text: String,             // word/punctuation/break text
+    kind: NodeKind,           // Word, Punctuation, Break, Silence
+    speaker: u8,              // speaker lane
+}
+```
+
+### 11.3 Serialization to LLM
+
+`to_llm_exchange` walks the projection (respecting the editing window — last N chunks) and produces an array of `LlmExchangeEntry`. This array is serialized as JSON and sent to the LLM alongside the formatting prompt.
+
+The LLM sees input like:
+
+```json
+[
+  { "node_id": 0, "text": "So", "kind": "Word", "speaker": 0 },
+  { "node_id": 1, "text": "um", "kind": "Word", "speaker": 0 },
+  { "node_id": 3, "text": "the", "kind": "Word", "speaker": 0 },
+  { "node_id": 5, "text": "idea", "kind": "Word", "speaker": 0 },
+  { "node_id": 7, "text": "is", "kind": "Word", "speaker": 0 }
+]
+```
+
+The LLM returns a modified array. It can:
+- **Modify text**: change `"idea"` to `"concept"` (keeps same `node_id`)
+- **Delete entries**: remove `"um"` (entry absent from output)
+- **Insert new entries**: add a new entry with `node_id: null` (or -1) for nodes that don't exist yet (e.g., punctuation, paragraph breaks)
+- **Reorder entries**: change sequence (though this is rare)
+
+### 11.4 Applying LLM output
+
+`apply_llm_exchange` receives the LLM's output array and applies changes to the graph:
+
+1. **Matched entries** (same `node_id`): if `text` changed, perform a `replace_span` for that node with `origin: LlmFormatted`.
+2. **Deleted entries** (present in input, absent in output): `delete_span` the corresponding nodes.
+3. **New entries** (`node_id` is null/absent): `insert_after` at the appropriate position with `origin: LlmFormatted`.
+4. All operations follow the non-destructive additive model — old nodes are bypassed, not removed.
+
+### 11.5 Prompt considerations
+
+The LLM prompt must instruct the model to:
+- Preserve `node_id` values for words it doesn't change
+- Return the full array (not just diffs)
+- Use `null` for `node_id` when inserting new nodes
+- Not invent or hallucinate `node_id` values
+
+This is more structured than the current flat-text approach but gives us precise graph alignment without a diff algorithm.
+
+---
+
+## 12. UI Rendering
+
+### 12.1 Rendered div (not textarea)
+
+The transcript display is a rendered `<div>` (not a `<textarea>`). This enables:
+- **Per-word confidence highlighting**: low-confidence words get a visual indicator (e.g., amber underline, background highlight)
+- **Turn-locked visual state**: turn-locked words render normally but with a subtle indicator (e.g., slightly reduced opacity) and are non-interactive
+- **Click-to-edit**: clicking a word selects it for editing
+- **Speaker-colored text**: words from different speakers can have different colors in multi-speaker mode
+- **Inline filler indicators**: fillers can be styled differently when `include_fillers: true`
+
+Each word is rendered as a `<span>` with data attributes for `node_id`, `speaker`, and relevant flags. This makes the mapping between DOM elements and graph nodes direct.
+
+### 12.2 Performance
+
+For large transcripts (thousands of words), rendering every word as a separate span can be expensive. Mitigations:
+- **Chunked rendering**: only render words in the visible viewport plus a small buffer
+- **Signal-driven updates**: only re-render the span(s) that changed when a Turn event arrives, not the entire transcript
+- **CSS-only styling**: confidence thresholds, filler status, and turn-lock state are applied via CSS classes, not inline styles
+
+### 12.3 Editable regions
+
+Words that are not turn-locked are editable. When the user clicks a word or selects a range:
+1. The selection maps to `NodeId` values via `data-node-id` attributes
+2. User types replacement text
+3. `replace_span` is called on the graph with `origin: UserTyped`
+4. The UI re-renders the affected region
+
+---
+
+## 13. Serialization & Export
+
+The word graph is an in-memory runtime structure. It is **not** persisted to disk in graph form. Export projections are:
+
+| Format | Method | Description |
+|---|---|---|
+| **Clipboard (plain text)** | `project()` | Flat text projection with current filter settings. Copies to clipboard. |
+| **Text file (.txt)** | `project()` | Same as clipboard, written to file. |
+| **Markdown file (.md)** | `project()` + YAML frontmatter | Projection with speaker labels, timestamps, and session metadata in frontmatter. |
+
+No graph serialization format (e.g., JSON graph, DOT, adjacency list) is needed for v0.5. The graph exists only in memory for the duration of a recording session. If the page refreshes, the graph is lost (same as the current flat-string transcript). Persistence across sessions is a future consideration.
+
+---
+
+## 14. Implementation Sequence
+
+1. **Define `Node`, `Edge`, `WordGraph`, `LlmExchangeEntry` structs** — pure data, no UI dependency. New module: `src/graph/mod.rs`.
+2. **Parse word-level data from AssemblyAI Turn events** — extend `on_transcript` callback to receive word-level data (the `words` array from Turn events) alongside the flat transcript string.
+3. **`ingest_turn` with FLAG_TURN_LOCKED** — populate the graph from STT words. Handle partial vs. final turns. Detect fillers. Split punctuation. Insert silence/break nodes.
 4. **`project()`** — flat text serialization for display and LLM input. Replaces the `Signal<String>` transcript.
-5. **Wire into UI** — graph becomes the backing store. Transcript display reads from `project()`. Current turn boxes continue to show live partials.
-6. **Filler detection + settings** — strip-filler toggle, custom word list.
-7. **Confidence highlighting** — render low-confidence words with visual indicator (requires moving from textarea to contenteditable or a rendered div).
-8. **Temporal analysis + interleaved projection** — replace the current `LiveWord` / `render_live_zone` system.
-9. **Non-destructive editing** — user corrections create Correction edges, bypassed nodes preserved.
-10. **LLM formatting as graph edit** — formatting pass writes back to graph via `replace_span`, not by overwriting a string.
+5. **Wire into UI as rendered div** — graph becomes the backing store. Replace textarea with rendered `<div>` of word spans. Turn-locked words render inline but non-editable.
+6. **Remove live zone** — delete `LiveWord`, `render_live_zone`, graduation system, `partial`/`partial2` signals. All text lives in the graph.
+7. **Filler detection + settings** — strip-filler toggle, custom word list, custom punctuation.
+8. **Confidence highlighting** — per-word styling in the rendered div based on confidence threshold.
+9. **LLM exchange format** — `to_llm_exchange` / `apply_llm_exchange` for structured LLM formatting pass.
+10. **Temporal analysis + interleaved projection** — multi-speaker ordering via temporal edges.
+11. **Non-destructive editing** — user corrections create Correction edges, bypassed nodes preserved.
