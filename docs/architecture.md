@@ -51,18 +51,20 @@ A span pinned to a time range, optionally on a specific lane. Annotations are th
 
 **Annotation types (initial set, expected to grow):**
 
-| Type | Scope | Description |
-|------|-------|-------------|
-| `Word` | Lane | A single transcribed word with start/end time and confidence score |
-| `Phrase` | Lane | A group of words forming a phrase or sentence, with aggregate confidence |
-| `Silence` | Session | A time range where no speech is detected on any lane. Enables skip-to-next-speech in playback. |
-| `SpeakerIdentity` | Lane | Who this lane's speaker is, with confidence and identification method |
-| `LowConfidence` | Lane | A flagged span where the model was uncertain — links to the confidence mode (off/defer/immediate) |
-| `SpatialPosition` | Lane | Estimated source position at a point in time, expressed in the spatial coordinate system (see below) |
-| `PostProcessed` | Lane | LLM-cleaned version of the raw transcription for a time range |
-| `UserCorrection` | Lane | A manual correction by the user, preserving both original and corrected text |
+| Type | Scope | Realization | Description |
+|------|-------|-------------|-------------|
+| `Word` | Lane | Graph node (`NodeKind::Word`) | A single transcribed word with start/end time and confidence score |
+| `Punctuation` | Lane | Graph node (`NodeKind::Punctuation`) | Inline punctuation (`.`, `,`, `—`, `?`) as a discrete node with independent confidence |
+| `Silence` | Lane/Session | Graph node (`NodeKind::Silence`) | A timed gap in speech. Enables skip-to-next-speech in playback. |
+| `Break` | Lane | Graph node (`NodeKind::Break`) | An explicit line or paragraph break — a structural boundary in the text |
+| `Phrase` | Lane | **Derived** — contiguous span query | A group of words between Break nodes. Not stored; emergent from graph structure. |
+| `SpeakerIdentity` | Lane | Side table (session metadata) | Who this lane's speaker is, with confidence and identification method |
+| `LowConfidence` | Lane | **Derived** — `confidence < threshold` | Not a separate entity. Every node has a confidence field; low confidence is a projection-time predicate. |
+| `SpatialPosition` | Lane | Future — per-node property or derived annotation | Estimated source position at a point in time, expressed in the spatial coordinate system (see below) |
+| `PostProcessed` | Lane | `NodeOrigin::LlmFormatted` + `Correction` edges | LLM-cleaned version. Structural — original STT nodes are bypassed but preserved via Correction edges. |
+| `UserCorrection` | Lane | `Correction` edge + bypassed nodes | Manual correction. Old and new nodes both live in the graph; edit history is structural. |
 
-The annotation system is open — new types can be added without changing the core model. An annotation is: `{ type, lane_id (optional), start_time, end_time, payload }`. The payload is type-specific.
+The annotation system is open — new types can be added without changing the core model. At the abstract level, an annotation is: `{ type, lane_id (optional), start_time, end_time, payload }`. At runtime, most annotation types are realized as nodes and edges in the word graph (see below).
 
 #### Speaker
 
@@ -129,6 +131,27 @@ The ordered sequence of processing stages for a given mode. Pipelines are compos
 #### Vocabulary
 
 User-maintained word list for domain-specific terms, names, and acronyms. Feeds into confidence checking — STT output is compared against vocabulary, and low-confidence words not in the list get flagged.
+
+#### Word Graph — Runtime Data Model
+
+The abstract annotation model above describes *what* Parley stores. The **word graph** describes *how* it is stored and manipulated at runtime. It is the concrete realization of the annotated stream during a live session.
+
+> Full specification: `docs/word-graph-spec.md`
+
+**Key insight from implementation:** The original architecture modeled annotations as separate entities layered over a timeline — a `LowConfidence` annotation points at a `Word` annotation; a `UserCorrection` annotation wraps another annotation. Building the real-time system revealed that **the word IS the annotation**. Separating the word from its metadata (confidence, origin, filler status) creates indirection that makes real-time ingest, editing, and projection harder. The word graph flattens this: metadata lives directly on each node.
+
+**Structure:**
+
+- **Nodes** — arena-allocated (`Vec<Node>`, `NodeId` = index). Each node has a `NodeKind` enum (`Word`, `Punctuation`, `Silence`, `Break`), a `NodeOrigin` enum (`Stt`, `LlmFormatted`, `UserTyped`), a `confidence` score, timing (`start_ms`, `end_ms`), speaker lane index, and a `flags: u16` bitfield for cross-cutting boolean properties (e.g., filler detection).
+- **Edges** — flat `Vec<Edge>`, each with `from: NodeId`, `to: NodeId`, `kind: EdgeKind`. Edge kinds: `Next` (primary sequence), `Alt` (alternative transcription), `Correction` (edit history), `Temporal` (cross-speaker timing, derived).
+- **Per-speaker trees** — one root per speaker lane, each a spine of `Next`-linked nodes. Occasional `Alt` branches for alternatives. Forms a **forest**.
+- **Temporal edges** make it a **DAG** — cross-speaker timing links computed by an analysis pass. These are derived artifacts: deletable and recomputable at any time.
+
+**Non-destructive editing:** All edits are additive. When words are replaced (by the user or LLM), old nodes are bypassed on the spine but remain in the arena. `Correction` edges link old nodes to their replacements. This preserves full edit history, enables undo via graph traversal, and allows "revert to STT original" for any passage.
+
+**Display is a projection:** The user never sees the graph directly. They see a filtered walk of the graph: verbatim mode (include fillers) vs. clean mode (skip fillers), single-speaker vs. interleaved, confidence-highlighted vs. plain. All are `ProjectionOpts` applied to the same graph.
+
+**Filler handling:** Filler words (um, uh, er, etc.) are detected at ingest via a configurable word list and flagged with `FLAG_FILLER` in the node's bitfield. They remain in the graph — "strip fillers" is a projection filter, not data destruction. Toggle verbatim mode and the fillers reappear.
 
 ---
 
@@ -265,6 +288,8 @@ graph TD
 The arity is unconstrained by design. A lane can have zero annotations or thousands. A word can have zero corrections or several (from different processing passes). A phrase can overlap with other phrases. Silence spans can be nested within or adjacent to any other annotation. New annotation types can be added as new node types with new edge types to existing nodes — no schema migration, no breaking changes to existing data.
 
 This graph structure also maps naturally to multiple persistence backends: serialize to JSON (nodes + edges), project to files (walk the graph and render), store in a graph database, or map to Gossamer's cell model.
+
+At runtime, the word graph (arena + adjacency list) *is* this graph — not a projection of it. The session-level type graph describes inter-entity relationships (Session → Lane → Annotation, Provenance → Profile, etc.), while the word graph describes intra-lane structure (word → next word → punctuation → break → next word, with Correction and Temporal edges forming the DAG). Both are graphs; they operate at different granularities.
 
 ---
 

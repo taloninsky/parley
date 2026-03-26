@@ -10,7 +10,32 @@ const ASSEMBLYAI_WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
 /// Fetch a temporary streaming token via the local proxy server.
 /// The proxy runs at localhost:3033 and forwards the request to AssemblyAI's
 /// v3 token endpoint, avoiding browser CORS restrictions.
+/// Retries up to 3 times with exponential backoff on failure.
 pub async fn fetch_temp_token(api_key: &str) -> Result<String, String> {
+    let mut last_err = String::new();
+
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            // Exponential backoff: 500ms, 1000ms
+            let delay_ms = 500 * (1 << (attempt - 1));
+            gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+        }
+
+        match fetch_temp_token_once(api_key).await {
+            Ok(token) => return Ok(token),
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("Token fetch attempt {} failed: {}", attempt + 1, e).into(),
+                );
+                last_err = e;
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+async fn fetch_temp_token_once(api_key: &str) -> Result<String, String> {
     let window = web_sys::window().ok_or("no window")?;
 
     let opts = web_sys::RequestInit::new();

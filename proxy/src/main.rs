@@ -1,56 +1,96 @@
+use axum::extract::State;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Max retries for transient failures on the token endpoint.
+const TOKEN_MAX_RETRIES: u32 = 3;
+/// Delay between token fetch retries.
+const TOKEN_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Shared application state holding a reusable HTTP client.
+#[derive(Clone)]
+struct AppState {
+    client: reqwest::Client,
+}
 
 #[derive(Deserialize)]
 struct TokenRequest {
     api_key: String,
 }
 
-async fn fetch_token(Json(body): Json<TokenRequest>) -> impl IntoResponse {
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get(format!("{}?expires_in_seconds=480", ASSEMBLYAI_TOKEN_URL))
-        .header("Authorization", &body.api_key)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
+async fn fetch_token(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TokenRequest>,
+) -> impl IntoResponse {
+    let client = &state.client;
+    let url = format!("{}?expires_in_seconds=480", ASSEMBLYAI_TOKEN_URL);
+
+    let mut last_err = String::new();
+    for attempt in 0..TOKEN_MAX_RETRIES {
+        if attempt > 0 {
+            eprintln!("[proxy] Token fetch retry {attempt}/{TOKEN_MAX_RETRIES}");
+            tokio::time::sleep(TOKEN_RETRY_DELAY).await;
+        }
+
+        let resp = match client
+            .get(&url)
+            .header("Authorization", &body.api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("{e:#}");
+                eprintln!("[proxy] Token fetch attempt {attempt} transport error: {last_err}");
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 || status.is_server_error() {
+            last_err = format!("AssemblyAI HTTP {status}: {text}");
+            eprintln!("[proxy] Token fetch attempt {attempt} retryable: {last_err}");
+            continue;
+        }
+
+        if !status.is_success() {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("upstream request failed: {e}")})),
+                Json(serde_json::json!({"error": format!("AssemblyAI HTTP {status}: {text}")})),
             );
         }
-    };
 
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("AssemblyAI HTTP {status}: {text}")})),
-        );
-    }
-
-    // Parse and forward the token
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(json) => match json.get("token").and_then(|t| t.as_str()) {
-            Some(token) => (StatusCode::OK, Json(serde_json::json!({"token": token}))),
-            None => (
+        // Parse and forward the token
+        return match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(json) => match json.get("token").and_then(|t| t.as_str()) {
+                Some(token) => (StatusCode::OK, Json(serde_json::json!({"token": token}))),
+                None => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": "no token in AssemblyAI response"})),
+                ),
+            },
+            Err(e) => (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": "no token in AssemblyAI response"})),
+                Json(serde_json::json!({"error": format!("parse error: {e}")})),
             ),
-        },
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("parse error: {e}")})),
-        ),
+        };
     }
+
+    // All retries exhausted
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(
+            serde_json::json!({"error": format!("upstream request failed after {TOKEN_MAX_RETRIES} attempts: {last_err}")}),
+        ),
+    )
 }
 
 // ── Formatting detection via Claude Haiku ────────────────────────────
@@ -124,8 +164,11 @@ If your output violates any of these, it will be automatically rejected.
   where "formatted" contains the full EDITABLE text with formatting applied.
   Do NOT include the CONTEXT in your output."#;
 
-async fn format_text(Json(body): Json<FormatRequest>) -> impl IntoResponse {
-    let client = reqwest::Client::new();
+async fn format_text(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FormatRequest>,
+) -> impl IntoResponse {
+    let client = &state.client;
 
     // Build user message with optional context section
     let user_msg = if body.context.is_empty() {
@@ -292,10 +335,19 @@ fn words_match(original: &str, formatted: &str) -> bool {
 async fn main() {
     let cors = CorsLayer::very_permissive();
 
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let state = Arc::new(AppState { client });
+
     let app = Router::new()
         .route("/token", post(fetch_token))
         .route("/format", post(format_text))
-        .layer(cors);
+        .layer(cors)
+        .with_state(state);
 
     let addr = "127.0.0.1:3033";
     println!("Parley token proxy listening on http://{addr}");
