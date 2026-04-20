@@ -102,9 +102,12 @@ Where this node came from. A node has exactly one origin.
 enum NodeOrigin {
     Stt,           // produced by the STT provider
     LlmFormatted,  // inserted or modified by the LLM formatting pass
-    UserTyped,      // typed by the user
+    AiGenerated,   // produced by an LLM as a conversational response (Conversation Mode)
+    UserTyped,     // typed by the user
 }
 ```
+
+`LlmFormatted` and `AiGenerated` are distinct: `LlmFormatted` describes nodes that originated as STT (or another origin) and were post-processed by an LLM formatter; `AiGenerated` describes nodes that were *originally produced by an LLM* as a turn in a conversation, with no underlying audio source. AI agent lanes in Conversation Mode are populated with `AiGenerated` nodes (see [conversation-mode-spec.md §1.5](conversation-mode-spec.md#15-dependencies--word-graph-slice-must-land-first)).
 
 ### 1.3 NodeFlags (bitfield — combinable)
 

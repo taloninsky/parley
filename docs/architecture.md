@@ -137,12 +137,14 @@ User-maintained word list for domain-specific terms, names, and acronyms. Feeds 
 The abstract annotation model above describes *what* Parley stores. The **word graph** describes *how* it is stored and manipulated at runtime. It is the concrete realization of the annotated stream during a live session.
 
 > Full specification: `docs/word-graph-spec.md`
+>
+> Implementation: `src/word_graph/` — currently the **minimal slice** (nodes, edges with `Next` only, arena+adjacency, `ingest_turn`, `walk_spine`, `edges_from`/`to`) per the Conversation Mode prerequisite (`docs/conversation-mode-spec.md` §1.5). The remaining graph features (`Alt`/`Correction`/`Temporal` edges, non-destructive editing, projection filters) will be added as the features that need them ship.
 
 **Key insight from implementation:** The original architecture modeled annotations as separate entities layered over a timeline — a `LowConfidence` annotation points at a `Word` annotation; a `UserCorrection` annotation wraps another annotation. Building the real-time system revealed that **the word IS the annotation**. Separating the word from its metadata (confidence, origin, filler status) creates indirection that makes real-time ingest, editing, and projection harder. The word graph flattens this: metadata lives directly on each node.
 
 **Structure:**
 
-- **Nodes** — arena-allocated (`Vec<Node>`, `NodeId` = index). Each node has a `NodeKind` enum (`Word`, `Punctuation`, `Silence`, `Break`), a `NodeOrigin` enum (`Stt`, `LlmFormatted`, `UserTyped`), a `confidence` score, timing (`start_ms`, `end_ms`), speaker lane index, and a `flags: u16` bitfield for cross-cutting boolean properties (e.g., filler detection).
+- **Nodes** — arena-allocated (`Vec<Node>`, `NodeId` = index). Each node has a `NodeKind` enum (`Word`, `Punctuation`, `Silence`, `Break`), a `NodeOrigin` enum (`Stt`, `LlmFormatted`, `AiGenerated`, `UserTyped`), a `confidence` score, timing (`start_ms`, `end_ms`), speaker lane index, and a `flags: u16` bitfield for cross-cutting boolean properties (e.g., filler detection).
 - **Edges** — flat `Vec<Edge>`, each with `from: NodeId`, `to: NodeId`, `kind: EdgeKind`. Edge kinds: `Next` (primary sequence), `Alt` (alternative transcription), `Correction` (edit history), `Temporal` (cross-speaker timing, derived).
 - **Per-speaker trees** — one root per speaker lane, each a spine of `Next`-linked nodes. Occasional `Alt` branches for alternatives. Forms a **forest**.
 - **Temporal edges** make it a **DAG** — cross-speaker timing links computed by an analysis pass. These are derived artifacts: deletable and recomputable at any time.
