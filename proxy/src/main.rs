@@ -7,6 +7,7 @@ use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
 mod llm;
+mod orchestrator;
 mod registry;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";

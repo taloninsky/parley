@@ -9,6 +9,7 @@
 //! See `docs/architecture.md` for the broader system shape.
 
 pub mod chat;
+pub mod conversation;
 pub mod model_config;
 pub mod persona;
 pub mod speaker;

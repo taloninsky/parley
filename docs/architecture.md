@@ -589,3 +589,58 @@ parley/
 | `serde` + `toml` + `serde_yaml` | Serialization |
 | `pulldown-cmark` | Markdown parsing (document reading feature) |
 | `ort` (ONNX Runtime) | Local model inference (Whisper, speaker embeddings) |
+
+---
+
+## Implemented Today (Phase 4b checkpoint)
+
+The structure above is the long-term target. The repository today contains a Cargo workspace with three members; the directory layout has not yet been migrated to the `models/ providers/ engine/ persistence/` shape above.
+
+```
+parley/                  # WASM-targeted Dioxus frontend (root crate `parley`)
+parley-core/             # WASM-clean shared data types + invariants
+proxy/                   # Native sidecar binary `parley-proxy`
+```
+
+### `parley-core`
+
+WASM-clean. No `tokio`, no I/O, no audio. Holds the data model the frontend, proxy, and (eventually) the file format share.
+
+- `chat` — `ChatMessage`, `ChatRole`, `ChatToken`, `TokenUsage`, `Cost`
+- `model_config` — `ModelConfig`, `ModelConfigId`, `LlmProviderTag`, `TokenRates`
+- `persona` — `Persona`, `PersonaId`, `SystemPrompt::{Inline, File}`, tier/voice/TTS settings
+- `speaker` — `Speaker`, `SpeakerId`, kind enum (human / ai_agent / unknown)
+- `word_graph` — node/edge types for the annotated stream
+- **`conversation`** *(new)* — `ConversationSession`, `Turn`, `TurnProvenance`, `PersonaActivation`, `TurnId`. The persistable state of one Conversation Mode session: ordered turns, registered speakers, and the history of (persona, model) activations so we can answer "who said what with which model" from the file alone.
+
+### `proxy`
+
+Native, async, owns I/O and credentials. Will eventually expose an HTTP endpoint to the WASM frontend.
+
+- `llm` — `LlmProvider` trait + `AnthropicLlm` streaming implementation, plus an SSE decoder hardened for chunk-boundary cases (Phase 4a)
+- `registry` — loads `ModelConfig` and `Persona` files from `~/.parley/{models,personas}/` with per-file diagnostics; shared validation enforces persona → model / system-prompt-file references (Phase 3)
+- **`orchestrator`** *(new)* — `ConversationOrchestrator`, `OrchestratorState`, `OrchestratorEvent`, `OrchestratorContext`. Drives the per-turn state machine and dispatches user input to the active persona's `LlmProvider`.
+
+### Conversation orchestrator (Phase 4b)
+
+The orchestrator is the runtime "harness" around a `ConversationSession`. It is **not** part of the audio pipeline — it consumes that pipeline's outputs and (in a later slice) drives a TTS provider with its outputs.
+
+- **State machine subset:** `Idle → Routing → Streaming → Idle`, plus `Failed → Idle`. The audio-bound states from spec §5 (`Capturing`, `FinalizingStt`, `Speaking`, `Paused`, `Stopped`) land with the audio integration slice.
+- **Turn flow:** `submit_user_turn(speaker_id, text)` resolves the active persona / model / provider *before* mutating the session, resolves the system prompt (inline or read from `prompts_dir`), appends the user turn, then returns a `BoxStream<OrchestratorEvent>` that the caller drives. Tokens stream through as `OrchestratorEvent::Token { delta }`; on completion the assistant turn is appended with full `TurnProvenance` (persona, model, usage, cost) and `OrchestratorEvent::AiTurnAppended` is emitted.
+- **Failure surfacing (spec §10.1, partial):** Pre-dispatch errors return `OrchestratorError` synchronously without touching the session. Mid-stream provider errors emit `OrchestratorEvent::Failed { message }` then transition `Failed → Idle` without appending a partial assistant turn. Retry/skip UI is deferred.
+- **Persona switching (spec §6.3):** `switch_persona(persona_id, model_config_id)` delegates to the session and takes effect on the next submitted turn. `PersonaActivation` history is recorded so a session file always shows when the active agent changed.
+- **Cost (spec §11):** Per-turn cost is computed at append time from the active model's `TokenRates` and pinned into `TurnProvenance`. Session totals are derived later by summing turns.
+- **Determinism for tests:** Time enters through a `Clock` trait so tests pin timestamps. Provider behavior enters through `LlmProvider` so tests use a `MockProvider` that yields a canned token script — no HTTP in unit tests.
+
+### Deferred slices (tracked, not yet built)
+
+- Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
+- Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)
+- Pause / Stop / Play / barge-in
+- Context compaction
+- Session persistence (the on-disk file format for `ConversationSession`)
+- HTTP endpoint on the proxy exposing the orchestrator to the WASM frontend
+- Expression-annotation auto-prepend
+- Retry-on-failure logic
+- Cost aggregation across turns (per-turn cost is recorded; session totals are a render concern)
+
