@@ -6,7 +6,7 @@ use wasm_bindgen::JsCast;
 
 use crate::audio::capture::BrowserCapture;
 use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
-use crate::word_graph::WordGraph;
+use parley_core::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
 

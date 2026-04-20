@@ -1,9 +1,12 @@
 use axum::extract::State;
-use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
+
+mod registry;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -276,18 +279,18 @@ async fn format_text(
             match serde_json::from_str::<serde_json::Value>(&full_json) {
                 Ok(parsed) => {
                     // Server-side validation: reject if Haiku changed any words
-                    if let Some(formatted) = parsed["formatted"].as_str() {
-                        if !words_match(&body.text, formatted) {
-                            eprintln!("[proxy] Haiku changed words — rejecting response");
-                            return (
-                                StatusCode::OK,
-                                Json(serde_json::json!({
-                                    "changed": false,
-                                    "input_tokens": input_tokens,
-                                    "output_tokens": output_tokens,
-                                })),
-                            );
-                        }
+                    if let Some(formatted) = parsed["formatted"].as_str()
+                        && !words_match(&body.text, formatted)
+                    {
+                        eprintln!("[proxy] Haiku changed words — rejecting response");
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "changed": false,
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                            })),
+                        );
                     }
                     // Merge token usage into the response
                     let mut result = parsed;
@@ -379,6 +382,28 @@ async fn main() {
 
     let state = Arc::new(AppState { client });
 
+    // Conversation Mode dependency: load persona / model registries from
+    // ~/.parley/. Loaders are non-fatal — missing dirs and bad files are
+    // logged, the proxy still serves token + format. The orchestrator
+    // (later phase) will consume these registries; for now they are just
+    // wired and logged so misconfiguration shows up at boot rather than
+    // at first turn.
+    let parley_dir = parley_config_dir();
+    let models_dir = parley_dir.join("models");
+    let personas_dir = parley_dir.join("personas");
+    let prompts_dir = parley_dir.join("prompts");
+    let models = registry::load_model_configs(&models_dir);
+    let personas = registry::load_personas(&personas_dir, &prompts_dir, &models.entries);
+    println!(
+        "Loaded {} model config(s) and {} persona(s) from {}",
+        models.count(),
+        personas.count(),
+        parley_dir.display(),
+    );
+    for err in models.errors.iter().chain(personas.errors.iter()) {
+        eprintln!("[parley-config] {err}");
+    }
+
     let app = Router::new()
         .route("/token", post(fetch_token))
         .route("/format", post(format_text))
@@ -390,6 +415,18 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Resolve the Parley config directory (`~/.parley` on Unix,
+/// `%USERPROFILE%\.parley` on Windows). Falls back to the current
+/// directory if no home dir is discoverable, which keeps the proxy
+/// runnable in odd environments without crashing.
+fn parley_config_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        PathBuf::from(home).join(".parley")
+    } else {
+        PathBuf::from(".parley")
+    }
 }
 
 #[cfg(test)]

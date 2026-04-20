@@ -5,7 +5,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
-use crate::word_graph::SttWord;
+use parley_core::word_graph::SttWord;
 
 const ASSEMBLYAI_WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
 

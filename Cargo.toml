@@ -1,9 +1,15 @@
+[workspace]
+members = ["parley-core", "proxy"]
+
 [package]
 name = "parley"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Shared data layer (types, word graph, persona/model definitions).
+parley-core = { path = "parley-core" }
+
 # UI framework — web/WASM renderer
 dioxus = { version = "0.7", features = ["web"] }
 
