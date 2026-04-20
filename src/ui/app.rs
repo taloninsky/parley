@@ -5,7 +5,8 @@ use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::audio::capture::BrowserCapture;
-use crate::stt::assemblyai::{AssemblyAiSession, fetch_temp_token};
+use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
+use crate::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
 
@@ -803,6 +804,18 @@ pub fn App() -> Element {
     // Reactive signal that mirrors live_turns length so UI re-renders
     let mut live_turns_version = use_signal(|| 0u32);
 
+    // ── Shadow word graph ───────────────────────────────────────────
+    // Per-word STT data lives here in parallel with the existing
+    // string-based transcript pipeline. Nothing reads from it yet — this
+    // is the migration path described in
+    // `docs/conversation-mode-spec.md` §1.5.3 step 2. UI rendering and
+    // the Haiku formatter remain unchanged for now; the graph is the
+    // foundation that Conversation Mode will read from in a later phase.
+    //
+    // All ingest is `speaker = 0` until diarization wiring lands with
+    // the multi-party work in Phase 8.
+    let mut word_graph_shared: Signal<Option<Rc<RefCell<WordGraph>>>> = use_signal(|| None);
+
     // ── Shared recording state ──────────────────────────────────────
     let mut session_start_time: Signal<Option<f64>> = use_signal(|| None);
     let mut last_committed_speaker: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
@@ -875,6 +888,11 @@ pub fn App() -> Element {
             turn_start_time1_shared.set(Some(turn_start1.clone()));
             turn_start_time2_shared.set(Some(turn_start2.clone()));
 
+            // Shadow word graph — fresh per session. Both s1 and s2 callbacks
+            // ingest into it as `speaker = 0` (single-lane until Phase 8).
+            let graph_rc: Rc<RefCell<WordGraph>> = Rc::new(RefCell::new(WordGraph::new()));
+            word_graph_shared.set(Some(graph_rc.clone()));
+
             // ── Speaker 1 session ───────────────────────────────────
             let session1_rc: Rc<RefCell<Option<AssemblyAiSession>>> = Rc::new(RefCell::new(None));
             // Session 2 ref for cross-session force endpoint
@@ -909,10 +927,29 @@ pub fn App() -> Element {
                 let s2_for_force = session2_rc_for_s1.clone();
                 let mut ltv = live_turns_version.clone();
                 let ff1 = formatted_flag1.clone();
+                let graph_for_s1 = graph_rc.clone();
 
                 match AssemblyAiSession::connect(
                     &token1,
-                    move |text, is_formatted, turn_order| {
+                    move |event: TurnEvent| {
+                        // Ingest per-word data into the shadow graph BEFORE
+                        // any string-based UI work. Speaker = 0; in
+                        // multi-speaker mode s2 ingests into speaker = 1
+                        // (perfect diarization by physical channel).
+                        if !event.words.is_empty() {
+                            graph_for_s1.borrow_mut().ingest_turn(
+                                0,
+                                &event.words,
+                                event.end_of_turn,
+                            );
+                        }
+
+                        let TurnEvent {
+                            transcript: text,
+                            is_formatted,
+                            turn_order,
+                            ..
+                        } = event;
                         last_activity.set(js_sys::Date::now());
                         let text = text.replace('\n', " ").replace("  ", " ");
 
@@ -1065,10 +1102,32 @@ pub fn App() -> Element {
                                 let s1_for_force = session1_rc.clone();
                                 let mut ltv = live_turns_version.clone();
                                 let ff2 = formatted_flag2.clone();
+                                let graph_for_s2 = graph_rc.clone();
 
                                 match AssemblyAiSession::connect(
                                     tok2,
-                                    move |text, is_formatted, turn_order| {
+                                    move |event: TurnEvent| {
+                                        // Ingest per-word data into the
+                                        // shadow graph. Speaker = 1 because
+                                        // s2 = the second physical mic;
+                                        // diarization-by-channel is exact.
+                                        // Phase 8 adds AI-diarization for
+                                        // the single-mic / multiple-voices
+                                        // case via `speaker_label`.
+                                        if !event.words.is_empty() {
+                                            graph_for_s2.borrow_mut().ingest_turn(
+                                                1,
+                                                &event.words,
+                                                event.end_of_turn,
+                                            );
+                                        }
+
+                                        let TurnEvent {
+                                            transcript: text,
+                                            is_formatted,
+                                            turn_order,
+                                            ..
+                                        } = event;
                                         last_activity.set(js_sys::Date::now());
                                         let text = text.replace('\n', " ").replace("  ", " ");
 

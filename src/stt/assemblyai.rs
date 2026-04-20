@@ -5,7 +5,32 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
+use crate::word_graph::SttWord;
+
 const ASSEMBLYAI_WS_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
+
+/// One Turn event from the STT provider, normalized into a provider-neutral
+/// shape. The transcript-string fields preserve the existing UI integration
+/// (formatter pipeline, live-zone insertion). The new `end_of_turn` and
+/// `words` fields carry the per-word data the word graph requires.
+///
+/// See `docs/word-graph-spec.md` §3.3 for the canonical `SttWord` shape;
+/// the AssemblyAI v3 `words` array maps directly onto it.
+#[derive(Clone, Debug)]
+pub struct TurnEvent {
+    /// Running transcript text for the turn.
+    pub transcript: String,
+    /// Whether the turn has been auto-formatted by the STT model
+    /// (always `true` for u3-rt-pro).
+    pub is_formatted: bool,
+    /// Monotonic turn counter (0, 1, 2, …) from the provider.
+    pub turn_order: u32,
+    /// `true` = turn complete; `false` = partial (may still update).
+    pub end_of_turn: bool,
+    /// Per-word data — text, timing, confidence, finality. Empty if the
+    /// provider message lacked a `words` array.
+    pub words: Vec<SttWord>,
+}
 
 /// Fetch a temporary streaming token via the local proxy server.
 /// The proxy runs at localhost:3033 and forwards the request to AssemblyAI's
@@ -90,12 +115,15 @@ pub struct AssemblyAiSession {
 impl AssemblyAiSession {
     /// Open a v3 Universal Streaming WebSocket.
     ///
-    /// `on_transcript` is called with (text, is_formatted) for each Turn event.
-    ///   is_formatted=true means the turn is finalized with punctuation.
+    /// `on_turn` is called once per Turn event with a normalized `TurnEvent`
+    /// (see struct doc). It fires for both partial and final turns, including
+    /// when `transcript` is empty (e.g., a final turn that arrives only as
+    /// an `end_of_turn=true` confirmation) — consumers that only care about
+    /// non-empty transcripts should filter accordingly.
     /// `on_close` is called when the connection closes, with (code, reason).
     pub fn connect(
         temp_token: &str,
-        on_transcript: impl FnMut(String, bool, u32) + 'static,
+        on_turn: impl FnMut(TurnEvent) + 'static,
         on_close: impl FnMut(u16, String) + 'static,
     ) -> Result<Self, JsValue> {
         let url = format!(
@@ -127,7 +155,7 @@ impl AssemblyAiSession {
 
         // On message: parse v3 events (Begin, Turn, Termination)
         {
-            let mut on_transcript = on_transcript;
+            let mut on_turn = on_turn;
             let session_ready_msg = session_ready.clone();
             let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
@@ -152,8 +180,26 @@ impl AssemblyAiSession {
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0)
                                     as u32;
+                                let end_of_turn = parsed
+                                    .get("end_of_turn")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let words = parse_words(parsed.get("words"));
+
+                                // Preserve historical UI behavior: only fire
+                                // when there is non-empty transcript text.
+                                // Per-word ingest into the graph happens via
+                                // the same callback; consumers that need the
+                                // word-graph synchronized on empty-transcript
+                                // turns can lift this check later.
                                 if !transcript.is_empty() {
-                                    on_transcript(transcript, is_formatted, turn_order);
+                                    on_turn(TurnEvent {
+                                        transcript,
+                                        is_formatted,
+                                        turn_order,
+                                        end_of_turn,
+                                        words,
+                                    });
                                 }
                             }
                             Some("Begin") => {
@@ -235,4 +281,39 @@ impl AssemblyAiSession {
         }
         Ok(())
     }
+}
+
+/// Parse the AssemblyAI v3 `words` array (per Turn event) into the
+/// provider-neutral `SttWord` shape consumed by the word graph.
+///
+/// Returns an empty vec if the value is missing, not an array, or contains
+/// only malformed entries. Individual malformed entries are skipped silently
+/// rather than failing the whole turn — partial-turn messages can contain
+/// in-flight data, and we'd rather drop a single bad word than discard the
+/// useful ones.
+fn parse_words(value: Option<&serde_json::Value>) -> Vec<SttWord> {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|w| {
+            let text = w.get("text").and_then(|t| t.as_str())?.to_string();
+            // AssemblyAI sends start/end as integer milliseconds; accept
+            // either integer or float to be defensive.
+            let start_ms = w.get("start").and_then(|v| v.as_f64())?;
+            let end_ms = w.get("end").and_then(|v| v.as_f64())?;
+            let confidence = w.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let word_is_final = w
+                .get("word_is_final")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            Some(SttWord {
+                text,
+                start_ms,
+                end_ms,
+                confidence,
+                word_is_final,
+            })
+        })
+        .collect()
 }
