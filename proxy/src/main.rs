@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,40 +122,45 @@ You will receive a message in two sections:
   in your output.
 - EDITABLE — the recent text you may reformat.
 
-A "chunk" is a paragraph optionally followed by a bulleted or numbered list
-that belongs to it. Use CONTEXT only to judge whether the EDITABLE text
-continues the same topic or starts a new one.
+Use CONTEXT only to judge whether the EDITABLE text continues the same topic
+or starts a new one.
 
-Patterns to detect (apply whichever fit):
-1. PARAGRAPH BREAKS — when the speaker shifts to a clearly different topic,
+What you fix:
+1. PUNCTUATION & CAPITALIZATION — add or remove commas, periods, question
+   marks, exclamation marks, semicolons, colons, and em-dashes when context
+   makes the correct punctuation clear. Capitalize the first word of each
+   sentence (after a period, question mark, or exclamation mark).
+2. PARAGRAPH BREAKS — when the speaker shifts to a clearly different topic,
    separate with a blank line.
-2. BULLETED LISTS — items enumerated informally ("things like X, Y, Z" or
-   "first... second...") → lines starting with "- ".  Keep the list
-   attached to the paragraph above it (no blank line between them).
-3. NUMBERED LISTS — explicitly numbered items ("number one... number two...")
-   → "1. ", "2. ", etc.  Keep attached to the paragraph above.
+3. ACRONYMS & ALPHANUMERIC IDENTIFIERS — when the STT has split a single
+   acronym or identifier into separate letter/digit tokens, join them.
+   Examples: "U S A" → "USA", "F B I" → "FBI", "G P T 4" → "GPT-4",
+   "A B 1 2 3" → "AB123". Only join when the surrounding context makes it
+   unambiguous that the speaker said an acronym/identifier rather than a
+   sequence of individual letters or numbers.
 
 === ABSOLUTE RULE — NEVER CHANGE WORDS ===
-The speaker's words are sacred. You must NEVER add, remove, substitute, or
-reorder any word. Every single word in your output must appear in the original
-text in exactly the same order. If you are unsure whether a change would alter
-a word, do NOT make that change.
+The speaker's words are sacred. With the single exception of acronym/
+identifier joining described in rule 3 above, you must NEVER add, remove,
+substitute, or reorder any word. Every word in your output must appear in
+the original text in the same order. If you are unsure whether a change
+would alter a word, do NOT make that change.
 
 What you MAY change:
-- Punctuation: add or remove commas, periods, question marks, exclamation
-  marks, semicolons, colons, and em-dashes when context makes the correct
-  punctuation clear.
-- Capitalization: ONLY at the very start of a sentence (after a period,
-  question mark, or exclamation mark). Never capitalize a word mid-sentence.
-- Whitespace: newlines, blank lines, leading "- " or "1. " for lists.
-- You may merge short chunks back together if they clearly belong to the
-  same thought.
+- Punctuation (per rule 1).
+- Capitalization, ONLY at the start of a sentence. Never capitalize a word
+  mid-sentence.
+- Whitespace: newlines, blank lines for paragraph breaks.
+- Joining single-letter/digit tokens into acronyms or identifiers (per rule 3).
 
-Reminder — the following are FORBIDDEN:
-- Adding a word that was not in the original.
-- Removing a word that was in the original.
+What is FORBIDDEN:
+- Adding any word that was not in the original (other than via acronym joining).
+- Removing any word (other than absorbing letter/digit tokens into an acronym).
 - Replacing one word with another (e.g. "their" → "there").
 - Reordering words.
+- Bulleted or numbered list formatting (do not add "- " or "1. " prefixes,
+  even if the speaker is enumerating).
+
 If your output violates any of these, it will be automatically rejected.
 
 - Return ONLY a JSON object, nothing else.
@@ -325,10 +330,41 @@ fn extract_words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Collapse runs of two or more consecutive single-character alphanumeric
+/// tokens into a single concatenated token. This matches the prompt's
+/// acronym/identifier joining carve-out: e.g. ["u", "s", "a"] → ["usa"],
+/// ["g", "p", "t", "4"] → ["gpt4"]. Single isolated single-char tokens
+/// (e.g. the word "I" or "a") are left alone, so a stray drop of one of
+/// them still fails the comparison. Applied to both sides of `words_match`.
+fn collapse_acronym_runs(words: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut run: Vec<String> = Vec::new();
+    let flush = |run: &mut Vec<String>, out: &mut Vec<String>| {
+        if run.len() >= 2 {
+            out.push(run.concat());
+        } else {
+            out.append(run);
+        }
+        run.clear();
+    };
+    for w in words {
+        if w.chars().count() == 1 && w.chars().next().unwrap().is_alphanumeric() {
+            run.push(w);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(w);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// Compare two texts word-by-word (ignoring punctuation, whitespace, case).
-/// Returns true if the words are identical in sequence.
+/// Returns true if the words are identical in sequence after collapsing
+/// any acronym runs (the one allowed word-shape change — see prompt rule 3).
 fn words_match(original: &str, formatted: &str) -> bool {
-    extract_words(original) == extract_words(formatted)
+    collapse_acronym_runs(extract_words(original))
+        == collapse_acronym_runs(extract_words(formatted))
 }
 
 #[tokio::main]
@@ -354,4 +390,145 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── extract_words ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_words_strips_punctuation_and_lowercases() {
+        assert_eq!(
+            extract_words("Hello, World! It's GREAT."),
+            vec!["hello", "world", "it's", "great"],
+        );
+    }
+
+    #[test]
+    fn extract_words_handles_empty_and_whitespace() {
+        assert!(extract_words("").is_empty());
+        assert!(extract_words("   \n\t  ").is_empty());
+    }
+
+    // ── collapse_acronym_runs ──────────────────────────────────────
+
+    #[test]
+    fn collapse_run_of_letters_joins_into_acronym() {
+        let input = vec!["u".into(), "s".into(), "a".into()];
+        assert_eq!(collapse_acronym_runs(input), vec!["usa"]);
+    }
+
+    #[test]
+    fn collapse_mixed_letter_digit_run_joins_into_identifier() {
+        let input = vec!["g".into(), "p".into(), "t".into(), "4".into()];
+        assert_eq!(collapse_acronym_runs(input), vec!["gpt4"]);
+    }
+
+    #[test]
+    fn collapse_isolated_single_char_token_left_alone() {
+        // The English word "I" is a single-char token but shouldn't fuse
+        // with its multi-char neighbours.
+        let input = vec!["i".into(), "am".into(), "home".into()];
+        assert_eq!(collapse_acronym_runs(input), vec!["i", "am", "home"]);
+    }
+
+    #[test]
+    fn collapse_only_runs_of_two_or_more_are_joined() {
+        // "i a" both single-char and consecutive → joined.
+        let input = vec!["i".into(), "a".into(), "house".into()];
+        assert_eq!(collapse_acronym_runs(input), vec!["ia", "house"]);
+    }
+
+    #[test]
+    fn collapse_handles_multiple_separated_runs() {
+        let input = vec![
+            "the".into(),
+            "f".into(),
+            "b".into(),
+            "i".into(),
+            "raided".into(),
+            "g".into(),
+            "p".into(),
+            "t".into(),
+        ];
+        assert_eq!(
+            collapse_acronym_runs(input),
+            vec!["the", "fbi", "raided", "gpt"],
+        );
+    }
+
+    #[test]
+    fn collapse_run_at_start_and_end() {
+        let input = vec![
+            "u".into(),
+            "s".into(),
+            "wins".into(),
+            "g".into(),
+            "o".into(),
+        ];
+        assert_eq!(collapse_acronym_runs(input), vec!["us", "wins", "go"]);
+    }
+
+    #[test]
+    fn collapse_empty_input_yields_empty_output() {
+        assert!(collapse_acronym_runs(Vec::new()).is_empty());
+    }
+
+    // ── words_match ────────────────────────────────────────────────
+
+    #[test]
+    fn words_match_identical_text() {
+        assert!(words_match("Hello world.", "Hello world."));
+    }
+
+    #[test]
+    fn words_match_punctuation_and_case_differences_allowed() {
+        assert!(words_match(
+            "hello world it works",
+            "Hello, world — it works!",
+        ));
+    }
+
+    #[test]
+    fn words_match_acronym_join_allowed() {
+        // The carve-out: STT split "USA" into single letters, formatter joined.
+        assert!(words_match("the u s a is great", "the USA is great"));
+    }
+
+    #[test]
+    fn words_match_alphanumeric_identifier_join_allowed() {
+        assert!(words_match(
+            "we use g p t 4 for this",
+            "we use GPT4 for this",
+        ));
+    }
+
+    #[test]
+    fn words_match_dropped_word_rejected() {
+        assert!(!words_match("hello big world", "hello world"));
+    }
+
+    #[test]
+    fn words_match_substituted_word_rejected() {
+        assert!(!words_match("their car is fast", "there car is fast"));
+    }
+
+    #[test]
+    fn words_match_added_word_rejected() {
+        assert!(!words_match("hello world", "hello cruel world"));
+    }
+
+    #[test]
+    fn words_match_reordered_words_rejected() {
+        assert!(!words_match("the quick fox", "the fox quick"));
+    }
+
+    #[test]
+    fn words_match_dropped_letter_inside_acronym_run_rejected() {
+        // Original "U S A B" → if formatter drops "B" and outputs "USA",
+        // the run collapses to "usa" vs "usab" — must fail.
+        assert!(!words_match("u s a b context", "USA context"));
+    }
 }

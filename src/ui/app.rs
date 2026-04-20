@@ -22,15 +22,13 @@ fn get_cursor() -> Option<(u32, u32)> {
 fn restore_cursor(start: u32, end: u32) {
     // Use queueMicrotask so we run after the virtual-DOM patch.
     let cb = wasm_bindgen::closure::Closure::once_into_js(move || {
-        if let Some(window) = web_sys::window() {
-            if let Some(doc) = window.document() {
-                if let Some(el) = doc.get_element_by_id(TEXTAREA_ID) {
-                    if let Ok(ta) = el.dyn_into::<web_sys::HtmlTextAreaElement>() {
-                        let _ = ta.set_selection_start(Some(start));
-                        let _ = ta.set_selection_end(Some(end));
-                    }
-                }
-            }
+        if let Some(window) = web_sys::window()
+            && let Some(doc) = window.document()
+            && let Some(el) = doc.get_element_by_id(TEXTAREA_ID)
+            && let Ok(ta) = el.dyn_into::<web_sys::HtmlTextAreaElement>()
+        {
+            let _ = ta.set_selection_start(Some(start));
+            let _ = ta.set_selection_end(Some(end));
         }
     });
     let _ = web_sys::window()
@@ -41,12 +39,11 @@ fn restore_cursor(start: u32, end: u32) {
 /// Scroll the transcript textarea to the bottom.
 fn scroll_textarea_to_bottom() {
     let cb = wasm_bindgen::closure::Closure::once_into_js(move || {
-        if let Some(window) = web_sys::window() {
-            if let Some(doc) = window.document() {
-                if let Some(el) = doc.get_element_by_id(TEXTAREA_ID) {
-                    el.set_scroll_top(el.scroll_height());
-                }
-            }
+        if let Some(window) = web_sys::window()
+            && let Some(doc) = window.document()
+            && let Some(el) = doc.get_element_by_id(TEXTAREA_ID)
+        {
+            el.set_scroll_top(el.scroll_height());
         }
     });
     let _ = web_sys::window()
@@ -76,10 +73,10 @@ fn load(key: &str) -> Option<String> {
         .as_string()?;
     for pair in cookies.split(';') {
         let pair = pair.trim();
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(v.to_string());
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return Some(v.to_string());
         }
     }
     None
@@ -114,10 +111,10 @@ fn play_beep() {
 }
 
 fn set_tab_title(title: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Some(doc) = window.document() {
-            doc.set_title(title);
-        }
+    if let Some(window) = web_sys::window()
+        && let Some(doc) = window.document()
+    {
+        doc.set_title(title);
     }
 }
 
@@ -551,6 +548,7 @@ fn render_live_zone(words: &[LiveWord], show_labels: bool, show_timestamps: bool
 
 /// Build the committed line with optional timestamp and speaker label.
 /// Returns the new full transcript string.
+#[allow(clippy::too_many_arguments)]
 fn build_committed_text(
     prev_transcript: &str,
     turn_text: &str,
@@ -588,6 +586,7 @@ fn build_committed_text(
 /// A word is safe when both speakers' current turn started after it,
 /// or it's older than `max_age_ms`. Consecutive same-speaker words
 /// are grouped into phrases before committing.
+#[allow(clippy::too_many_arguments)]
 fn graduate_live_words(
     live_words: &Rc<RefCell<Vec<LiveWord>>>,
     transcript: &mut Signal<String>,
@@ -919,13 +918,13 @@ pub fn App() -> Element {
                 let cto = current_turn_order1.clone();
                 let npc = needs_para_check.clone();
                 let tcc = turn_commit_counter.clone();
-                let mut t_sig = transcript.clone();
-                let mut p_sig = partial.clone();
+                let mut t_sig = transcript;
+                let mut p_sig = partial;
                 let ss1 = speech_start1.clone();
                 let ts1 = turn_start1.clone();
                 let live_rc = live_turns_rc.clone();
                 let s2_for_force = session2_rc_for_s1.clone();
-                let mut ltv = live_turns_version.clone();
+                let mut ltv = live_turns_version;
                 let ff1 = formatted_flag1.clone();
                 let graph_for_s1 = graph_rc.clone();
 
@@ -999,7 +998,7 @@ pub fn App() -> Element {
                                 }
                                 if !(anthropic_key)().is_empty() && (auto_format_enabled)() {
                                     tcc.set(tcc.get() + 1);
-                                    if tcc.get() % (format_nth)() == 0 {
+                                    if tcc.get().is_multiple_of((format_nth)()) {
                                         npc.set(true);
                                     }
                                 }
@@ -1019,9 +1018,9 @@ pub fn App() -> Element {
                         ff1.set(is_formatted);
                     },
                     {
-                        let mut rec_state = rec_state.clone();
-                        let mut status_msg = status_msg.clone();
-                        let mut error_msg = error_msg.clone();
+                        let mut rec_state = rec_state;
+                        let mut status_msg = status_msg;
+                        let mut error_msg = error_msg;
                         move |code: u16, reason: String| {
                             rec_state.set(RecState::Stopped);
                             if code == 4001 {
@@ -1095,12 +1094,12 @@ pub fn App() -> Element {
                                 let cto = cto2.clone();
                                 let npc = needs_para_check.clone();
                                 let tcc = turn_commit_counter.clone();
-                                let mut p2_sig = partial2.clone();
+                                let mut p2_sig = partial2;
                                 let ss2 = speech_start2.clone();
                                 let ts2 = turn_start2.clone();
                                 let live_rc = live_turns_rc.clone();
                                 let s1_for_force = session1_rc.clone();
-                                let mut ltv = live_turns_version.clone();
+                                let mut ltv = live_turns_version;
                                 let ff2 = formatted_flag2.clone();
                                 let graph_for_s2 = graph_rc.clone();
 
@@ -1159,7 +1158,7 @@ pub fn App() -> Element {
                                                     && (auto_format_enabled)()
                                                 {
                                                     tcc.set(tcc.get() + 1);
-                                                    if tcc.get() % (format_nth)() == 0 {
+                                                    if tcc.get().is_multiple_of((format_nth)()) {
                                                         npc.set(true);
                                                     }
                                                 }
@@ -1178,9 +1177,9 @@ pub fn App() -> Element {
                                         ff2.set(is_formatted);
                                     },
                                     {
-                                        let mut rec_state = rec_state.clone();
-                                        let mut status_msg = status_msg.clone();
-                                        let mut error_msg = error_msg.clone();
+                                        let mut rec_state = rec_state;
+                                        let mut status_msg = status_msg;
+                                        let mut error_msg = error_msg;
                                         move |code: u16, reason: String| {
                                             rec_state.set(RecState::Stopped);
                                             if code != 1000 {
@@ -1263,18 +1262,18 @@ pub fn App() -> Element {
                         None
                     };
                     let cap2_for_timeout = cap2_rc;
-                    let mut rec_state = rec_state.clone();
-                    let mut status_msg = status_msg.clone();
-                    let mut partial_t = partial.clone();
-                    let mut partial2_t = partial2.clone();
-                    let mut transcript_t = transcript.clone();
-                    let mut countdown_secs = countdown_secs.clone();
+                    let mut rec_state = rec_state;
+                    let mut status_msg = status_msg;
+                    let mut partial_t = partial;
+                    let mut partial2_t = partial2;
+                    let mut transcript_t = transcript;
+                    let mut countdown_secs = countdown_secs;
                     let ticker_needs_para = needs_para_check.clone();
                     let ticker_last_speaker = last_speaker.clone();
                     let ticker_live_turns = live_turns_rc.clone();
                     let ticker_ts1 = turn_start1.clone();
                     let ticker_ts2 = turn_start2.clone();
-                    let mut ticker_ltv = live_turns_version.clone();
+                    let mut ticker_ltv = live_turns_version;
 
                     spawn(async move {
                         let mut blink_on = false;
@@ -1307,34 +1306,33 @@ pub fn App() -> Element {
                                 let model = (format_model)();
                                 let depth = (format_depth)();
                                 let ctx_depth = (format_context_depth)();
-                                let mut t = transcript_t.clone();
-                                let mut llm = llm_cost.clone();
+                                let mut t = transcript_t;
+                                let mut llm = llm_cost;
                                 spawn(async move {
                                     let text = (t)();
-                                    if !text.is_empty() {
-                                        if let Some(result) = check_formatting(
+                                    if !text.is_empty()
+                                        && let Some(result) = check_formatting(
                                             &key, &text, multi, &model, depth, ctx_depth,
                                         )
                                         .await
-                                        {
-                                            // Accumulate LLM cost
-                                            let model_val = (format_model)();
-                                            let (in_rate, out_rate) = llm_rates(&model_val);
-                                            llm.set(
-                                                llm()
-                                                    + token_cost(
-                                                        result.input_tokens,
-                                                        result.output_tokens,
-                                                        in_rate,
-                                                        out_rate,
-                                                    ),
-                                            );
-                                            if let Some(formatted) = result.formatted {
-                                                let cursor = get_cursor();
-                                                t.set(formatted);
-                                                if let Some((s, e)) = cursor {
-                                                    restore_cursor(s, e);
-                                                }
+                                    {
+                                        // Accumulate LLM cost
+                                        let model_val = (format_model)();
+                                        let (in_rate, out_rate) = llm_rates(&model_val);
+                                        llm.set(
+                                            llm()
+                                                + token_cost(
+                                                    result.input_tokens,
+                                                    result.output_tokens,
+                                                    in_rate,
+                                                    out_rate,
+                                                ),
+                                        );
+                                        if let Some(formatted) = result.formatted {
+                                            let cursor = get_cursor();
+                                            t.set(formatted);
+                                            if let Some((s, e)) = cursor {
+                                                restore_cursor(s, e);
                                             }
                                         }
                                     }
@@ -1390,15 +1388,15 @@ pub fn App() -> Element {
                                     let _ = sess.terminate();
                                 }
                                 // Stop speaker 2
-                                if let Some(ref c2rc) = cap2_for_timeout {
-                                    if let Some(cap2) = c2rc.borrow_mut().take() {
-                                        cap2.stop();
-                                    }
+                                if let Some(ref c2rc) = cap2_for_timeout
+                                    && let Some(cap2) = c2rc.borrow_mut().take()
+                                {
+                                    cap2.stop();
                                 }
-                                if let Some(ref s2rc) = session2_for_timeout {
-                                    if let Some(ref sess) = *s2rc.borrow() {
-                                        let _ = sess.terminate();
-                                    }
+                                if let Some(ref s2rc) = session2_for_timeout
+                                    && let Some(ref sess) = *s2rc.borrow()
+                                {
+                                    let _ = sess.terminate();
                                 }
                                 // Flush partials
                                 let p1 = (partial_t)();
@@ -1490,10 +1488,10 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 1) ────────────────────────────────────────
     let on_end_turn1 = move |_| {
-        if let Some(sess_rc) = (session_handle)().as_ref() {
-            if let Some(ref sess) = *sess_rc.borrow() {
-                let _ = sess.force_endpoint();
-            }
+        if let Some(sess_rc) = (session_handle)().as_ref()
+            && let Some(ref sess) = *sess_rc.borrow()
+        {
+            let _ = sess.force_endpoint();
         }
         let p = (partial)();
         if !p.is_empty() {
@@ -1544,10 +1542,10 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 2) ────────────────────────────────────────
     let on_end_turn2 = move |_| {
-        if let Some(sess_rc) = (session_handle2)().as_ref() {
-            if let Some(ref sess) = *sess_rc.borrow() {
-                let _ = sess.force_endpoint();
-            }
+        if let Some(sess_rc) = (session_handle2)().as_ref()
+            && let Some(ref sess) = *sess_rc.borrow()
+        {
+            let _ = sess.force_endpoint();
         }
         let p = (partial2)();
         if !p.is_empty() {
@@ -1584,45 +1582,39 @@ pub fn App() -> Element {
             let multi = (speaker2_enabled)();
 
             // 1. Stop audio capture — no more audio sent to STT
-            if let Some(cap_rc) = (capture_handle)().as_ref() {
-                if let Some(cap) = cap_rc.borrow_mut().take() {
-                    cap.stop();
-                }
+            if let Some(cap_rc) = (capture_handle)().as_ref()
+                && let Some(cap) = cap_rc.borrow_mut().take()
+            {
+                cap.stop();
             }
-            if multi {
-                if let Some(cap_rc) = (capture_handle2)().as_ref() {
-                    if let Some(cap) = cap_rc.borrow_mut().take() {
-                        cap.stop();
-                    }
-                }
+            if multi
+                && let Some(cap_rc) = (capture_handle2)().as_ref()
+                && let Some(cap) = cap_rc.borrow_mut().take()
+            {
+                cap.stop();
             }
 
             // 2. Force endpoint on active sessions and reset formatted flags
             let s1_has_partial = !(partial)().is_empty();
             let s2_has_partial = multi && !(partial2)().is_empty();
 
-            if s1_has_partial {
-                if let Some(ref ff) = (turn_is_formatted1_shared)() {
-                    ff.set(false);
-                }
+            if s1_has_partial && let Some(ref ff) = (turn_is_formatted1_shared)() {
+                ff.set(false);
             }
-            if s2_has_partial {
-                if let Some(ref ff) = (turn_is_formatted2_shared)() {
-                    ff.set(false);
-                }
+            if s2_has_partial && let Some(ref ff) = (turn_is_formatted2_shared)() {
+                ff.set(false);
             }
 
-            if let Some(sess_rc) = (session_handle)().as_ref() {
-                if let Some(ref sess) = *sess_rc.borrow() {
-                    let _ = sess.force_endpoint();
-                }
+            if let Some(sess_rc) = (session_handle)().as_ref()
+                && let Some(ref sess) = *sess_rc.borrow()
+            {
+                let _ = sess.force_endpoint();
             }
-            if multi {
-                if let Some(sess_rc) = (session_handle2)().as_ref() {
-                    if let Some(ref sess) = *sess_rc.borrow() {
-                        let _ = sess.force_endpoint();
-                    }
-                }
+            if multi
+                && let Some(sess_rc) = (session_handle2)().as_ref()
+                && let Some(ref sess) = *sess_rc.borrow()
+            {
+                let _ = sess.force_endpoint();
             }
 
             // 3. Wait for formatted responses (5s safety timeout)
@@ -1645,17 +1637,16 @@ pub fn App() -> Element {
             }
 
             // 4. Terminate sessions
-            if let Some(sess_rc) = (session_handle)().as_ref() {
-                if let Some(ref sess) = *sess_rc.borrow() {
-                    let _ = sess.terminate();
-                }
+            if let Some(sess_rc) = (session_handle)().as_ref()
+                && let Some(ref sess) = *sess_rc.borrow()
+            {
+                let _ = sess.terminate();
             }
-            if multi {
-                if let Some(sess_rc) = (session_handle2)().as_ref() {
-                    if let Some(ref sess) = *sess_rc.borrow() {
-                        let _ = sess.terminate();
-                    }
-                }
+            if multi
+                && let Some(sess_rc) = (session_handle2)().as_ref()
+                && let Some(ref sess) = *sess_rc.borrow()
+            {
+                let _ = sess.terminate();
             }
 
             // 5. Flush speaker 1 partial
@@ -1736,30 +1727,29 @@ pub fn App() -> Element {
                 let model = (format_model)();
                 let depth = (format_depth)();
                 let ctx_depth = (format_context_depth)();
-                let mut t = transcript.clone();
-                let mut llm = llm_cost.clone();
+                let mut t = transcript;
+                let mut llm = llm_cost;
                 spawn(async move {
                     let text = (t)();
-                    if !text.is_empty() {
-                        if let Some(result) =
+                    if !text.is_empty()
+                        && let Some(result) =
                             check_formatting(&akey, &text, multi, &model, depth, ctx_depth).await
-                        {
-                            let (in_rate, out_rate) = llm_rates(&model);
-                            llm.set(
-                                llm()
-                                    + token_cost(
-                                        result.input_tokens,
-                                        result.output_tokens,
-                                        in_rate,
-                                        out_rate,
-                                    ),
-                            );
-                            if let Some(formatted) = result.formatted {
-                                let cursor = get_cursor();
-                                t.set(formatted);
-                                if let Some((s, e)) = cursor {
-                                    restore_cursor(s, e);
-                                }
+                    {
+                        let (in_rate, out_rate) = llm_rates(&model);
+                        llm.set(
+                            llm()
+                                + token_cost(
+                                    result.input_tokens,
+                                    result.output_tokens,
+                                    in_rate,
+                                    out_rate,
+                                ),
+                        );
+                        if let Some(formatted) = result.formatted {
+                            let cursor = get_cursor();
+                            t.set(formatted);
+                            if let Some((s, e)) = cursor {
+                                restore_cursor(s, e);
                             }
                         }
                     }
@@ -1767,41 +1757,9 @@ pub fn App() -> Element {
                     if do_format_on_stop {
                         let sonnet = "claude-sonnet-4-6-20250514";
                         let text = (t)();
-                        if !text.is_empty() {
-                            if let Some(result) =
+                        if !text.is_empty()
+                            && let Some(result) =
                                 check_formatting(&akey, &text, multi, sonnet, 0, 0).await
-                            {
-                                let (in_rate, out_rate) = llm_rates(sonnet);
-                                llm.set(
-                                    llm()
-                                        + token_cost(
-                                            result.input_tokens,
-                                            result.output_tokens,
-                                            in_rate,
-                                            out_rate,
-                                        ),
-                                );
-                                if let Some(formatted) = result.formatted {
-                                    let cursor = get_cursor();
-                                    t.set(formatted);
-                                    if let Some((s, e)) = cursor {
-                                        restore_cursor(s, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            } else if !akey.is_empty() && do_format_on_stop {
-                // Auto-format disabled — skip incremental but still do the full Sonnet pass
-                let mut t = transcript.clone();
-                let mut llm = llm_cost.clone();
-                spawn(async move {
-                    let sonnet = "claude-sonnet-4-6-20250514";
-                    let text = (t)();
-                    if !text.is_empty() {
-                        if let Some(result) =
-                            check_formatting(&akey, &text, multi, sonnet, 0, 0).await
                         {
                             let (in_rate, out_rate) = llm_rates(sonnet);
                             llm.set(
@@ -1819,6 +1777,36 @@ pub fn App() -> Element {
                                 if let Some((s, e)) = cursor {
                                     restore_cursor(s, e);
                                 }
+                            }
+                        }
+                    }
+                });
+            } else if !akey.is_empty() && do_format_on_stop {
+                // Auto-format disabled — skip incremental but still do the full Sonnet pass
+                let mut t = transcript;
+                let mut llm = llm_cost;
+                spawn(async move {
+                    let sonnet = "claude-sonnet-4-6-20250514";
+                    let text = (t)();
+                    if !text.is_empty()
+                        && let Some(result) =
+                            check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                    {
+                        let (in_rate, out_rate) = llm_rates(sonnet);
+                        llm.set(
+                            llm()
+                                + token_cost(
+                                    result.input_tokens,
+                                    result.output_tokens,
+                                    in_rate,
+                                    out_rate,
+                                ),
+                        );
+                        if let Some(formatted) = result.formatted {
+                            let cursor = get_cursor();
+                            t.set(formatted);
+                            if let Some((s, e)) = cursor {
+                                restore_cursor(s, e);
                             }
                         }
                     }
@@ -1974,30 +1962,26 @@ pub fn App() -> Element {
         let key = (anthropic_key)();
         let model = "claude-sonnet-4-6-20250514".to_string();
         let multi = (speaker2_enabled)();
-        let mut t = transcript.clone();
-        let mut r = reformatting.clone();
-        let mut llm = llm_cost.clone();
+        let mut t = transcript;
+        let mut r = reformatting;
+        let mut llm = llm_cost;
         spawn(async move {
             r.set(true);
             let text = (t)();
-            if !text.is_empty() && !key.is_empty() {
-                if let Some(result) = check_formatting(&key, &text, multi, &model, 0, 0).await {
-                    let (in_rate, out_rate) = llm_rates(&model);
-                    llm.set(
-                        llm()
-                            + token_cost(
-                                result.input_tokens,
-                                result.output_tokens,
-                                in_rate,
-                                out_rate,
-                            ),
-                    );
-                    if let Some(formatted) = result.formatted {
-                        let cursor = get_cursor();
-                        t.set(formatted);
-                        if let Some((s, e)) = cursor {
-                            restore_cursor(s, e);
-                        }
+            if !text.is_empty()
+                && !key.is_empty()
+                && let Some(result) = check_formatting(&key, &text, multi, &model, 0, 0).await
+            {
+                let (in_rate, out_rate) = llm_rates(&model);
+                llm.set(
+                    llm()
+                        + token_cost(result.input_tokens, result.output_tokens, in_rate, out_rate),
+                );
+                if let Some(formatted) = result.formatted {
+                    let cursor = get_cursor();
+                    t.set(formatted);
+                    if let Some((s, e)) = cursor {
+                        restore_cursor(s, e);
                     }
                 }
             }
