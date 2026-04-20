@@ -72,29 +72,71 @@
 - [ ] Same pipeline as live recording (diarization, post-processing, confidence flagging)
 - [ ] Drag-and-drop file import
 
-## Phase 8: Full-Duplex & TTS
+## Phase 8: Conversation Mode (v1)
 
-- [ ] Define `TtsProvider` trait
-- [ ] Implement TTS provider (OpenAI, ElevenLabs, or local)
-- [ ] Full-duplex mode: simultaneous capture + playback
-- [ ] Conversation UI — interleaved user/AI transcript
+> Full specification: `docs/conversation-mode-spec.md`
+
+- [ ] Define `LlmProvider` shared trait + provider-specific extension traits (Anthropic, OpenAI)
+- [ ] Define `TtsProvider` trait (returning audio + word-level timings)
+- [ ] Implement ElevenLabs TTS provider with streaming synthesis
+- [ ] Persona schema + storage (`~/.parley/personas/*.toml`)
+- [ ] Model config schema + storage (`~/.parley/models/*.toml`)
+- [ ] Conversation Mode toggle (top-level Capture ↔ Conversation)
+- [ ] Conversation Orchestrator — turn state machine, history, persona resolution, dispatch
+- [ ] Sentence-boundary chunking with single-token lookahead for TTS streaming
+- [ ] Conversation UI — interleaved user/AI transcript with per-turn cost & Play button
+- [ ] Per-turn TTS audio cache (`tts-cache/turn-NNN.opus` in session dir)
+- [ ] Pause / Stop / Play controls (per §5.3 of spec)
+- [ ] Press-to-start / press-to-end turn-taking
+- [ ] Multi-party self-introduction protocol (phonetic-rich sentence, per-speaker buttons)
+- [ ] Real-time diarization integration with manual speaker-tagging fallback
+- [ ] Crude VAD barge-in with pending-input capture
+- [ ] Token-based context compaction with word-count fallback
+- [ ] Summary turns (`Speaker.kind = system`, `was_compacted_from = [turn_ids]`)
+- [ ] Context utilization indicator in UI
+- [ ] Per-turn + running-total cost tracking (extends existing meter)
+- [ ] Failure handling: meta-turn announcing provider errors with Retry/Skip
+- [ ] Session frontmatter additions (`mode`, `personas_used`, `compaction_events`)
+
+## Phase 9: Conversation Mode v1.5 — Polish & Diarization Confidence
+
+- [ ] Cross-session voice fingerprinting persistence
+- [ ] Diarization quality validation; hide manual fallback by default if quality is good
+- [ ] Per-persona vocabulary integration with existing vocabulary system
+- [ ] TTS playback speed adjustment
+
+## Phase 10: Conversation Mode v2 — Multi-Tier Orchestration
+
+- [ ] Two agents per persona (fast + heavy) with handoff state in turn state machine
+- [ ] Fast-model acknowledgement before heavy-model response
+- [ ] Distinct voices per tier
+- [ ] Re-hydration of compacted content into live context
+- [ ] Mid-session persona/model switching UI affordance
+- [ ] Tools / function calling support
+
+## Phase 11: Conversation Mode v3 — Expensive Narration & Full-Duplex
+
+- [ ] Live narration of heavy-model reasoning streams
+- [ ] True barge-in (audio-native via Gradium-style provider)
+- [ ] Cross-session memory
+- [ ] Reader-style word-level highlighting and click-to-play
+- [ ] Provider failover (LLM A errors → automatic fallback to LLM B)
 - [ ] Document reading: parse markdown files and synthesize speech via TTS
-- [ ] Voice model selection per profile
 
-## Phase 9: Local/Offline Mode
+## Phase 12: Local/Offline Mode
 
 - [ ] Local Whisper STT via ONNX Runtime (`ort` crate)
 - [ ] Fallback logic: try cloud provider, fall back to local on failure
 - [ ] Settings toggle for "offline only" mode
 
-## Phase 10: Voice Fingerprinting (Future)
+## Phase 13: Voice Fingerprinting (Future)
 
 - [ ] Speaker embedding model integration (ECAPA-TDNN via ONNX)
 - [ ] Voice embedding storage across sessions
 - [ ] Cross-session speaker recognition
 - [ ] Speaker management UI (name, merge, delete voice profiles)
 
-## Phase 11: Polish & Gossamer Integration
+## Phase 14: Polish & Gossamer Integration
 
 - [ ] Extract `parley-core` library crate (everything except `ui/`)
 - [ ] CLI interface for headless operation

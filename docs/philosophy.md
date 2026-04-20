@@ -75,5 +75,5 @@ Parley is a flexible, configurable audio processing module. It can be a standalo
 ## What Parley Is Not
 
 - **Not a note-taking app.** Parley produces transcripts and processed audio. What you do with them is your business.
-- **Not an AI assistant.** It uses AI models as tools in its pipeline, but it doesn't have conversations on its own (unless you're in full-duplex mode, and even then it's *your* conversation, not Parley's).
+- **Not, at its core, an AI assistant.** Parley's core is an audio-processing module. AI models are tools in its pipeline. Parley does, however, ship a **Conversation Mode** as an opt-in feature that uses the core to host turn-based exchanges with AI agents (see `docs/conversation-mode-spec.md`). Conversation Mode is a *consumer* of the core, not a redefinition of it. The audio core knows nothing about agents, personas, or turns — and that boundary is structural.
 - **Not a closed system.** If you want to plug Parley into Zoom, Teams, a podcast workflow, or a custom bot — that's a valid use case, not a misuse. The core is a module; the surface area is yours to define.
