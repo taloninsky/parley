@@ -10,6 +10,7 @@ mod conversation_api;
 mod llm;
 mod orchestrator;
 mod registry;
+mod session_store;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -415,6 +416,7 @@ async fn main() {
         personas: personas.entries,
         models: models.entries,
         prompts_dir: prompts_dir.clone(),
+        sessions_dir: parley_dir.join("sessions"),
     });
     let conversation_state =
         conversation_api::ConversationApiState::new(registries, state.client.clone());

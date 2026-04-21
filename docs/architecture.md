@@ -643,6 +643,9 @@ The proxy now exposes the orchestrator over HTTP so the WASM frontend (and any o
 | `/conversation/turn` | POST | Submit a user turn. Body: `{ speaker_id, content }`. Response is a `text/event-stream` of [`OrchestratorEvent`]s (one JSON object per `data:` line, with the SSE `event:` field mirroring the variant tag). |
 | `/conversation/switch` | POST | Switch the active `(persona, model)` for the next turn. Validates ids against the loaded registries. Returns `204`. |
 | `/conversation/snapshot` | GET | Full `ConversationSession` as JSON. |
+| `/conversation/save` | POST | Persist the live session to disk via the configured `SessionStore`. Returns `{ "session_id": "..." }`. |
+| `/conversation/load` | POST | Body: `{ session_id, anthropic_key? }`. Reads the session from disk, re-resolves its active persona/model against the current registries, builds a fresh provider (credentials are not persisted), and installs a new orchestrator. Returns the loaded `ConversationSession`. |
+| `/conversation/sessions` | GET | List all session ids on disk, sorted. |
 
 **Failure mapping (spec §10.1, partial):**
 
@@ -654,13 +657,34 @@ The proxy now exposes the orchestrator over HTTP so the WASM frontend (and any o
 
 **Determinism for tests:** A `#[cfg(test)]`-only `ConversationApiState::install_for_test` lets integration tests bypass the provider-construction path and inject an orchestrator built around a `MockProvider` (extracted to `proxy::llm::test_support` so the orchestrator and HTTP tests share one mock implementation). HTTP tests drive the router via `tower::ServiceExt::oneshot`, so they exercise the real routing, JSON deserialization, and SSE encoding without binding a port.
 
+### Session persistence (Phase 4d)
+
+Sessions are persisted as one JSON file per session under `~/.parley/sessions/{id}.json` (configured via `Registries::sessions_dir`). The store is abstracted behind a small async trait so tests inject a `tempfile::TempDir`-rooted store and the eventual move to a different backend (sqlite, etc.) does not ripple into the HTTP layer.
+
+```rust
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn save(&self, session: &ConversationSession) -> Result<(), SessionStoreError>;
+    async fn load(&self, id: &str) -> Result<ConversationSession, SessionStoreError>;
+    async fn list(&self) -> Result<Vec<SessionId>, SessionStoreError>;
+}
+```
+
+The default implementation, `FsSessionStore`, applies a strict ASCII allowlist to session ids before touching the filesystem: alphanumerics plus `_`, `-`, and `.`, with no leading/trailing dot, no `..`, no path separators, no controls, and no unicode. Invalid ids are rejected before any directory is created so a malicious id cannot have side effects on disk. The root directory is created lazily on first `save`.
+
+**Credential policy:** `anthropic_key` is *never* written to disk. `/load` requires the caller to re-supply credentials in the same shape `/init` does. This keeps session files safe to commit, sync, or share, and forces a single chokepoint for credential handling.
+
+**Drift handling:** When `/load` reads a file whose active persona or model id is no longer present in the live registries, the load returns `422 Unprocessable Entity` rather than silently substituting. The file is fine; the runtime config simply cannot drive it as-is.
+
+**Failure mapping:** `InvalidId` → `400`; `NotFound` → `404`; I/O and JSON-decode failures → `500`. Save without an active session → `409` (same shape as the other write routes).
+
 
 
 - Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
 - Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)
 - Pause / Stop / Play / barge-in
 - Context compaction
-- Session persistence (the on-disk file format for `ConversationSession`)
+- Session persistence: file-per-session JSON store landed in Phase 4d. **Deferred:** auto-save after each turn (clients call `/save` explicitly), session deletion endpoint, richer listing (metadata snapshot per id), encryption at rest.
 - Frontend wiring: a Dioxus `use_resource` / `use_future` hook that consumes the SSE stream
 - Multi-session multiplexing (one process, many concurrent sessions keyed by id)
 - Expression-annotation auto-prepend

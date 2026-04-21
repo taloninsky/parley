@@ -54,6 +54,7 @@ use crate::llm::anthropic::AnthropicLlm;
 use crate::orchestrator::{
     ConversationOrchestrator, OrchestratorContext, OrchestratorError, OrchestratorEvent,
 };
+use crate::session_store::{FsSessionStore, SessionStore, SessionStoreError};
 
 /// Immutable view of the registries loaded once at proxy boot.
 /// Cheap to share via `Arc`.
@@ -64,6 +65,8 @@ pub struct Registries {
     pub models: HashMap<ModelConfigId, ModelConfig>,
     /// Directory holding `SystemPrompt::File` referents.
     pub prompts_dir: PathBuf,
+    /// Directory the filesystem session store writes into.
+    pub sessions_dir: PathBuf,
 }
 
 /// Shared state behind the conversation routes.
@@ -71,22 +74,43 @@ pub struct Registries {
 /// `inner` holds the live orchestrator (None until first `init`).
 /// `registries` is the immutable view of personas/models loaded at
 /// boot. `http` is the shared reqwest client used to construct
-/// real providers.
+/// real providers. `store` persists sessions to disk.
 #[derive(Clone)]
 pub struct ConversationApiState {
     inner: Arc<Mutex<Option<Arc<ConversationOrchestrator>>>>,
     registries: Arc<Registries>,
     http: reqwest::Client,
+    store: Arc<dyn SessionStore>,
 }
 
 impl ConversationApiState {
     /// Build a new state wrapper around the supplied registries and
-    /// HTTP client.
+    /// HTTP client. Uses a [`FsSessionStore`] rooted at
+    /// `registries.sessions_dir`.
     pub fn new(registries: Arc<Registries>, http: reqwest::Client) -> Self {
+        let store: Arc<dyn SessionStore> =
+            Arc::new(FsSessionStore::new(registries.sessions_dir.clone()));
         Self {
             inner: Arc::new(Mutex::new(None)),
             registries,
             http,
+            store,
+        }
+    }
+
+    /// Build with a caller-supplied store. Lets tests inject an
+    /// in-memory store or point at a `tempfile::TempDir` without
+    /// touching the real `~/.parley/sessions/`.
+    pub fn with_store(
+        registries: Arc<Registries>,
+        http: reqwest::Client,
+        store: Arc<dyn SessionStore>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            registries,
+            http,
+            store,
         }
     }
 
@@ -108,6 +132,9 @@ pub fn router(state: ConversationApiState) -> Router {
         .route("/conversation/turn", post(submit_turn))
         .route("/conversation/switch", post(switch_persona))
         .route("/conversation/snapshot", get(session_snapshot))
+        .route("/conversation/save", post(save_session))
+        .route("/conversation/load", post(load_session))
+        .route("/conversation/sessions", get(list_sessions))
         .with_state(state)
 }
 
@@ -149,6 +176,35 @@ pub struct SwitchRequest {
     pub persona_id: PersonaId,
     /// Model config id to pair with that persona.
     pub model_config_id: ModelConfigId,
+}
+
+/// Body for `POST /conversation/load`.
+///
+/// Credentials are *not* persisted with the session, so loading
+/// requires re-supplying them. Same provider-construction rules as
+/// `/init`: only Anthropic is wired today.
+#[derive(Debug, Deserialize)]
+pub struct LoadRequest {
+    /// Id of a previously saved session.
+    pub session_id: String,
+    /// Anthropic API key — required when the active model's provider
+    /// tag is `Anthropic`.
+    #[serde(default)]
+    pub anthropic_key: Option<String>,
+}
+
+/// Response body for `GET /conversation/sessions`.
+#[derive(Debug, Serialize)]
+pub struct SessionList {
+    /// All session ids currently on disk, sorted lexicographically.
+    pub sessions: Vec<String>,
+}
+
+/// Response body for `POST /conversation/save`.
+#[derive(Debug, Serialize)]
+pub struct SaveResponse {
+    /// Id of the saved session (echoed back for client convenience).
+    pub session_id: String,
 }
 
 /// Wire-format error body. Stable shape across all routes.
@@ -283,6 +339,100 @@ async fn session_snapshot(
     Ok(Json(orchestrator.session_snapshot().await))
 }
 
+async fn save_session(
+    State(state): State<ConversationApiState>,
+) -> Result<Json<SaveResponse>, (StatusCode, Json<ErrorBody>)> {
+    let orchestrator = require_session(&state).await?;
+    let snapshot = orchestrator.session_snapshot().await;
+    let id = snapshot.id.clone();
+    state
+        .store
+        .save(&snapshot)
+        .await
+        .map_err(session_store_error_to_response)?;
+    Ok(Json(SaveResponse { session_id: id }))
+}
+
+async fn load_session(
+    State(state): State<ConversationApiState>,
+    Json(req): Json<LoadRequest>,
+) -> Result<Json<ConversationSession>, (StatusCode, Json<ErrorBody>)> {
+    let session = state
+        .store
+        .load(&req.session_id)
+        .await
+        .map_err(session_store_error_to_response)?;
+
+    // Resolve the active persona/model from the registries against
+    // what the file says is active. Drift (a persona that has since
+    // been deleted from disk) is a 422 — the file is fine, but the
+    // current registries can no longer drive it.
+    let active = session.active().clone();
+    let persona = state
+        .registries
+        .personas
+        .get(&active.persona_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorBody::new(format!(
+                    "saved session uses persona '{}' which is no longer in the registry",
+                    active.persona_id
+                ))),
+            )
+        })?;
+    let model = state
+        .registries
+        .models
+        .get(&active.model_config_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorBody::new(format!(
+                    "saved session uses model '{}' which is no longer in the registry",
+                    active.model_config_id
+                ))),
+            )
+        })?;
+
+    // Synthesize an InitRequest just to reuse `build_provider`'s
+    // credential-policy logic. Speaker fields are unused in that
+    // path, so we pass placeholders.
+    let synthetic = InitRequest {
+        session_id: session.id.clone(),
+        persona_id: persona.id.clone(),
+        ai_speaker_id: String::new(),
+        ai_speaker_label: String::new(),
+        anthropic_key: req.anthropic_key.clone(),
+    };
+    let provider = build_provider(&model, &synthetic, &state.http)?;
+
+    let snapshot = session.clone();
+    let ctx = OrchestratorContext {
+        personas: state.registries.personas.clone(),
+        models: state.registries.models.clone(),
+        providers: HashMap::from([(model.id.clone(), provider)]),
+        prompts_dir: state.registries.prompts_dir.clone(),
+    };
+    let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
+    *state.inner.lock().await = Some(orchestrator);
+    Ok(Json(snapshot))
+}
+
+async fn list_sessions(
+    State(state): State<ConversationApiState>,
+) -> Result<Json<SessionList>, (StatusCode, Json<ErrorBody>)> {
+    let mut sessions = state
+        .store
+        .list()
+        .await
+        .map_err(session_store_error_to_response)?;
+    sessions.sort();
+    Ok(Json(SessionList { sessions }))
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 async fn require_session(
@@ -339,6 +489,20 @@ fn orchestrator_error_to_response(err: OrchestratorError) -> (StatusCode, Json<E
             StatusCode::BAD_REQUEST
         }
         OrchestratorError::NoProvider(_) | OrchestratorError::PromptFile { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, Json(ErrorBody::new(err.to_string())))
+}
+
+/// Map [`SessionStoreError`] to an HTTP response. `InvalidId` is a
+/// client error; `NotFound` maps to 404; everything else (I/O,
+/// decode) is server-side.
+fn session_store_error_to_response(err: SessionStoreError) -> (StatusCode, Json<ErrorBody>) {
+    let status = match &err {
+        SessionStoreError::InvalidId(_) => StatusCode::BAD_REQUEST,
+        SessionStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+        SessionStoreError::Io { .. } | SessionStoreError::Decode { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
@@ -416,6 +580,7 @@ mod tests {
             personas: [(persona.id.clone(), persona)].into(),
             models: [(model.id.clone(), model)].into(),
             prompts_dir: PathBuf::from("/nonexistent"),
+            sessions_dir: PathBuf::from("/nonexistent-sessions"),
         })
     }
 
@@ -652,6 +817,7 @@ mod tests {
             .into(),
             models: [(model.id.clone(), model.clone())].into(),
             prompts_dir: PathBuf::from("/x"),
+            sessions_dir: PathBuf::from("/x-sessions"),
         });
         let state = ConversationApiState::new(registries, reqwest::Client::new());
         let provider: Arc<dyn LlmProvider> =
@@ -812,5 +978,280 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snap.status(), StatusCode::OK);
+    }
+
+    // ── Persistence ────────────────────────────────────────────
+
+    /// Build a state whose store writes into the supplied tempdir.
+    fn build_state_with_store_dir(
+        persona: Persona,
+        model: ModelConfig,
+        store_dir: PathBuf,
+    ) -> ConversationApiState {
+        let registries = Arc::new(Registries {
+            personas: [(persona.id.clone(), persona)].into(),
+            models: [(model.id.clone(), model)].into(),
+            prompts_dir: PathBuf::from("/nonexistent"),
+            sessions_dir: store_dir.clone(),
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(store_dir));
+        ConversationApiState::with_store(registries, reqwest::Client::new(), store)
+    }
+
+    #[tokio::test]
+    async fn save_endpoint_writes_session_and_load_restores_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+
+        // First state: run a turn, then save.
+        let state_a =
+            build_state_with_store_dir(persona.clone(), model.clone(), tmp.path().to_path_buf());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "mock",
+            vec![MockItem::Text("hi back".into())],
+            TokenUsage::default(),
+        ));
+        install_orchestrator(&state_a, persona.clone(), model.clone(), provider).await;
+
+        // Drive one turn so there's content to persist.
+        let _ = read_body(
+            router(state_a.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/conversation/turn")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"speaker_id":"g","content":"hi"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let save_resp = router(state_a)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_resp.status(), StatusCode::OK);
+        let saved: serde_json::Value = serde_json::from_str(&read_body(save_resp).await).unwrap();
+        assert_eq!(saved["session_id"], "sess-test");
+
+        // Second state: empty orchestrator, same store. Load should
+        // hydrate it and snapshot should match what we saved.
+        let state_b = build_state_with_store_dir(persona, model, tmp.path().to_path_buf());
+
+        let load_resp = router(state_b.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "session_id": "sess-test",
+                            "anthropic_key": "sk-test",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(load_resp.status(), StatusCode::OK);
+
+        let snap = router(state_b)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read_body(snap).await).unwrap();
+        assert_eq!(v["id"], "sess-test");
+        assert_eq!(v["turns"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_without_active_session_is_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/save")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn load_unknown_session_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_id":"missing","anthropic_key":"k"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn load_with_invalid_id_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_id":"../etc/passwd","anthropic_key":"k"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn load_without_anthropic_key_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        // Pre-seed a saved session on disk.
+        let session = ConversationSession::new(
+            "sess-x",
+            Speaker::ai_agent("ai-scholar", "Scholar"),
+            persona.id.clone(),
+            model.id.clone(),
+        );
+        let store = FsSessionStore::new(tmp.path());
+        store.save(&session).await.unwrap();
+
+        let state = build_state_with_store_dir(persona, model, tmp.path().to_path_buf());
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session_id":"sess-x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn load_when_persona_no_longer_in_registry_is_422() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Save a session that uses persona 'gone'.
+        let session = ConversationSession::new(
+            "sess-orphan",
+            Speaker::ai_agent("ai-gone", "Gone"),
+            "gone".to_string(),
+            "m1".to_string(),
+        );
+        FsSessionStore::new(tmp.path())
+            .save(&session)
+            .await
+            .unwrap();
+
+        // But the live registry only knows about 'scholar'.
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"session_id":"sess-orphan","anthropic_key":"k"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_sorted_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsSessionStore::new(tmp.path());
+        for id in ["beta", "alpha", "gamma"] {
+            store
+                .save(&ConversationSession::new(
+                    id,
+                    Speaker::ai_agent("ai-x", "X"),
+                    "scholar".to_string(),
+                    "m1".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let sessions = v["sessions"].as_array().unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
     }
 }
