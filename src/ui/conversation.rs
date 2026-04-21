@@ -73,6 +73,36 @@ struct ModelListResponse {
     models: Vec<ModelSummary>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SessionListResponse {
+    sessions: Vec<String>,
+}
+
+// `WireSession` mirrors `parley_core::ConversationSession` but only
+// carries the fields the picker UI actually needs to rehydrate the
+// view. `serde` ignores unknown fields by default, so adding more on
+// the proxy side never breaks the frontend.
+#[derive(Debug, Clone, Deserialize)]
+struct WireSession {
+    #[allow(dead_code)] // echoed by the proxy; we already know our own id
+    id: String,
+    turns: Vec<WireTurn>,
+    persona_history: Vec<WirePersonaActivation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireTurn {
+    /// `"user" | "assistant" | "system"` — drives the bubble color.
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WirePersonaActivation {
+    persona_id: String,
+    model_config_id: String,
+}
+
 /// Mirrors `proxy::orchestrator::OrchestratorEvent`. The `#[serde(tag
 /// = "type")]` discriminant lets us decode the union without knowing
 /// the SSE event name up front.
@@ -347,12 +377,19 @@ pub fn ConversationView() -> Element {
     let mut selected_persona = use_signal(String::new);
     let mut selected_model = use_signal(String::new);
     let mut session_id = use_signal(generate_session_id);
-    let session_initialized = use_signal(|| false);
-    let messages = use_signal(Vec::<Message>::new);
-    let streaming = use_signal(String::new);
+    let mut session_initialized = use_signal(|| false);
+    let mut messages = use_signal(Vec::<Message>::new);
+    let mut streaming = use_signal(String::new);
     let mut input = use_signal(String::new);
-    let status = use_signal(|| SendStatus::Idle);
+    let mut status = use_signal(|| SendStatus::Idle);
     let mut bootstrap_error: Signal<Option<String>> = use_signal(|| None);
+    // Saved-session picker state. `available_sessions` is the dropdown
+    // list (lexicographic from the proxy, which sorts the filenames).
+    // `pick_session` is the user's current selection inside the
+    // dropdown — distinct from `session_id` because the latter is the
+    // id of the *active* session, not the one staged for loading.
+    let mut available_sessions = use_signal(Vec::<String>::new);
+    let mut pick_session = use_signal(String::new);
 
     // ── Bootstrap: load personas + models on mount ───────────────
     use_future(move || async move {
@@ -380,6 +417,15 @@ pub fn ConversationView() -> Element {
             },
             Err(e) => bootstrap_error.set(Some(format!("could not build /models request: {e}"))),
         }
+        match build_get(&format!("{PROXY_BASE}/conversation/sessions")) {
+            Ok(req) => match fetch_json::<SessionListResponse>(req).await {
+                Ok(resp) => available_sessions.set(resp.sessions),
+                Err(e) => bootstrap_error.set(Some(format!("could not load sessions: {e}"))),
+            },
+            Err(e) => bootstrap_error.set(Some(format!(
+                "could not build /conversation/sessions request: {e}"
+            ))),
+        }
     });
 
     // ── Submit handler ────────────────────────────────────────────
@@ -397,6 +443,7 @@ pub fn ConversationView() -> Element {
         streaming,
         input,
         status,
+        available_sessions,
     };
 
     rsx! {
@@ -500,6 +547,122 @@ pub fn ConversationView() -> Element {
             if let Some(err) = bootstrap_error() {
                 div { style: "color: #ff6b81; padding: 0.5rem; border: 1px solid #e94560; border-radius: 4px; margin-bottom: 1rem; background: #3a1020;",
                     "Bootstrap error: {err}"
+                }
+            }
+
+            // ── Saved-session picker ─────────────────────────
+            // Lets the user resume a previously persisted session or
+            // start a fresh one. The persona/model dropdowns lock to
+            // whatever the loaded session was using — mid-session
+            // switching of persona/model is intentionally deferred.
+            div { style: "display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap;",
+                label { r#for: "convo-pick", style: "color: #c0c0d0;", "Saved sessions" }
+                select {
+                    id: "convo-pick",
+                    value: "{pick_session}",
+                    onchange: move |e| pick_session.set(e.value()),
+                    option { value: "", "— select a saved session —" }
+                    for sid in available_sessions().iter() {
+                        option { key: "{sid}", value: "{sid}", "{sid}" }
+                    }
+                }
+                button {
+                    class: "convo-send",
+                    disabled: pick_session().is_empty()
+                        || matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                    onclick: move |_| {
+                        let sid = pick_session.peek().clone();
+                        if sid.is_empty() {
+                            return;
+                        }
+                        let key = anthropic_key.peek().clone();
+                        if key.is_empty() {
+                            status.set(SendStatus::Failed(
+                                "set an Anthropic key before loading".into(),
+                            ));
+                            return;
+                        }
+                        status.set(SendStatus::Sending);
+                        spawn_local(async move {
+                            let body = match serde_json::to_string(&serde_json::json!({
+                                "session_id": sid,
+                                "anthropic_key": key,
+                            })) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(format!(
+                                        "load payload: {e}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            let req = match build_post(
+                                &format!("{PROXY_BASE}/conversation/load"),
+                                &body,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(e));
+                                    return;
+                                }
+                            };
+                            match fetch_json::<WireSession>(req).await {
+                                Ok(snap) => {
+                                    // Replace transcript with loaded turns. System
+                                    // turns (compaction summaries) are skipped —
+                                    // they aren't user-visible content.
+                                    let mut loaded = Vec::with_capacity(snap.turns.len());
+                                    for t in snap.turns {
+                                        let role = match t.role.as_str() {
+                                            "user" => Some(Role::User),
+                                            "assistant" => Some(Role::Assistant),
+                                            _ => None,
+                                        };
+                                        if let Some(role) = role {
+                                            loaded.push(Message { role, content: t.content });
+                                        }
+                                    }
+                                    messages.set(loaded);
+                                    streaming.set(String::new());
+                                    session_id.set(sid);
+                                    // Surface the persona/model that the
+                                    // loaded session is currently bound to.
+                                    // Lock both dropdowns by flipping
+                                    // session_initialized — mid-session
+                                    // switching is a future slice.
+                                    if let Some(active) = snap.persona_history.last() {
+                                        selected_persona.set(active.persona_id.clone());
+                                        selected_model.set(active.model_config_id.clone());
+                                    }
+                                    session_initialized.set(true);
+                                    status.set(SendStatus::Idle);
+                                }
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(format!(
+                                        "load failed: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    },
+                    "Load"
+                }
+                button {
+                    class: "convo-send",
+                    disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                    onclick: move |_| {
+                        // Reset to a fresh session. Persona/model
+                        // dropdowns re-enable so the user can pick
+                        // again before the next turn.
+                        messages.set(Vec::new());
+                        streaming.set(String::new());
+                        input.set(String::new());
+                        session_id.set(generate_session_id());
+                        session_initialized.set(false);
+                        pick_session.set(String::new());
+                        status.set(SendStatus::Idle);
+                    },
+                    "New"
                 }
             }
 
@@ -634,6 +797,10 @@ struct SendHandles {
     streaming: Signal<String>,
     input: Signal<String>,
     status: Signal<SendStatus>,
+    /// Refreshed after every successful auto-save so a freshly
+    /// created session id appears in the picker without a manual
+    /// reload.
+    available_sessions: Signal<Vec<String>>,
 }
 
 /// Validate inputs, optimistically render the user turn, kick off the
@@ -655,6 +822,7 @@ fn submit_turn(h: SendHandles) {
         mut streaming,
         mut input,
         mut status,
+        mut available_sessions,
     } = h;
 
     let user_text = input.peek().trim().to_string();
@@ -830,6 +998,14 @@ fn submit_turn(h: SendHandles) {
                         // the conversation itself is fine, only persistence
                         // failed. The user can retry on their next turn.
                         status.set(SendStatus::Failed(format!("auto-save failed: {e}")));
+                    } else if let Ok(req) =
+                        build_get(&format!("{PROXY_BASE}/conversation/sessions"))
+                        && let Ok(resp) = fetch_json::<SessionListResponse>(req).await
+                    {
+                        // Refresh the picker so a brand-new session id
+                        // is selectable on the very next turn. Failure
+                        // here is silent — the picker is non-critical.
+                        available_sessions.set(resp.sessions);
                     }
                 }
                 Err(e) => {
