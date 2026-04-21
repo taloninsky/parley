@@ -406,6 +406,12 @@ pub fn ConversationView() -> Element {
     // id of the *active* session, not the one staged for loading.
     let mut available_sessions = use_signal(Vec::<SessionSummary>::new);
     let mut pick_session = use_signal(String::new);
+    // `applied_*` mirror the persona/model that the *active* session
+    // is currently bound to on the proxy. They diverge from
+    // `selected_*` when the user changes a dropdown post-init; the
+    // "Switch" button uses that delta to decide if it's actionable.
+    let mut applied_persona = use_signal(String::new);
+    let mut applied_model = use_signal(String::new);
 
     // ── Bootstrap: load personas + models on mount ───────────────
     use_future(move || async move {
@@ -460,6 +466,8 @@ pub fn ConversationView() -> Element {
         input,
         status,
         available_sessions,
+        applied_persona,
+        applied_model,
     };
 
     rsx! {
@@ -651,6 +659,8 @@ pub fn ConversationView() -> Element {
                                     if let Some(active) = snap.persona_history.last() {
                                         selected_persona.set(active.persona_id.clone());
                                         selected_model.set(active.model_config_id.clone());
+                                        applied_persona.set(active.persona_id.clone());
+                                        applied_model.set(active.model_config_id.clone());
                                     }
                                     session_initialized.set(true);
                                     status.set(SendStatus::Idle);
@@ -678,6 +688,8 @@ pub fn ConversationView() -> Element {
                         session_id.set(generate_session_id());
                         session_initialized.set(false);
                         pick_session.set(String::new());
+                        applied_persona.set(String::new());
+                        applied_model.set(String::new());
                         status.set(SendStatus::Idle);
                     },
                     "New"
@@ -768,7 +780,7 @@ pub fn ConversationView() -> Element {
                 select {
                     id: "convo-persona",
                     value: "{selected_persona}",
-                    disabled: session_initialized(),
+                    disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
                     onchange: move |e| selected_persona.set(e.value()),
                     for p in personas().iter() {
                         option { key: "{p.id}", value: "{p.id}",
@@ -781,7 +793,7 @@ pub fn ConversationView() -> Element {
                 select {
                     id: "convo-model",
                     value: "{selected_model}",
-                    disabled: session_initialized(),
+                    disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
                     onchange: move |e| selected_model.set(e.value()),
                     for m in models().iter() {
                         option { key: "{m.id}", value: "{m.id}",
@@ -797,6 +809,89 @@ pub fn ConversationView() -> Element {
                     value: "{session_id}",
                     disabled: session_initialized(),
                     oninput: move |e| session_id.set(e.value()),
+                }
+
+                // Switch button: rebinds the active session to the
+                // currently-selected persona/model. Only meaningful
+                // post-init and when the dropdowns have actually
+                // drifted from what the proxy currently has bound.
+                button {
+                    class: "convo-send",
+                    disabled: !session_initialized()
+                        || matches!(status(), SendStatus::Sending | SendStatus::Streaming)
+                        || (selected_persona() == applied_persona()
+                            && selected_model() == applied_model()),
+                    onclick: move |_| {
+                        let new_persona = selected_persona.peek().clone();
+                        let new_model = selected_model.peek().clone();
+                        let key = anthropic_key.peek().clone();
+                        if key.is_empty() {
+                            status.set(SendStatus::Failed(
+                                "set an Anthropic key in the field above".into(),
+                            ));
+                            return;
+                        }
+                        status.set(SendStatus::Sending);
+                        spawn_local(async move {
+                            let body = match serde_json::to_string(&serde_json::json!({
+                                "persona_id": new_persona,
+                                "model_config_id": new_model,
+                                "anthropic_key": key,
+                            })) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(format!("switch payload: {e}")));
+                                    return;
+                                }
+                            };
+                            let req = match build_post(
+                                &format!("{PROXY_BASE}/conversation/switch"),
+                                &body,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(e));
+                                    return;
+                                }
+                            };
+                            // /switch returns 204 No Content on success;
+                            // we just need the HTTP status, not a body.
+                            let window = match web_sys::window() {
+                                Some(w) => w,
+                                None => return,
+                            };
+                            match JsFuture::from(window.fetch_with_request(&req)).await {
+                                Ok(resp_val) => {
+                                    let resp = match resp_val.dyn_into::<web_sys::Response>() {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            status.set(SendStatus::Failed(
+                                                "switch: bad response".into(),
+                                            ));
+                                            return;
+                                        }
+                                    };
+                                    if !resp.ok() {
+                                        status.set(SendStatus::Failed(format!(
+                                            "switch failed: HTTP {}",
+                                            resp.status()
+                                        )));
+                                        return;
+                                    }
+                                    applied_persona.set(new_persona);
+                                    applied_model.set(new_model);
+                                    status.set(SendStatus::Idle);
+                                }
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(format!(
+                                        "switch request failed: {:?}",
+                                        e
+                                    )));
+                                }
+                            }
+                        });
+                    },
+                    "Switch"
                 }
             }
 
@@ -884,6 +979,11 @@ struct SendHandles {
     /// created session id appears in the picker without a manual
     /// reload.
     available_sessions: Signal<Vec<SessionSummary>>,
+    /// Persona/model the active session was last bound to on the
+    /// proxy. Updated on init/load/switch success; used to detect
+    /// when the dropdowns have drifted from the active state.
+    applied_persona: Signal<String>,
+    applied_model: Signal<String>,
 }
 
 /// Validate inputs, optimistically render the user turn, kick off the
@@ -906,6 +1006,8 @@ fn submit_turn(h: SendHandles) {
         mut input,
         mut status,
         mut available_sessions,
+        mut applied_persona,
+        mut applied_model,
     } = h;
 
     let user_text = input.peek().trim().to_string();
@@ -915,7 +1017,6 @@ fn submit_turn(h: SendHandles) {
     let key = anthropic_key.peek().clone();
     let persona = selected_persona.peek().clone();
     let model = selected_model.peek().clone();
-    let _ = model; // currently unused on the wire (proxy resolves model from persona)
     let sid = session_id.peek().clone();
     let already_init = *session_initialized.peek();
 
@@ -969,6 +1070,8 @@ fn submit_turn(h: SendHandles) {
                 return;
             }
             session_initialized.set(true);
+            applied_persona.set(persona.clone());
+            applied_model.set(model.clone());
         }
 
         // Submit the turn.

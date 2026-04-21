@@ -179,6 +179,12 @@ pub struct SwitchRequest {
     pub persona_id: PersonaId,
     /// Model config id to pair with that persona.
     pub model_config_id: ModelConfigId,
+    /// Anthropic API key — required when switching to a model whose
+    /// provider tag is `Anthropic` and that provider isn't already
+    /// registered on the active orchestrator. Same credential rules
+    /// as `/init` and `/load`.
+    #[serde(default)]
+    pub anthropic_key: Option<String>,
 }
 
 /// Body for `POST /conversation/load`.
@@ -375,18 +381,46 @@ async fn switch_persona(
             ))),
         ));
     }
-    if !state.registries.models.contains_key(&req.model_config_id) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody::new(format!(
-                "unknown model '{}'",
-                req.model_config_id
-            ))),
-        ));
-    }
-    orchestrator
-        .switch_persona(req.persona_id, req.model_config_id)
-        .await;
+    let model = state
+        .registries
+        .models
+        .get(&req.model_config_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new(format!(
+                    "unknown model '{}'",
+                    req.model_config_id
+                ))),
+            )
+        })?;
+
+    // Snapshot current session, then rebuild the orchestrator with a
+    // freshly constructed provider for the new model. This is how we
+    // keep `OrchestratorContext::providers` aligned with the active
+    // model without making the context internally mutable. The
+    // session itself — turns, speakers, persona history — carries
+    // over unchanged; `switch_persona` then records the activation
+    // so the next turn dispatches against the new pair.
+    let mut snapshot = orchestrator.session_snapshot().await;
+    let synthetic = InitRequest {
+        session_id: snapshot.id.clone(),
+        persona_id: req.persona_id.clone(),
+        ai_speaker_id: String::new(),
+        ai_speaker_label: String::new(),
+        anthropic_key: req.anthropic_key.clone(),
+    };
+    let provider = build_provider(&model, &synthetic, &state.http)?;
+    snapshot.switch_persona(req.persona_id.clone(), req.model_config_id.clone());
+    let ctx = OrchestratorContext {
+        personas: state.registries.personas.clone(),
+        models: state.registries.models.clone(),
+        providers: HashMap::from([(model.id.clone(), provider)]),
+        prompts_dir: state.registries.prompts_dir.clone(),
+    };
+    let new_orchestrator = Arc::new(ConversationOrchestrator::new(snapshot, ctx));
+    *state.inner.lock().await = Some(new_orchestrator);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -978,6 +1012,7 @@ mod tests {
                         serde_json::to_vec(&serde_json::json!({
                             "persona_id": "storyteller",
                             "model_config_id": "m1",
+                            "anthropic_key": "test-key",
                         }))
                         .unwrap(),
                     ))
@@ -1020,7 +1055,7 @@ mod tests {
                     .uri("/conversation/switch")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"persona_id":"ghost","model_config_id":"m1"}"#,
+                        r#"{"persona_id":"ghost","model_config_id":"m1","anthropic_key":"k"}"#,
                     ))
                     .unwrap(),
             )
