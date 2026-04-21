@@ -25,8 +25,9 @@ pub fn Root() -> Element {
         div { class: "parley-shell",
             // Compact mode toggle pinned to the top of the page. Kept
             // above the existing transcription UI so it can't disrupt
-            // any existing layout assumptions inside `App`.
-            div { style: "display: flex; gap: 0.5rem; padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; background: #f7f7f7;",
+            // any existing layout assumptions inside `App`. Styled to
+            // match the dark palette used by both child views.
+            div { style: "display: flex; gap: 0.5rem; padding: 0.5rem 1rem; border-bottom: 1px solid #2a3960; background: #16213e;",
                 button {
                     style: tab_style(*mode.read() == Mode::Transcribe),
                     onclick: move |_| mode.set(Mode::Transcribe),
@@ -63,10 +64,11 @@ pub fn Root() -> Element {
 }
 
 fn tab_style(active: bool) -> String {
-    let bg = if active { "#1976d2" } else { "#fff" };
-    let fg = if active { "#fff" } else { "#333" };
+    let bg = if active { "#0f3460" } else { "#1a1a2e" };
+    let fg = if active { "#e0e0e0" } else { "#8888aa" };
+    let border = if active { "#4ecca3" } else { "#2a3960" };
     format!(
         "padding: 0.4rem 0.9rem; font-size: 0.95rem; cursor: pointer; \
-         border: 1px solid #bbb; border-radius: 4px; background: {bg}; color: {fg};"
+         border: 1px solid {border}; border-radius: 4px; background: {bg}; color: {fg};"
     )
 }

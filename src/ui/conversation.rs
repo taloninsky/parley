@@ -400,13 +400,105 @@ pub fn ConversationView() -> Element {
     };
 
     rsx! {
+        // Scoped dark theme matching the transcription view's
+        // palette (#1a1a2e bg, #16213e panel, #0f3460 highlight,
+        // #e0e0e0 text, #4ecca3 success, #e94560 error). Kept inline
+        // so this component stays self-contained — no global CSS
+        // file changes needed for the slice.
+        style {
+            r#"
+            .convo-root {{
+                background: #1a1a2e;
+                color: #e0e0e0;
+                min-height: 100vh;
+                box-sizing: border-box;
+            }}
+            .convo-root h2 {{ margin-top: 0; color: #e0e0e0; }}
+            .convo-root label {{ color: #c0c0d0; font-size: 0.95rem; }}
+            .convo-root input,
+            .convo-root select,
+            .convo-root textarea {{
+                background: #16213e;
+                color: #e0e0e0;
+                border: 1px solid #2a3960;
+                border-radius: 4px;
+                padding: 0.4rem 0.6rem;
+                font-family: inherit;
+                font-size: 0.95rem;
+            }}
+            .convo-root input:focus,
+            .convo-root select:focus,
+            .convo-root textarea:focus {{
+                outline: none;
+                border-color: #4ecca3;
+            }}
+            .convo-root input:disabled,
+            .convo-root select:disabled {{
+                opacity: 0.55;
+                cursor: not-allowed;
+            }}
+            .convo-root button.convo-send {{
+                background: #0f3460;
+                color: #e0e0e0;
+                border: 1px solid #2a3960;
+                border-radius: 4px;
+                padding: 0.5rem 1rem;
+                font-size: 1rem;
+                cursor: pointer;
+            }}
+            .convo-root button.convo-send:hover:not(:disabled) {{
+                background: #16213e;
+                border-color: #4ecca3;
+            }}
+            .convo-root button.convo-send:disabled {{
+                opacity: 0.5;
+                cursor: not-allowed;
+            }}
+            .convo-root .convo-transcript {{
+                background: #12284a;
+                border: 1px solid #2a3960;
+                border-radius: 6px;
+                padding: 0.75rem;
+                min-height: 240px;
+                max-height: 60vh;
+                overflow-y: auto;
+                margin-bottom: 0.75rem;
+            }}
+            .convo-root .convo-msg-user {{
+                background: #0f3460;
+                border-left: 3px solid #4ecca3;
+            }}
+            .convo-root .convo-msg-ai {{
+                background: #16213e;
+                border-left: 3px solid #e9a545;
+            }}
+            .convo-root .convo-msg-streaming {{
+                background: #16213e;
+                border-left: 3px solid #e9a545;
+                opacity: 0.85;
+            }}
+            .convo-root .convo-msg {{
+                margin-bottom: 0.75rem;
+                padding: 0.5rem 0.75rem;
+                border-radius: 4px;
+            }}
+            .convo-root .convo-role {{
+                font-size: 0.75rem;
+                color: #8888aa;
+                margin-bottom: 0.25rem;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }}
+            .convo-root .convo-empty {{ color: #8888aa; font-style: italic; }}
+            "#
+        }
         div { class: "convo-root",
             style: "max-width: 760px; margin: 0 auto; padding: 1rem; font-family: system-ui, sans-serif;",
 
             h2 { "Conversation" }
 
             if let Some(err) = bootstrap_error() {
-                div { style: "color: #b00020; padding: 0.5rem; border: 1px solid #b00020; border-radius: 4px; margin-bottom: 1rem;",
+                div { style: "color: #ff6b81; padding: 0.5rem; border: 1px solid #e94560; border-radius: 4px; margin-bottom: 1rem; background: #3a1020;",
                     "Bootstrap error: {err}"
                 }
             }
@@ -463,20 +555,19 @@ pub fn ConversationView() -> Element {
             }
 
             // ── Transcript ────────────────────────────────────
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; min-height: 240px; max-height: 60vh; overflow-y: auto; background: #fafafa; margin-bottom: 0.75rem;",
+            div { class: "convo-transcript",
                 if messages().is_empty() && streaming().is_empty() {
-                    div { style: "color: #666; font-style: italic;",
+                    div { class: "convo-empty",
                         "No messages yet. Type something below to start."
                     }
                 }
                 for (i, msg) in messages().iter().enumerate() {
                     div { key: "msg-{i}",
-                        style: format!(
-                            "margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; background: {};",
-                            match msg.role { Role::User => "#e3f2fd", Role::Assistant => "#fff" }
-                        ),
-                        div { style: "font-size: 0.75rem; color: #666; margin-bottom: 0.25rem;",
+                        class: match msg.role {
+                            Role::User => "convo-msg convo-msg-user",
+                            Role::Assistant => "convo-msg convo-msg-ai",
+                        },
+                        div { class: "convo-role",
                             match msg.role { Role::User => "You", Role::Assistant => "Assistant" }
                         }
                         div { style: "white-space: pre-wrap;", "{msg.content}" }
@@ -484,10 +575,8 @@ pub fn ConversationView() -> Element {
                 }
                 if !streaming().is_empty() {
                     div { key: "{\"streaming\"}",
-                        style: "margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; background: #fff; border: 1px dashed #999;",
-                        div { style: "font-size: 0.75rem; color: #666; margin-bottom: 0.25rem;",
-                            "Assistant (typing…)"
-                        }
+                        class: "convo-msg convo-msg-streaming",
+                        div { class: "convo-role", "Assistant (typing…)" }
                         div { style: "white-space: pre-wrap;", "{streaming}" }
                     }
                 }
@@ -496,17 +585,17 @@ pub fn ConversationView() -> Element {
             // ── Status row ───────────────────────────────────
             div { style: "min-height: 1.25rem; margin-bottom: 0.5rem; font-size: 0.875rem;",
                 match status() {
-                    SendStatus::Idle => rsx! { span { style: "color: #444;", "Ready" } },
-                    SendStatus::Sending => rsx! { span { style: "color: #444;", "Sending…" } },
-                    SendStatus::Streaming => rsx! { span { style: "color: #0a7;", "Streaming…" } },
-                    SendStatus::Failed(msg) => rsx! { span { style: "color: #b00020;", "Error: {msg}" } },
+                    SendStatus::Idle => rsx! { span { style: "color: #8888aa;", "Ready" } },
+                    SendStatus::Sending => rsx! { span { style: "color: #c0c0d0;", "Sending…" } },
+                    SendStatus::Streaming => rsx! { span { style: "color: #4ecca3;", "Streaming…" } },
+                    SendStatus::Failed(msg) => rsx! { span { style: "color: #ff6b81;", "Error: {msg}" } },
                 }
             }
 
             // ── Composer ─────────────────────────────────────
             div { style: "display: flex; gap: 0.5rem;",
                 textarea {
-                    style: "flex: 1; min-height: 4rem; padding: 0.5rem; font-family: inherit; font-size: 1rem; resize: vertical;",
+                    style: "flex: 1; min-height: 4rem; resize: vertical;",
                     placeholder: "Type a message and press Ctrl+Enter to send.",
                     value: "{input}",
                     oninput: move |e| input.set(e.value()),
@@ -520,7 +609,7 @@ pub fn ConversationView() -> Element {
                     },
                 }
                 button {
-                    style: "padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer;",
+                    class: "convo-send",
                     disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
                     onclick: move |_| submit_turn(handles),
                     "Send"
