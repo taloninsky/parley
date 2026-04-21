@@ -130,6 +130,8 @@ pub fn router(state: ConversationApiState) -> Router {
     Router::new()
         .route("/conversation/init", post(init_session))
         .route("/conversation/turn", post(submit_turn))
+        .route("/conversation/retry", post(retry_turn))
+        .route("/conversation/discard_pending", post(discard_pending_turn))
         .route("/conversation/switch", post(switch_persona))
         .route("/conversation/snapshot", get(session_snapshot))
         .route("/conversation/save", post(save_session))
@@ -365,6 +367,41 @@ async fn submit_turn(
         Ok::<_, Infallible>(Event::default().event(event_name(&event)).data(json))
     });
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// `POST /conversation/retry` — re-dispatch the session's pending
+/// tail user turn (left behind by a failed `submit_turn`). Streams
+/// SSE events identical to `/conversation/turn` minus the synthetic
+/// `user_turn_appended` (the user turn is already in the session).
+/// Returns 409 when there is no pending turn to retry.
+async fn retry_turn(
+    State(state): State<ConversationApiState>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
+    let orchestrator = require_session(&state).await?;
+    let event_stream = orchestrator
+        .retry_pending()
+        .await
+        .map_err(orchestrator_error_to_response)?;
+    let sse_stream = event_stream.map(|event| {
+        let json = serde_json::to_string(&event).expect("OrchestratorEvent serialization");
+        Ok::<_, Infallible>(Event::default().event(event_name(&event)).data(json))
+    });
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// `POST /conversation/discard_pending` — pop the trailing
+/// pending user turn from the session so subsequent dispatches see
+/// clean history. Used by the Dismiss path after a failure. Returns
+/// 204 on success, 409 when there is nothing pending.
+async fn discard_pending_turn(
+    State(state): State<ConversationApiState>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let orchestrator = require_session(&state).await?;
+    orchestrator
+        .discard_pending()
+        .await
+        .map_err(orchestrator_error_to_response)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn switch_persona(
@@ -669,6 +706,9 @@ fn orchestrator_error_to_response(err: OrchestratorError) -> (StatusCode, Json<E
         OrchestratorError::NoProvider(_) | OrchestratorError::PromptFile { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
+        // 409: the session state isn't compatible with the request
+        // (e.g. retry/discard called when there's nothing pending).
+        OrchestratorError::NoPendingTurn => StatusCode::CONFLICT,
     };
     (status, Json(ErrorBody::new(err.to_string())))
 }
@@ -934,6 +974,172 @@ mod tests {
         let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"failed"));
         assert!(!names.contains(&"ai_turn_appended"));
+    }
+
+    #[tokio::test]
+    async fn retry_endpoint_redispatches_pending_user_turn() {
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let state = build_state(persona.clone(), model.clone());
+
+        // First call errors out and leaves the user turn pending.
+        // Second call must succeed using the *same* tail user turn,
+        // without appending a duplicate.
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "mock",
+            vec![
+                MockItem::Err(crate::llm::LlmError::Other("transient".into())),
+                MockItem::Text("recovered".into()),
+            ],
+            TokenUsage::default(),
+        ));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        // Initial /turn — should fail mid-stream.
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/turn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"speaker_id":"g","content":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = read_body(resp).await;
+
+        // Retry — must succeed, must NOT emit user_turn_appended,
+        // must end with ai_turn_appended.
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let frames = parse_sse(&body);
+        let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"user_turn_appended"));
+        assert!(names.contains(&"ai_turn_appended"));
+
+        // Snapshot must show exactly one user turn + one assistant.
+        let snap = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read_body(snap).await).unwrap();
+        let turns = v["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["role"], "user");
+        assert_eq!(turns[1]["role"], "assistant");
+    }
+
+    #[tokio::test]
+    async fn retry_endpoint_returns_409_when_no_pending_turn() {
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let state = build_state(persona.clone(), model.clone());
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn discard_pending_endpoint_pops_orphan_user_turn() {
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let state = build_state(persona.clone(), model.clone());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(
+            "mock",
+            vec![MockItem::Err(crate::llm::LlmError::Other("boom".into()))],
+            TokenUsage::default(),
+        ));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        // Force the orphan tail.
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/turn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"speaker_id":"g","content":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = read_body(resp).await;
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/discard_pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let snap = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read_body(snap).await).unwrap();
+        assert_eq!(v["turns"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discard_pending_endpoint_returns_409_when_clean() {
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let state = build_state(persona.clone(), model.clone());
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/discard_pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

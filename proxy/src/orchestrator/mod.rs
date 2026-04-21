@@ -140,6 +140,10 @@ pub enum OrchestratorError {
         #[source]
         source: std::io::Error,
     },
+    /// Retry/discard was requested but the session's tail is not a
+    /// pending user turn (no failed dispatch to recover from).
+    #[error("no pending user turn to retry or discard")]
+    NoPendingTurn,
 }
 
 /// Runtime resources the orchestrator needs to dispatch a turn. Held
@@ -245,31 +249,7 @@ impl ConversationOrchestrator {
         // 1. Resolve the active persona + model + provider *before*
         //    we mutate the session, so a config error doesn't leave
         //    a dangling user turn with no AI response.
-        let (persona, model, provider) = {
-            let session = self.session.lock().await;
-            let active = session.active().clone();
-            let persona = self
-                .ctx
-                .personas
-                .get(&active.persona_id)
-                .cloned()
-                .ok_or_else(|| OrchestratorError::UnknownPersona(active.persona_id.clone()))?;
-            let model = self
-                .ctx
-                .models
-                .get(&active.model_config_id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrchestratorError::UnknownModelConfig(active.model_config_id.clone())
-                })?;
-            let provider = self
-                .ctx
-                .providers
-                .get(&active.model_config_id)
-                .cloned()
-                .ok_or_else(|| OrchestratorError::NoProvider(active.model_config_id.clone()))?;
-            (persona, model, provider)
-        };
+        let (persona, model, provider) = self.resolve_active().await?;
 
         // 2. Resolve the system prompt — inline is free, file
         //    requires I/O. Done before mutating the session for the
@@ -286,8 +266,96 @@ impl ConversationOrchestrator {
             (id, msgs)
         };
 
-        // 4. Build the dispatch future. All subsequent state lives
-        //    inside the stream; the caller drives by polling.
+        // 4. Build the dispatch stream. Emits the synthetic
+        //    `UserTurnAppended` first since the caller is observing
+        //    a fresh submission, not a retry.
+        Ok(self.dispatch_history(history, persona, model, provider, Some(user_turn_id)))
+    }
+
+    /// Re-dispatch the session's pending tail user turn (the one
+    /// left behind by a failed `submit_user_turn`). Resolves
+    /// persona/model/provider from the *current* active activation
+    /// — a `/switch` between failure and retry will be honored.
+    ///
+    /// Returns [`OrchestratorError::NoPendingTurn`] when the tail is
+    /// not an unanswered user turn.
+    pub async fn retry_pending(
+        &self,
+    ) -> Result<BoxStream<'static, OrchestratorEvent>, OrchestratorError> {
+        let (persona, model, provider) = self.resolve_active().await?;
+        let system_text = resolve_system_prompt(&persona.system_prompt, &self.ctx.prompts_dir)?;
+
+        let history = {
+            let session = self.session.lock().await;
+            if !session.has_pending_user_turn() {
+                return Err(OrchestratorError::NoPendingTurn);
+            }
+            let mut msgs = vec![ChatMessage::system(system_text)];
+            msgs.extend(session.to_chat_messages());
+            msgs
+        };
+
+        // No `UserTurnAppended` — the user turn is already in the
+        // session from the original (failed) attempt. The frontend
+        // already has it rendered.
+        Ok(self.dispatch_history(history, persona, model, provider, None))
+    }
+
+    /// Pop the trailing pending user turn from the session, if one
+    /// exists. Used by the "Dismiss" path so the orphaned user turn
+    /// doesn't poison the next dispatch's history.
+    ///
+    /// Returns [`OrchestratorError::NoPendingTurn`] when there is
+    /// nothing to pop.
+    pub async fn discard_pending(&self) -> Result<(), OrchestratorError> {
+        let mut session = self.session.lock().await;
+        if session.discard_pending_user_turn().is_some() {
+            Ok(())
+        } else {
+            Err(OrchestratorError::NoPendingTurn)
+        }
+    }
+
+    /// Resolve the (persona, model, provider) triple for the current
+    /// active activation. Shared by `submit_user_turn` and
+    /// `retry_pending` so dispatch errors stay consistent.
+    async fn resolve_active(
+        &self,
+    ) -> Result<(Persona, ModelConfig, Arc<dyn LlmProvider>), OrchestratorError> {
+        let session = self.session.lock().await;
+        let active = session.active().clone();
+        let persona = self
+            .ctx
+            .personas
+            .get(&active.persona_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::UnknownPersona(active.persona_id.clone()))?;
+        let model = self
+            .ctx
+            .models
+            .get(&active.model_config_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::UnknownModelConfig(active.model_config_id.clone()))?;
+        let provider = self
+            .ctx
+            .providers
+            .get(&active.model_config_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::NoProvider(active.model_config_id.clone()))?;
+        Ok((persona, model, provider))
+    }
+
+    /// Run the streaming dispatch for an already-prepared history.
+    /// Optionally yields a `UserTurnAppended` first when called from
+    /// the fresh-submission path; `retry_pending` skips it.
+    fn dispatch_history(
+        &self,
+        history: Vec<ChatMessage>,
+        persona: Persona,
+        model: ModelConfig,
+        provider: Arc<dyn LlmProvider>,
+        user_turn_id: Option<TurnId>,
+    ) -> BoxStream<'static, OrchestratorEvent> {
         let session = self.session.clone();
         let clock = self.clock.clone();
         let ai_speaker_id = speaker_for_persona(&persona);
@@ -296,7 +364,9 @@ impl ConversationOrchestrator {
         let opts = ChatOptions::default();
 
         let stream = async_stream::stream! {
-            yield OrchestratorEvent::UserTurnAppended { turn_id: user_turn_id.clone() };
+            if let Some(id) = user_turn_id {
+                yield OrchestratorEvent::UserTurnAppended { turn_id: id };
+            }
             yield OrchestratorEvent::StateChanged { state: OrchestratorState::Routing };
             yield OrchestratorEvent::StateChanged { state: OrchestratorState::Streaming };
 
@@ -364,7 +434,7 @@ impl ConversationOrchestrator {
             yield OrchestratorEvent::StateChanged { state: OrchestratorState::Idle };
         };
 
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 }
 

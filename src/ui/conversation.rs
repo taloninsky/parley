@@ -979,7 +979,21 @@ pub fn ConversationView() -> Element {
                             SendStatus::Idle => rsx! { span { style: "color: #8888aa;", "Ready" } },
                             SendStatus::Sending => rsx! { span { style: "color: #c0c0d0;", "Sending…" } },
                             SendStatus::Streaming => rsx! { span { style: "color: #4ecca3;", "Streaming…" } },
-                            SendStatus::Failed(msg) => rsx! { span { style: "color: #ff6b81;", "Error: {msg}" } },
+                            SendStatus::Failed(msg) => rsx! {
+                                span { style: "color: #ff6b81;", "Error: {msg}" }
+                                button {
+                                    class: "convo-send",
+                                    style: "padding: 0.25rem 0.5rem; font-size: 0.8rem;",
+                                    onclick: move |_| retry_pending(handles),
+                                    "Retry"
+                                }
+                                button {
+                                    class: "convo-send",
+                                    style: "padding: 0.25rem 0.5rem; font-size: 0.8rem;",
+                                    onclick: move |_| dismiss_pending(handles),
+                                    "Dismiss"
+                                }
+                            },
                         }
                         if total_usd > 0.0 {
                             span { style: "color: #8888aa; margin-left: auto;",
@@ -1062,7 +1076,7 @@ fn submit_turn(h: SendHandles) {
         mut streaming,
         mut input,
         mut status,
-        mut available_sessions,
+        available_sessions,
         mut applied_persona,
         mut applied_model,
     } = h;
@@ -1188,77 +1202,197 @@ fn submit_turn(h: SendHandles) {
         }
 
         status.set(SendStatus::Streaming);
-        // `drain_sse` takes an `FnMut`, so the closure can capture
-        // signal handles by value (they're Copy) and mutate them
-        // through `with_mut` / `set`. Failures during the stream are
-        // routed through a shared cell and surfaced after the loop
-        // ends, so we don't dispatch a status update from within the
-        // event callback (which would interleave with token writes).
-        // Auto-save signaling rides on the same channel: when the
-        // assistant turn finalizes we set `saved_pending = true` and
-        // fire the `/conversation/save` POST after the stream ends.
-        let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let save_pending: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let failure_inner = failure.clone();
-        let save_inner = save_pending.clone();
-        drain_sse(resp, move |ev| match ev {
-            WireEvent::Token { delta } => {
-                streaming.with_mut(|s| s.push_str(&delta));
-            }
-            WireEvent::AiTurnAppended { cost, .. } => {
-                let final_text = streaming.peek().clone();
-                streaming.set(String::new());
-                messages.with_mut(|m| {
-                    m.push(Message {
-                        role: Role::Assistant,
-                        content: final_text,
-                        cost_usd: Some(cost.usd),
-                    })
-                });
-                *save_inner.borrow_mut() = true;
-            }
-            WireEvent::Failed { message } => {
-                *failure_inner.borrow_mut() = Some(message);
-            }
-            WireEvent::StateChanged { .. } | WireEvent::UserTurnAppended { .. } => {}
-        })
-        .await;
-
-        if let Some(msg) = failure.borrow().as_ref() {
-            status.set(SendStatus::Failed(msg.clone()));
-        } else {
-            status.set(SendStatus::Idle);
-        }
-
-        // Auto-save after the assistant turn lands. Done after the
-        // status update so a save failure can override `Idle` with a
-        // diagnostic without racing the streaming UI. We don't auto-
-        // save on `Failed` because the proxy's session state will not
-        // include the failed exchange anyway.
-        if *save_pending.borrow() {
-            match build_post(&format!("{PROXY_BASE}/conversation/save"), "") {
-                Ok(req) => {
-                    if let Err(e) = fetch_json::<serde_json::Value>(req).await {
-                        // Surface as a soft warning via SendStatus::Failed —
-                        // the conversation itself is fine, only persistence
-                        // failed. The user can retry on their next turn.
-                        status.set(SendStatus::Failed(format!("auto-save failed: {e}")));
-                    } else if let Ok(req) =
-                        build_get(&format!("{PROXY_BASE}/conversation/sessions"))
-                        && let Ok(resp) = fetch_json::<SessionListResponse>(req).await
-                    {
-                        // Refresh the picker so a brand-new session id
-                        // is selectable on the very next turn. Failure
-                        // here is silent — the picker is non-critical.
-                        available_sessions.set(resp.sessions);
-                    }
-                }
-                Err(e) => {
-                    status.set(SendStatus::Failed(format!("auto-save build failed: {e}")));
-                }
-            }
-        }
+        consume_turn_response(resp, messages, streaming, status, available_sessions).await;
     });
+}
+
+/// Re-dispatch the session's pending tail user turn after a failure.
+/// POSTs `/conversation/retry` (no body — the proxy reads from the
+/// session) and consumes the SSE stream the same way `submit_turn`
+/// does. Leaves the optimistically-rendered user message in place.
+fn retry_pending(h: SendHandles) {
+    let SendHandles {
+        messages,
+        streaming,
+        mut status,
+        available_sessions,
+        ..
+    } = h;
+    status.set(SendStatus::Sending);
+    spawn_local(async move {
+        let req = match build_post(&format!("{PROXY_BASE}/conversation/retry"), "") {
+            Ok(r) => r,
+            Err(e) => {
+                status.set(SendStatus::Failed(e));
+                return;
+            }
+        };
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => {
+                status.set(SendStatus::Failed("no window".into()));
+                return;
+            }
+        };
+        let resp_val = match JsFuture::from(window.fetch_with_request(&req)).await {
+            Ok(v) => v,
+            Err(e) => {
+                status.set(SendStatus::Failed(format!("retry request failed: {:?}", e)));
+                return;
+            }
+        };
+        let resp: web_sys::Response = match resp_val.dyn_into() {
+            Ok(r) => r,
+            Err(_) => {
+                status.set(SendStatus::Failed("retry: not a Response".into()));
+                return;
+            }
+        };
+        if !resp.ok() {
+            status.set(SendStatus::Failed(format!(
+                "retry failed: HTTP {}",
+                resp.status()
+            )));
+            return;
+        }
+        status.set(SendStatus::Streaming);
+        consume_turn_response(resp, messages, streaming, status, available_sessions).await;
+    });
+}
+
+/// Discard the session's pending tail user turn after a failure.
+/// POSTs `/conversation/discard_pending`, then pops the trailing
+/// user `Message` from the local view so the UI matches the proxy
+/// state. Clears `Failed` to `Idle` regardless of outcome (a
+/// failed discard is logged as the new status).
+fn dismiss_pending(h: SendHandles) {
+    let SendHandles {
+        mut messages,
+        mut status,
+        ..
+    } = h;
+    spawn_local(async move {
+        let req = match build_post(&format!("{PROXY_BASE}/conversation/discard_pending"), "") {
+            Ok(r) => r,
+            Err(e) => {
+                status.set(SendStatus::Failed(e));
+                return;
+            }
+        };
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => return,
+        };
+        match JsFuture::from(window.fetch_with_request(&req)).await {
+            Ok(resp_val) => {
+                if let Ok(resp) = resp_val.dyn_into::<web_sys::Response>()
+                    && !resp.ok()
+                {
+                    status.set(SendStatus::Failed(format!(
+                        "dismiss failed: HTTP {}",
+                        resp.status()
+                    )));
+                    return;
+                }
+            }
+            Err(e) => {
+                status.set(SendStatus::Failed(format!("dismiss request failed: {:?}", e)));
+                return;
+            }
+        }
+        // Pop the orphan user message from the local view so the UI
+        // matches the now-clean session state.
+        messages.with_mut(|m| {
+            if matches!(m.last(), Some(msg) if msg.role == Role::User) {
+                m.pop();
+            }
+        });
+        status.set(SendStatus::Idle);
+    });
+}
+
+/// Drain an SSE response body from `/conversation/turn` (or
+/// `/conversation/retry`) into the message log. Owns the post-stream
+/// status update + auto-save + picker refresh. Extracted so both
+/// fresh submissions and retries share the exact same consumer
+/// behavior.
+async fn consume_turn_response(
+    resp: web_sys::Response,
+    mut messages: Signal<Vec<Message>>,
+    mut streaming: Signal<String>,
+    mut status: Signal<SendStatus>,
+    mut available_sessions: Signal<Vec<SessionSummary>>,
+) {
+    // `drain_sse` takes an `FnMut`, so the closure can capture
+    // signal handles by value (they're Copy) and mutate them
+    // through `with_mut` / `set`. Failures during the stream are
+    // routed through a shared cell and surfaced after the loop
+    // ends, so we don't dispatch a status update from within the
+    // event callback (which would interleave with token writes).
+    // Auto-save signaling rides on the same channel: when the
+    // assistant turn finalizes we set `saved_pending = true` and
+    // fire the `/conversation/save` POST after the stream ends.
+    let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let save_pending: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let failure_inner = failure.clone();
+    let save_inner = save_pending.clone();
+    drain_sse(resp, move |ev| match ev {
+        WireEvent::Token { delta } => {
+            streaming.with_mut(|s| s.push_str(&delta));
+        }
+        WireEvent::AiTurnAppended { cost, .. } => {
+            let final_text = streaming.peek().clone();
+            streaming.set(String::new());
+            messages.with_mut(|m| {
+                m.push(Message {
+                    role: Role::Assistant,
+                    content: final_text,
+                    cost_usd: Some(cost.usd),
+                })
+            });
+            *save_inner.borrow_mut() = true;
+        }
+        WireEvent::Failed { message } => {
+            *failure_inner.borrow_mut() = Some(message);
+        }
+        WireEvent::StateChanged { .. } | WireEvent::UserTurnAppended { .. } => {}
+    })
+    .await;
+
+    if let Some(msg) = failure.borrow().as_ref() {
+        status.set(SendStatus::Failed(msg.clone()));
+    } else {
+        status.set(SendStatus::Idle);
+    }
+
+    // Auto-save after the assistant turn lands. Done after the
+    // status update so a save failure can override `Idle` with a
+    // diagnostic without racing the streaming UI. We don't auto-
+    // save on `Failed` because the proxy's session state will not
+    // include the failed exchange anyway.
+    if *save_pending.borrow() {
+        match build_post(&format!("{PROXY_BASE}/conversation/save"), "") {
+            Ok(req) => {
+                if let Err(e) = fetch_json::<serde_json::Value>(req).await {
+                    // Surface as a soft warning via SendStatus::Failed —
+                    // the conversation itself is fine, only persistence
+                    // failed. The user can retry on their next turn.
+                    status.set(SendStatus::Failed(format!("auto-save failed: {e}")));
+                } else if let Ok(req) =
+                    build_get(&format!("{PROXY_BASE}/conversation/sessions"))
+                    && let Ok(resp) = fetch_json::<SessionListResponse>(req).await
+                {
+                    // Refresh the picker so a brand-new session id
+                    // is selectable on the very next turn. Failure
+                    // here is silent — the picker is non-critical.
+                    available_sessions.set(resp.sessions);
+                }
+            }
+            Err(e) => {
+                status.set(SendStatus::Failed(format!("auto-save build failed: {e}")));
+            }
+        }
+    }
 }
 
 /// Generate a short, file-safe session id. The proxy's

@@ -275,6 +275,26 @@ impl ConversationSession {
             .collect()
     }
 
+    /// True when the session ends with a user turn that has no
+    /// assistant reply yet — the precondition for retry/discard
+    /// after a failed dispatch.
+    pub fn has_pending_user_turn(&self) -> bool {
+        matches!(self.turns.last(), Some(t) if t.role == ChatRole::User)
+    }
+
+    /// Pop the trailing user turn iff it has no assistant reply.
+    /// Returns the popped turn so the caller can decide whether to
+    /// echo it (for "Dismiss" UX, the frontend already cleared the
+    /// optimistically-rendered bubble). No-op + `None` when the tail
+    /// is anything else.
+    pub fn discard_pending_user_turn(&mut self) -> Option<Turn> {
+        if self.has_pending_user_turn() {
+            self.turns.pop()
+        } else {
+            None
+        }
+    }
+
     fn next_id(&mut self) -> TurnId {
         let id = format!("turn-{:04}", self.next_turn_seq);
         self.next_turn_seq += 1;
@@ -387,6 +407,60 @@ mod tests {
         s.append_system_turn("compaction summary".into(), 5);
         assert!(s.speakers.contains_key("system"));
         assert_eq!(s.turns[0].role, ChatRole::System);
+    }
+
+    #[test]
+    fn has_pending_user_turn_reflects_tail() {
+        let mut s = fresh();
+        // empty
+        assert!(!s.has_pending_user_turn());
+
+        // user appended → pending
+        s.append_user_turn("gavin".into(), "hi".into(), 1);
+        assert!(s.has_pending_user_turn());
+
+        // ai followup → not pending
+        s.append_ai_turn(
+            "ai-scholar".into(),
+            "hello".into(),
+            2,
+            TurnProvenance {
+                persona_id: "scholar".into(),
+                model_config_id: "claude-x".into(),
+                usage: TokenUsage::default(),
+                cost: Cost::default(),
+            },
+        );
+        assert!(!s.has_pending_user_turn());
+    }
+
+    #[test]
+    fn discard_pending_user_turn_pops_only_when_pending() {
+        let mut s = fresh();
+        // No-op on empty session.
+        assert!(s.discard_pending_user_turn().is_none());
+
+        s.append_user_turn("gavin".into(), "hi".into(), 1);
+        let popped = s.discard_pending_user_turn().expect("pending tail");
+        assert_eq!(popped.content, "hi");
+        assert!(!s.has_pending_user_turn());
+        assert_eq!(s.turns.len(), 0);
+
+        // After an AI follow-up, no pending tail to pop.
+        s.append_user_turn("gavin".into(), "again".into(), 2);
+        s.append_ai_turn(
+            "ai-scholar".into(),
+            "ok".into(),
+            3,
+            TurnProvenance {
+                persona_id: "scholar".into(),
+                model_config_id: "claude-x".into(),
+                usage: TokenUsage::default(),
+                cost: Cost::default(),
+            },
+        );
+        assert!(s.discard_pending_user_turn().is_none());
+        assert_eq!(s.turns.len(), 2);
     }
 
     #[test]
