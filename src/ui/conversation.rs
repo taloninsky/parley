@@ -75,7 +75,16 @@ struct ModelListResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SessionListResponse {
-    sessions: Vec<String>,
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionSummary {
+    id: String,
+    /// Best-effort title pulled from the first user turn server-side.
+    /// Empty when the session has no user turns yet.
+    #[serde(default)]
+    title: String,
 }
 
 // `WireSession` mirrors `parley_core::ConversationSession` but only
@@ -388,7 +397,7 @@ pub fn ConversationView() -> Element {
     // `pick_session` is the user's current selection inside the
     // dropdown — distinct from `session_id` because the latter is the
     // id of the *active* session, not the one staged for loading.
-    let mut available_sessions = use_signal(Vec::<String>::new);
+    let mut available_sessions = use_signal(Vec::<SessionSummary>::new);
     let mut pick_session = use_signal(String::new);
 
     // ── Bootstrap: load personas + models on mount ───────────────
@@ -562,8 +571,10 @@ pub fn ConversationView() -> Element {
                     value: "{pick_session}",
                     onchange: move |e| pick_session.set(e.value()),
                     option { value: "", "— select a saved session —" }
-                    for sid in available_sessions().iter() {
-                        option { key: "{sid}", value: "{sid}", "{sid}" }
+                    for s in available_sessions().iter() {
+                        option { key: "{s.id}", value: "{s.id}",
+                            if s.title.is_empty() { "{s.id}" } else { "{s.title}" }
+                        }
                     }
                 }
                 button {
@@ -800,7 +811,7 @@ struct SendHandles {
     /// Refreshed after every successful auto-save so a freshly
     /// created session id appears in the picker without a manual
     /// reload.
-    available_sessions: Signal<Vec<String>>,
+    available_sessions: Signal<Vec<SessionSummary>>,
 }
 
 /// Validate inputs, optimistically render the user turn, kick off the

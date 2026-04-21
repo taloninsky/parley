@@ -195,11 +195,25 @@ pub struct LoadRequest {
     pub anthropic_key: Option<String>,
 }
 
+/// Compact summary of a saved session, returned by `GET
+/// /conversation/sessions`. The `title` is derived best-effort from
+/// the first user turn so the picker UI can render something more
+/// human-friendly than the raw filename id.
+#[derive(Debug, Serialize)]
+pub struct SessionSummary {
+    /// Filesystem id (also the filename stem).
+    pub id: String,
+    /// Truncated preview of the first user turn, or an empty string
+    /// if the session has no user turns yet (or failed to load).
+    pub title: String,
+}
+
 /// Response body for `GET /conversation/sessions`.
 #[derive(Debug, Serialize)]
 pub struct SessionList {
-    /// All session ids currently on disk, sorted lexicographically.
-    pub sessions: Vec<String>,
+    /// All saved sessions, sorted by id (lexicographic, which for
+    /// our `sess-{epoch_ms}-{rand}` ids is also chronological).
+    pub sessions: Vec<SessionSummary>,
 }
 
 /// Compact view of a [`Persona`] used by the picker UI. Strips the
@@ -467,13 +481,51 @@ async fn load_session(
 async fn list_sessions(
     State(state): State<ConversationApiState>,
 ) -> Result<Json<SessionList>, (StatusCode, Json<ErrorBody>)> {
-    let mut sessions = state
+    let mut ids = state
         .store
         .list()
         .await
         .map_err(session_store_error_to_response)?;
-    sessions.sort();
+    ids.sort();
+    // Best-effort title derivation: load each session and pull the
+    // first user turn. A load failure (corrupt JSON, registry drift)
+    // is non-fatal — we still return the id with an empty title so
+    // the picker can show *something*.
+    let mut sessions = Vec::with_capacity(ids.len());
+    for id in ids {
+        let title = match state.store.load(&id).await {
+            Ok(session) => derive_session_title(&session),
+            Err(_) => String::new(),
+        };
+        sessions.push(SessionSummary { id, title });
+    }
     Ok(Json(SessionList { sessions }))
+}
+
+/// Pull a short, human-friendly title out of a session: the first
+/// user turn's content, collapsed to a single line and truncated to
+/// roughly 60 chars at a char boundary. Returns an empty string when
+/// there are no user turns.
+fn derive_session_title(session: &ConversationSession) -> String {
+    const MAX_CHARS: usize = 60;
+    let Some(first_user) = session
+        .turns
+        .iter()
+        .find(|t| matches!(t.role, parley_core::chat::ChatRole::User))
+    else {
+        return String::new();
+    };
+    let collapsed: String = first_user
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() <= MAX_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 async fn list_personas(State(state): State<ConversationApiState>) -> Json<PersonaListResponse> {
@@ -1325,7 +1377,55 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
         let sessions = v["sessions"].as_array().unwrap();
-        let ids: Vec<&str> = sessions.iter().map(|s| s.as_str().unwrap()).collect();
+        let ids: Vec<&str> = sessions.iter().map(|s| s["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
+        // No turns appended, so titles default to empty strings.
+        for s in sessions {
+            assert_eq!(s["title"].as_str().unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn derive_title_uses_first_user_turn() {
+        let mut s = ConversationSession::new(
+            "t1",
+            Speaker::ai_agent("ai-x", "X"),
+            "scholar".to_string(),
+            "m1".to_string(),
+        );
+        // AI turn first should be ignored; title pulls from the first
+        // *user* turn, even when the AI replied earlier in the file.
+        s.append_user_turn(
+            "user".to_string(),
+            "hello   world\nhow are you?".to_string(),
+            0,
+        );
+        assert_eq!(derive_session_title(&s), "hello world how are you?");
+    }
+
+    #[test]
+    fn derive_title_truncates_at_60_chars() {
+        let mut s = ConversationSession::new(
+            "t2",
+            Speaker::ai_agent("ai-x", "X"),
+            "scholar".to_string(),
+            "m1".to_string(),
+        );
+        let long = "a".repeat(120);
+        s.append_user_turn("user".to_string(), long, 0);
+        let title = derive_session_title(&s);
+        assert_eq!(title.chars().count(), 61); // 60 + ellipsis
+        assert!(title.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn derive_title_empty_when_no_user_turns() {
+        let s = ConversationSession::new(
+            "t3",
+            Speaker::ai_agent("ai-x", "X"),
+            "scholar".to_string(),
+            "m1".to_string(),
+        );
+        assert_eq!(derive_session_title(&s), "");
     }
 }
