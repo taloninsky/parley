@@ -619,7 +619,8 @@ Native, async, owns I/O and credentials. Will eventually expose an HTTP endpoint
 
 - `llm` — `LlmProvider` trait + `AnthropicLlm` streaming implementation, plus an SSE decoder hardened for chunk-boundary cases (Phase 4a)
 - `registry` — loads `ModelConfig` and `Persona` files from `~/.parley/{models,personas}/` with per-file diagnostics; shared validation enforces persona → model / system-prompt-file references (Phase 3)
-- **`orchestrator`** *(new)* — `ConversationOrchestrator`, `OrchestratorState`, `OrchestratorEvent`, `OrchestratorContext`. Drives the per-turn state machine and dispatches user input to the active persona's `LlmProvider`.
+- **`orchestrator`** *(Phase 4b)* — `ConversationOrchestrator`, `OrchestratorState`, `OrchestratorEvent`, `OrchestratorContext`. Drives the per-turn state machine and dispatches user input to the active persona's `LlmProvider`.
+- **`conversation_api`** *(new)* — HTTP routes that expose a single in-process `ConversationOrchestrator` to any client (the WASM frontend, integration tests, `curl`).
 
 ### Conversation orchestrator (Phase 4b)
 
@@ -632,14 +633,36 @@ The orchestrator is the runtime "harness" around a `ConversationSession`. It is 
 - **Cost (spec §11):** Per-turn cost is computed at append time from the active model's `TokenRates` and pinned into `TurnProvenance`. Session totals are derived later by summing turns.
 - **Determinism for tests:** Time enters through a `Clock` trait so tests pin timestamps. Provider behavior enters through `LlmProvider` so tests use a `MockProvider` that yields a canned token script — no HTTP in unit tests.
 
-### Deferred slices (tracked, not yet built)
+### Conversation HTTP API (Phase 4c)
+
+The proxy now exposes the orchestrator over HTTP so the WASM frontend (and any other client) can drive a session without speaking to LLM providers directly. All routes share one in-process orchestrator handle — multi-session multiplexing is a later concern.
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/conversation/init` | POST | Create the session. Resolves persona → model → provider; for `LlmProviderTag::Anthropic` builds an `AnthropicLlm` from the supplied `anthropic_key`. Returns the initial `ConversationSession` JSON. |
+| `/conversation/turn` | POST | Submit a user turn. Body: `{ speaker_id, content }`. Response is a `text/event-stream` of [`OrchestratorEvent`]s (one JSON object per `data:` line, with the SSE `event:` field mirroring the variant tag). |
+| `/conversation/switch` | POST | Switch the active `(persona, model)` for the next turn. Validates ids against the loaded registries. Returns `204`. |
+| `/conversation/snapshot` | GET | Full `ConversationSession` as JSON. |
+
+**Failure mapping (spec §10.1, partial):**
+
+- Pre-dispatch errors come back synchronously: unknown persona / model → `400`; missing provider / unreadable prompt file → `500`. The user turn is *not* appended on these.
+- Mid-stream provider errors arrive on the SSE channel as a `failed` event followed by `state_changed` → `failed` → `idle`. The HTTP response itself is still `200` and the stream ends cleanly.
+- "No active session" requests against `/turn`, `/switch`, `/snapshot` return `409 Conflict` so the client knows to call `/init` first.
+
+**Provider construction:** Only `LlmProviderTag::Anthropic` is wired in this slice. Other tags surface as `501 Not Implemented` from `/init`. The supplied `anthropic_key` lives only inside the constructed `AnthropicLlm`; it is never logged.
+
+**Determinism for tests:** A `#[cfg(test)]`-only `ConversationApiState::install_for_test` lets integration tests bypass the provider-construction path and inject an orchestrator built around a `MockProvider` (extracted to `proxy::llm::test_support` so the orchestrator and HTTP tests share one mock implementation). HTTP tests drive the router via `tower::ServiceExt::oneshot`, so they exercise the real routing, JSON deserialization, and SSE encoding without binding a port.
+
+
 
 - Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
 - Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)
 - Pause / Stop / Play / barge-in
 - Context compaction
 - Session persistence (the on-disk file format for `ConversationSession`)
-- HTTP endpoint on the proxy exposing the orchestrator to the WASM frontend
+- Frontend wiring: a Dioxus `use_resource` / `use_future` hook that consumes the SSE stream
+- Multi-session multiplexing (one process, many concurrent sessions keyed by id)
 - Expression-annotation auto-prepend
 - Retry-on-failure logic
 - Cost aggregation across turns (per-turn cost is recorded; session totals are a render concern)

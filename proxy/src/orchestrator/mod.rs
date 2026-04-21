@@ -44,6 +44,7 @@ use parley_core::conversation::{ConversationSession, TurnId, TurnProvenance};
 use parley_core::model_config::{ModelConfig, ModelConfigId};
 use parley_core::persona::{Persona, PersonaId, SystemPrompt};
 use parley_core::speaker::SpeakerId;
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -53,7 +54,8 @@ use crate::llm::{ChatOptions, LlmError, LlmProvider};
 /// subset of spec §5: the audio-bound states (Capturing,
 /// FinalizingStt, Speaking, Paused, Stopped) are deferred until the
 /// audio integration slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrchestratorState {
     /// No active turn; ready to accept input.
     Idle,
@@ -70,7 +72,8 @@ pub enum OrchestratorState {
 /// One observable side-effect of orchestration. The caller (UI,
 /// future HTTP endpoint, test harness) consumes a stream of these
 /// from [`ConversationOrchestrator::submit_user_turn`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrchestratorEvent {
     /// State machine moved into `state`.
     StateChanged {
@@ -407,97 +410,12 @@ fn format_llm_error(e: &LlmError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use futures::stream;
-    use parley_core::chat::ChatToken;
+    use crate::llm::test_support::{MockItem, MockProvider};
     use parley_core::model_config::{LlmProviderTag, TokenRates};
     use parley_core::persona::{
         PersonaContextSettings, PersonaTier, PersonaTiers, PersonaTtsSettings, SystemPrompt,
     };
     use parley_core::speaker::Speaker;
-    use std::sync::Mutex as StdMutex;
-
-    /// Mock `LlmProvider` driven by a canned token script. Emits each
-    /// scripted item in order, then a `Done` with the configured
-    /// usage. Behaves like a well-formed Anthropic-style stream
-    /// without any HTTP at all.
-    struct MockProvider {
-        id: String,
-        context_window: u32,
-        rates: TokenRates,
-        script: Arc<StdMutex<Vec<MockItem>>>,
-        usage: TokenUsage,
-        captured_messages: Arc<StdMutex<Option<Vec<ChatMessage>>>>,
-    }
-
-    enum MockItem {
-        Text(String),
-        Err(LlmError),
-    }
-
-    impl MockProvider {
-        fn new(id: &str, script: Vec<MockItem>, usage: TokenUsage) -> Self {
-            Self {
-                id: id.into(),
-                context_window: 200_000,
-                rates: TokenRates {
-                    input_per_1m: 1.0,
-                    output_per_1m: 5.0,
-                },
-                script: Arc::new(StdMutex::new(script)),
-                usage,
-                captured_messages: Arc::new(StdMutex::new(None)),
-            }
-        }
-
-        fn captured(&self) -> Option<Vec<ChatMessage>> {
-            self.captured_messages.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for MockProvider {
-        fn id(&self) -> &str {
-            &self.id
-        }
-        fn context_window(&self) -> u32 {
-            self.context_window
-        }
-        fn count_tokens(&self, text: &str) -> u64 {
-            text.split_whitespace().count() as u64
-        }
-        fn cost(&self, usage: TokenUsage) -> Cost {
-            Cost::from_usd(
-                (usage.input as f64 / 1_000_000.0) * self.rates.input_per_1m
-                    + (usage.output as f64 / 1_000_000.0) * self.rates.output_per_1m,
-            )
-        }
-        async fn complete(
-            &self,
-            _messages: &[ChatMessage],
-            _opts: &ChatOptions,
-        ) -> Result<crate::llm::ChatCompletion, LlmError> {
-            unimplemented!("complete is not exercised by the orchestrator skeleton")
-        }
-        async fn stream_chat(
-            &self,
-            messages: &[ChatMessage],
-            _opts: &ChatOptions,
-        ) -> Result<BoxStream<'static, Result<ChatToken, LlmError>>, LlmError> {
-            *self.captured_messages.lock().unwrap() = Some(messages.to_vec());
-            let script = std::mem::take(&mut *self.script.lock().unwrap());
-            let usage = self.usage;
-            let mut items: Vec<Result<ChatToken, LlmError>> = script
-                .into_iter()
-                .map(|item| match item {
-                    MockItem::Text(t) => Ok(ChatToken::TextDelta { text: t }),
-                    MockItem::Err(e) => Err(e),
-                })
-                .collect();
-            items.push(Ok(ChatToken::Done { usage: Some(usage) }));
-            Ok(Box::pin(stream::iter(items)))
-        }
-    }
 
     struct FakeClock(u64);
     impl Clock for FakeClock {
@@ -813,7 +731,7 @@ mod tests {
             vec![MockItem::Text("ok".into())],
             TokenUsage::default(),
         ));
-        let captured_handle = provider.captured_messages.clone();
+        let captured_handle = provider.captured_handle();
         let o = build(
             sample_persona("scholar", "m1", "BE BRIEF"),
             sample_model("m1"),
@@ -840,7 +758,7 @@ mod tests {
             vec![MockItem::Text("ok".into())],
             TokenUsage::default(),
         ));
-        let captured_handle = provider.captured_messages.clone();
+        let captured_handle = provider.captured_handle();
         let mut persona = sample_persona("scholar", "m1", "");
         persona.system_prompt = SystemPrompt::File {
             file: "scholar".into(),

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
+mod conversation_api;
 mod llm;
 mod orchestrator;
 mod registry;
@@ -406,11 +407,24 @@ async fn main() {
         eprintln!("[parley-config] {err}");
     }
 
+    // Conversation API: shared in-process orchestrator handle, lazily
+    // populated by `POST /conversation/init`. Holding the registries
+    // behind `Arc` lets every request resolve persona / model without
+    // re-reading from disk.
+    let registries = Arc::new(conversation_api::Registries {
+        personas: personas.entries,
+        models: models.entries,
+        prompts_dir: prompts_dir.clone(),
+    });
+    let conversation_state =
+        conversation_api::ConversationApiState::new(registries, state.client.clone());
+
     let app = Router::new()
         .route("/token", post(fetch_token))
         .route("/format", post(format_text))
-        .layer(cors)
-        .with_state(state);
+        .with_state(state)
+        .merge(conversation_api::router(conversation_state))
+        .layer(cors);
 
     let addr = "127.0.0.1:3033";
     println!("Parley token proxy listening on http://{addr}");

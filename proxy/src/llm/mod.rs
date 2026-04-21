@@ -29,6 +29,8 @@ use thiserror::Error;
 
 pub mod anthropic;
 pub mod sse;
+#[cfg(test)]
+pub mod test_support;
 
 /// Universal options for a single chat exchange. Provider-specific
 /// knobs (Anthropic's `extended_thinking`, OpenAI's reasoning effort,
