@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::{Stream, StreamExt};
 use parley_core::conversation::ConversationSession;
@@ -135,6 +135,7 @@ pub fn router(state: ConversationApiState) -> Router {
         .route("/conversation/save", post(save_session))
         .route("/conversation/load", post(load_session))
         .route("/conversation/sessions", get(list_sessions))
+        .route("/conversation/sessions/{id}", delete(delete_session))
         .route("/personas", get(list_personas))
         .route("/models", get(list_models))
         .with_state(state)
@@ -526,6 +527,23 @@ fn derive_session_title(session: &ConversationSession) -> String {
         let truncated: String = collapsed.chars().take(MAX_CHARS).collect();
         format!("{truncated}…")
     }
+}
+
+/// `DELETE /conversation/sessions/{id}` — remove a saved session
+/// from disk. Returns `204 No Content` on success, `404 Not Found`
+/// for unknown ids, `400 Bad Request` for invalid ids. Does not
+/// touch the in-memory active session: deleting the file does not
+/// detach an orchestrator that's already loaded that id.
+async fn delete_session(
+    State(state): State<ConversationApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    state
+        .store
+        .delete(&id)
+        .await
+        .map_err(session_store_error_to_response)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_personas(State(state): State<ConversationApiState>) -> Json<PersonaListResponse> {
@@ -1383,6 +1401,73 @@ mod tests {
         for s in sessions {
             assert_eq!(s["title"].as_str().unwrap(), "");
         }
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_file_and_404s_on_repeat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsSessionStore::new(tmp.path());
+        store
+            .save(&ConversationSession::new(
+                "doomed",
+                Speaker::ai_agent("ai-x", "X"),
+                "scholar".to_string(),
+                "m1".to_string(),
+            ))
+            .await
+            .unwrap();
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        // First delete: 204.
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/conversation/sessions/doomed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // Second delete: 404.
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/conversation/sessions/doomed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_session_rejects_invalid_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = build_state_with_store_dir(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    // Space (URL-encoded) is rejected by `validate_id`
+                    // since it isn't in the allowed alphabet.
+                    .uri("/conversation/sessions/has%20space")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

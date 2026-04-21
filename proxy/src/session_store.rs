@@ -84,6 +84,11 @@ pub trait SessionStore: Send + Sync {
     /// implementation-defined — the HTTP layer sorts before
     /// returning.
     async fn list(&self) -> Result<Vec<SessionId>, SessionStoreError>;
+
+    /// Remove the session with `id`. Returns `NotFound` if no such
+    /// file exists, so callers can distinguish a no-op from a
+    /// silent failure (e.g. a `404` propagating to the HTTP layer).
+    async fn delete(&self, id: &str) -> Result<(), SessionStoreError>;
 }
 
 /// Filesystem-backed implementation. One file per session.
@@ -184,6 +189,17 @@ impl SessionStore for FsSessionStore {
             }
         }
         Ok(out)
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), SessionStoreError> {
+        let path = self.path_for(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(SessionStoreError::NotFound(id.to_string()))
+            }
+            Err(source) => Err(SessionStoreError::Io { path, source }),
+        }
     }
 }
 
@@ -325,6 +341,34 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = FsSessionStore::new(tmp.path().join("nope"));
         assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_file_and_drops_from_list() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsSessionStore::new(tmp.path());
+        store.save(&sample_session("a")).await.unwrap();
+        store.save(&sample_session("b")).await.unwrap();
+        store.delete("a").await.unwrap();
+        let mut got = store.list().await.unwrap();
+        got.sort();
+        assert_eq!(got, vec!["b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_id_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsSessionStore::new(tmp.path());
+        let err = store.delete("ghost").await.unwrap_err();
+        assert!(matches!(err, SessionStoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_invalid_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = FsSessionStore::new(tmp.path());
+        let err = store.delete("../escape").await.unwrap_err();
+        assert!(matches!(err, SessionStoreError::InvalidId(_)));
     }
 
     #[tokio::test]

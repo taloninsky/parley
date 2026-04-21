@@ -226,6 +226,13 @@ fn build_get(url: &str) -> Result<web_sys::Request, String> {
     web_sys::Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))
 }
 
+fn build_delete(url: &str) -> Result<web_sys::Request, String> {
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("DELETE");
+    opts.set_mode(web_sys::RequestMode::Cors);
+    web_sys::Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))
+}
+
 async fn fetch_json<T>(req: web_sys::Request) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
@@ -674,6 +681,71 @@ pub fn ConversationView() -> Element {
                         status.set(SendStatus::Idle);
                     },
                     "New"
+                }
+                button {
+                    class: "convo-send",
+                    disabled: pick_session().is_empty()
+                        || matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                    onclick: move |_| {
+                        // Delete the saved session currently selected
+                        // in the picker. Does NOT touch the active
+                        // session — if the user just deleted the file
+                        // for an in-progress session, the next turn's
+                        // auto-save will recreate it.
+                        let target = pick_session.peek().clone();
+                        if target.is_empty() {
+                            return;
+                        }
+                        spawn_local(async move {
+                            let url = format!(
+                                "{PROXY_BASE}/conversation/sessions/{target}"
+                            );
+                            let req = match build_delete(&url) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(e));
+                                    return;
+                                }
+                            };
+                            let window = match web_sys::window() {
+                                Some(w) => w,
+                                None => return,
+                            };
+                            match JsFuture::from(window.fetch_with_request(&req)).await {
+                                Ok(resp_val) => {
+                                    if let Ok(resp) =
+                                        resp_val.dyn_into::<web_sys::Response>()
+                                        && !resp.ok()
+                                    {
+                                        status.set(SendStatus::Failed(format!(
+                                            "delete failed: HTTP {}",
+                                            resp.status()
+                                        )));
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    status.set(SendStatus::Failed(format!(
+                                        "delete request failed: {:?}",
+                                        e
+                                    )));
+                                    return;
+                                }
+                            }
+                            // Refresh the picker list and clear the
+                            // selection. Failure is silent — picker
+                            // state is non-critical.
+                            if let Ok(req) = build_get(&format!(
+                                "{PROXY_BASE}/conversation/sessions"
+                            )) && let Ok(resp) =
+                                fetch_json::<SessionListResponse>(req).await
+                            {
+                                available_sessions.set(resp.sessions);
+                            }
+                            pick_session.set(String::new());
+                        });
+                    },
+                    "Delete"
                 }
             }
 
