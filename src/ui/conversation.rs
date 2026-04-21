@@ -104,6 +104,25 @@ struct WireTurn {
     /// `"user" | "assistant" | "system"` — drives the bubble color.
     role: String,
     content: String,
+    /// Provenance is populated only for AI turns; user/system turns
+    /// have no cost. We only need the cost out of it on the wire,
+    /// so the nested struct intentionally ignores the rest.
+    #[serde(default)]
+    provenance: Option<WireProvenance>,
+}
+
+/// Subset of `parley_core::TurnProvenance` — only `cost` is
+/// rendered. `serde` ignores unknown fields.
+#[derive(Debug, Clone, Deserialize)]
+struct WireProvenance {
+    cost: WireCost,
+}
+
+/// Mirrors `parley_core::Cost`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct WireCost {
+    #[serde(default)]
+    usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +152,10 @@ enum WireEvent {
     AiTurnAppended {
         #[serde(default)]
         turn_id: String,
+        /// Final USD cost for this turn. Carried as a nested struct
+        /// to mirror `parley_core::Cost` on the wire.
+        #[serde(default)]
+        cost: WireCost,
     },
     Failed {
         message: String,
@@ -166,6 +189,10 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    /// USD cost for this turn. `None` for user turns and for
+    /// historical assistant turns whose session file lacks
+    /// provenance (older sessions).
+    cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -645,7 +672,17 @@ pub fn ConversationView() -> Element {
                                             _ => None,
                                         };
                                         if let Some(role) = role {
-                                            loaded.push(Message { role, content: t.content });
+                                            let cost_usd = match role {
+                                                Role::Assistant => {
+                                                    t.provenance.as_ref().map(|p| p.cost.usd)
+                                                }
+                                                Role::User => None,
+                                            };
+                                            loaded.push(Message {
+                                                role,
+                                                content: t.content,
+                                                cost_usd,
+                                            });
                                         }
                                     }
                                     messages.set(loaded);
@@ -912,6 +949,12 @@ pub fn ConversationView() -> Element {
                             match msg.role { Role::User => "You", Role::Assistant => "Assistant" }
                         }
                         div { style: "white-space: pre-wrap;", "{msg.content}" }
+                        if let Some(usd) = msg.cost_usd {
+                            div {
+                                style: "margin-top: 0.25rem; font-size: 0.75rem; color: #8888aa;",
+                                "${usd:.4}"
+                            }
+                        }
                     }
                 }
                 if !streaming().is_empty() {
@@ -924,12 +967,26 @@ pub fn ConversationView() -> Element {
             }
 
             // ── Status row ───────────────────────────────────
-            div { style: "min-height: 1.25rem; margin-bottom: 0.5rem; font-size: 0.875rem;",
-                match status() {
-                    SendStatus::Idle => rsx! { span { style: "color: #8888aa;", "Ready" } },
-                    SendStatus::Sending => rsx! { span { style: "color: #c0c0d0;", "Sending…" } },
-                    SendStatus::Streaming => rsx! { span { style: "color: #4ecca3;", "Streaming…" } },
-                    SendStatus::Failed(msg) => rsx! { span { style: "color: #ff6b81;", "Error: {msg}" } },
+            // Running total includes every assistant turn the
+            // current view has surfaced — including loaded
+            // historical turns whose session file carried
+            // provenance.
+            {
+                let total_usd: f64 = messages().iter().filter_map(|m| m.cost_usd).sum();
+                rsx! {
+                    div { style: "min-height: 1.25rem; margin-bottom: 0.5rem; font-size: 0.875rem; display: flex; gap: 1rem; align-items: center;",
+                        match status() {
+                            SendStatus::Idle => rsx! { span { style: "color: #8888aa;", "Ready" } },
+                            SendStatus::Sending => rsx! { span { style: "color: #c0c0d0;", "Sending…" } },
+                            SendStatus::Streaming => rsx! { span { style: "color: #4ecca3;", "Streaming…" } },
+                            SendStatus::Failed(msg) => rsx! { span { style: "color: #ff6b81;", "Error: {msg}" } },
+                        }
+                        if total_usd > 0.0 {
+                            span { style: "color: #8888aa; margin-left: auto;",
+                                "Total: ${total_usd:.4}"
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1036,6 +1093,7 @@ fn submit_turn(h: SendHandles) {
         m.push(Message {
             role: Role::User,
             content: user_text.clone(),
+            cost_usd: None,
         })
     });
     input.set(String::new());
@@ -1147,13 +1205,14 @@ fn submit_turn(h: SendHandles) {
             WireEvent::Token { delta } => {
                 streaming.with_mut(|s| s.push_str(&delta));
             }
-            WireEvent::AiTurnAppended { .. } => {
+            WireEvent::AiTurnAppended { cost, .. } => {
                 let final_text = streaming.peek().clone();
                 streaming.set(String::new());
                 messages.with_mut(|m| {
                     m.push(Message {
                         role: Role::Assistant,
                         content: final_text,
+                        cost_usd: Some(cost.usd),
                     })
                 });
                 *save_inner.borrow_mut() = true;
