@@ -38,9 +38,25 @@ pub fn Root() -> Element {
                     "Conversation"
                 }
             }
-            match *mode.read() {
-                Mode::Transcribe => rsx! { App {} },
-                Mode::Converse => rsx! { ConversationView {} },
+            // Render BOTH subtrees and toggle visibility with CSS.
+            // A `match` here would unmount the inactive view and
+            // discard every `use_signal` it owns — meaning a stray
+            // tab click would silently throw away the user's
+            // in-progress conversation or transcription. Keeping
+            // both mounted preserves all local state at the cost of
+            // a tiny amount of layout work for the hidden subtree.
+            //
+            // Caveat: any background work either subtree starts
+            // (e.g. the transcription view's audio capture) keeps
+            // running while hidden. That's fine today because both
+            // views are user-initiated — capture only starts when
+            // you click Record, and the conversation view is idle
+            // until you send a turn.
+            div { style: if *mode.read() == Mode::Transcribe { "display: block;" } else { "display: none;" },
+                App {}
+            }
+            div { style: if *mode.read() == Mode::Converse { "display: block;" } else { "display: none;" },
+                ConversationView {}
             }
         }
     }

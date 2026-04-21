@@ -693,8 +693,13 @@ fn submit_turn(h: SendHandles) {
         // routed through a shared cell and surfaced after the loop
         // ends, so we don't dispatch a status update from within the
         // event callback (which would interleave with token writes).
+        // Auto-save signaling rides on the same channel: when the
+        // assistant turn finalizes we set `saved_pending = true` and
+        // fire the `/conversation/save` POST after the stream ends.
         let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let save_pending: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         let failure_inner = failure.clone();
+        let save_inner = save_pending.clone();
         drain_sse(resp, move |ev| match ev {
             WireEvent::Token { delta } => {
                 streaming.with_mut(|s| s.push_str(&delta));
@@ -708,6 +713,7 @@ fn submit_turn(h: SendHandles) {
                         content: final_text,
                     })
                 });
+                *save_inner.borrow_mut() = true;
             }
             WireEvent::Failed { message } => {
                 *failure_inner.borrow_mut() = Some(message);
@@ -720,6 +726,27 @@ fn submit_turn(h: SendHandles) {
             status.set(SendStatus::Failed(msg.clone()));
         } else {
             status.set(SendStatus::Idle);
+        }
+
+        // Auto-save after the assistant turn lands. Done after the
+        // status update so a save failure can override `Idle` with a
+        // diagnostic without racing the streaming UI. We don't auto-
+        // save on `Failed` because the proxy's session state will not
+        // include the failed exchange anyway.
+        if *save_pending.borrow() {
+            match build_post(&format!("{PROXY_BASE}/conversation/save"), "") {
+                Ok(req) => {
+                    if let Err(e) = fetch_json::<serde_json::Value>(req).await {
+                        // Surface as a soft warning via SendStatus::Failed —
+                        // the conversation itself is fine, only persistence
+                        // failed. The user can retry on their next turn.
+                        status.set(SendStatus::Failed(format!("auto-save failed: {e}")));
+                    }
+                }
+                Err(e) => {
+                    status.set(SendStatus::Failed(format!("auto-save build failed: {e}")));
+                }
+            }
         }
     });
 }
