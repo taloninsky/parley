@@ -65,6 +65,13 @@ web-sys = { version = "0.3", features = [
     "console",
     "DisplayMediaStreamConstraints",
     "HtmlAnchorElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "TextDecoder",
+    "TextDecoderOptions",
     "Url",
 ] }
 js-sys = "0.3"

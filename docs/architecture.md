@@ -646,6 +646,8 @@ The proxy now exposes the orchestrator over HTTP so the WASM frontend (and any o
 | `/conversation/save` | POST | Persist the live session to disk via the configured `SessionStore`. Returns `{ "session_id": "..." }`. |
 | `/conversation/load` | POST | Body: `{ session_id, anthropic_key? }`. Reads the session from disk, re-resolves its active persona/model against the current registries, builds a fresh provider (credentials are not persisted), and installs a new orchestrator. Returns the loaded `ConversationSession`. |
 | `/conversation/sessions` | GET | List all session ids on disk, sorted. |
+| `/personas` | GET | List the loaded personas as compact summaries: `{ personas: [{ id, name, description }, ...] }`, sorted by id. Used by the frontend's persona picker; does not expose `system_prompt` or other internals (the picker doesn't need them). *(Phase 4e)* |
+| `/models` | GET | List the loaded model configs as compact summaries: `{ models: [{ id, provider, model_name, context_window }, ...] }`, sorted by id. Used by the frontend's model picker; does not expose provider options. *(Phase 4e)* |
 
 **Failure mapping (spec §10.1, partial):**
 
@@ -685,7 +687,8 @@ The default implementation, `FsSessionStore`, applies a strict ASCII allowlist t
 - Pause / Stop / Play / barge-in
 - Context compaction
 - Session persistence: file-per-session JSON store landed in Phase 4d. **Deferred:** auto-save after each turn (clients call `/save` explicitly), session deletion endpoint, richer listing (metadata snapshot per id), encryption at rest.
-- Frontend wiring: a Dioxus `use_resource` / `use_future` hook that consumes the SSE stream
+- Frontend wiring: ✅ landed in **Phase 4f**. `src/ui/conversation.rs` (`ConversationView`) talks to the proxy via hand-rolled `web_sys::Request` + `wasm_bindgen_futures::JsFuture`. On mount it fetches `/personas` and `/models` to populate two `<select>` dropdowns; on send it lazily POSTs `/conversation/init`, then POSTs `/conversation/turn` and consumes the SSE response by reading `Response::body()` as a `ReadableStreamDefaultReader`, decoding chunks with `TextDecoder`, splitting on `\n\n` event boundaries, and parsing each frame's `data:` line into a `WireEvent` (mirror of `OrchestratorEvent`). `Token { delta }` accumulates into a streaming "in-progress" assistant bubble; `AiTurnAppended` finalizes the bubble; `Failed` surfaces as a status banner. `src/ui/root.rs` (`Root`) is a thin shell with a two-button toggle that picks between the existing transcription view (`App`) and `ConversationView` — no router, no shared state. The `parley_anthropic_key` cookie is read on mount and written back on edit, reusing the same key the transcription view uses for Haiku formatting.
+  - **Deferred frontend pieces:** save/load/list/delete UI for sessions (proxy endpoints exist; no UI yet), `/conversation/switch` mid-conversation, auto-save after each turn, transcription→conversation handoff, multi-speaker turn metadata, audio integration, OpenAI provider, encryption at rest.
 - Multi-session multiplexing (one process, many concurrent sessions keyed by id)
 - Expression-annotation auto-prepend
 - Retry-on-failure logic

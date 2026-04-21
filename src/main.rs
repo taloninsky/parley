@@ -2,8 +2,8 @@ mod audio;
 mod stt;
 mod ui;
 
-use ui::app::App;
+use ui::root::Root;
 
 fn main() {
-    dioxus::launch(App);
+    dioxus::launch(Root);
 }

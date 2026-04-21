@@ -135,6 +135,8 @@ pub fn router(state: ConversationApiState) -> Router {
         .route("/conversation/save", post(save_session))
         .route("/conversation/load", post(load_session))
         .route("/conversation/sessions", get(list_sessions))
+        .route("/personas", get(list_personas))
+        .route("/models", get(list_models))
         .with_state(state)
 }
 
@@ -198,6 +200,47 @@ pub struct LoadRequest {
 pub struct SessionList {
     /// All session ids currently on disk, sorted lexicographically.
     pub sessions: Vec<String>,
+}
+
+/// Compact view of a [`Persona`] used by the picker UI. Strips the
+/// system-prompt body and tier internals — those aren't useful for
+/// rendering a dropdown and may be large.
+#[derive(Debug, Serialize)]
+pub struct PersonaSummary {
+    /// Stable persona id.
+    pub id: PersonaId,
+    /// Display name.
+    pub name: String,
+    /// Free-form description for tooltips.
+    pub description: String,
+}
+
+/// Compact view of a [`ModelConfig`] used by the picker UI.
+#[derive(Debug, Serialize)]
+pub struct ModelSummary {
+    /// Stable model-config id.
+    pub id: ModelConfigId,
+    /// Provider tag (anthropic, openai, ...). Lets the client warn
+    /// before submitting credentials of the wrong shape.
+    pub provider: LlmProviderTag,
+    /// Provider-specific model name (e.g. `claude-opus-4-7-...`).
+    pub model_name: String,
+    /// Total context window in tokens.
+    pub context_window: u32,
+}
+
+/// Response body for `GET /personas`.
+#[derive(Debug, Serialize)]
+pub struct PersonaListResponse {
+    /// Personas sorted by id.
+    pub personas: Vec<PersonaSummary>,
+}
+
+/// Response body for `GET /models`.
+#[derive(Debug, Serialize)]
+pub struct ModelListResponse {
+    /// Model configs sorted by id.
+    pub models: Vec<ModelSummary>,
 }
 
 /// Response body for `POST /conversation/save`.
@@ -431,6 +474,37 @@ async fn list_sessions(
         .map_err(session_store_error_to_response)?;
     sessions.sort();
     Ok(Json(SessionList { sessions }))
+}
+
+async fn list_personas(State(state): State<ConversationApiState>) -> Json<PersonaListResponse> {
+    let mut personas: Vec<PersonaSummary> = state
+        .registries
+        .personas
+        .values()
+        .map(|p| PersonaSummary {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            description: p.description.clone(),
+        })
+        .collect();
+    personas.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(PersonaListResponse { personas })
+}
+
+async fn list_models(State(state): State<ConversationApiState>) -> Json<ModelListResponse> {
+    let mut models: Vec<ModelSummary> = state
+        .registries
+        .models
+        .values()
+        .map(|m| ModelSummary {
+            id: m.id.clone(),
+            provider: m.provider,
+            model_name: m.model_name.clone(),
+            context_window: m.context_window,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(ModelListResponse { models })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
