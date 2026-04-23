@@ -719,6 +719,21 @@ pub fn App() -> Element {
                 .unwrap_or(false),
         )
     });
+    // ElevenLabs powers Conversation Mode TTS. The credential is
+    // optional — without it, conversation runs text-only and the
+    // Voice/Type toggle defaults to Type. Surfaced in Settings so
+    // the user can configure or remove the key alongside the
+    // other providers.
+    let elevenlabs_configured = use_memo(move || {
+        matches!(
+            &*secrets_status.read_unchecked(),
+            Some(Ok(s)) if s
+                .provider("elevenlabs")
+                .and_then(|p| p.credential("default"))
+                .map(|c| c.configured)
+                .unwrap_or(false),
+        )
+    });
 
     let mut idle_minutes = use_signal(|| {
         load("parley_idle_minutes")
@@ -2457,6 +2472,13 @@ pub fn App() -> Element {
                         label: "Anthropic API Key",
                         hint: "Used for paragraph detection and conversation mode.",
                         configured: anthropic_configured(),
+                        on_changed: move |_| secrets_refresh.refresh(),
+                    }
+                    SecretsKeyRow {
+                        provider: "elevenlabs",
+                        label: "ElevenLabs API Key",
+                        hint: "Used for spoken AI replies in Conversation Mode. Optional.",
+                        configured: elevenlabs_configured(),
                         on_changed: move |_| secrets_refresh.refresh(),
                     }
 
