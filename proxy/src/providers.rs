@@ -70,12 +70,19 @@ pub enum ProviderId {
     /// AssemblyAI — used for streaming STT and temporary token issuance.
     #[serde(rename = "assemblyai")]
     AssemblyAi,
+    /// ElevenLabs — used for streaming TTS in Conversation Mode.
+    #[serde(rename = "elevenlabs")]
+    ElevenLabs,
 }
 
 impl ProviderId {
     /// All known providers, in display order.
     pub const fn all() -> &'static [ProviderId] {
-        &[ProviderId::Anthropic, ProviderId::AssemblyAi]
+        &[
+            ProviderId::Anthropic,
+            ProviderId::AssemblyAi,
+            ProviderId::ElevenLabs,
+        ]
     }
 
     /// Stable lowercase string id (used in keystore accounts and URLs).
@@ -173,6 +180,12 @@ pub static REGISTRY: &[ProviderDescriptor] = &[
         category: ProviderCategory::Stt,
         env_var: "PARLEY_ASSEMBLYAI_API_KEY",
     },
+    ProviderDescriptor {
+        id: "elevenlabs",
+        display_name: "ElevenLabs",
+        category: ProviderCategory::Tts,
+        env_var: "PARLEY_ELEVENLABS_API_KEY",
+    },
 ];
 
 #[cfg(test)]
@@ -211,6 +224,8 @@ mod tests {
         assert_eq!(json, "\"anthropic\"");
         let json = serde_json::to_string(&ProviderId::AssemblyAi).unwrap();
         assert_eq!(json, "\"assemblyai\"");
+        let json = serde_json::to_string(&ProviderId::ElevenLabs).unwrap();
+        assert_eq!(json, "\"elevenlabs\"");
     }
 
     #[test]
@@ -219,6 +234,8 @@ mod tests {
         assert_eq!(p, ProviderId::Anthropic);
         let p: ProviderId = serde_json::from_str("\"assemblyai\"").unwrap();
         assert_eq!(p, ProviderId::AssemblyAi);
+        let p: ProviderId = serde_json::from_str("\"elevenlabs\"").unwrap();
+        assert_eq!(p, ProviderId::ElevenLabs);
     }
 
     #[test]

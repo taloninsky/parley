@@ -113,11 +113,14 @@ struct WireTurn {
     provenance: Option<WireProvenance>,
 }
 
-/// Subset of `parley_core::TurnProvenance` — only `cost` is
-/// rendered. `serde` ignores unknown fields.
+/// Subset of `parley_core::TurnProvenance` — only the cost fields
+/// are rendered. `serde` ignores unknown fields.
 #[derive(Debug, Clone, Deserialize)]
 struct WireProvenance {
-    cost: WireCost,
+    #[serde(default)]
+    llm_cost: WireCost,
+    #[serde(default)]
+    tts_cost: WireCost,
 }
 
 /// Mirrors `parley_core::Cost`.
@@ -654,7 +657,12 @@ pub fn ConversationView() -> Element {
                                         if let Some(role) = role {
                                             let cost_usd = match role {
                                                 Role::Assistant => {
-                                                    t.provenance.as_ref().map(|p| p.cost.usd)
+                                                    // Sum LLM + TTS cost so the
+                                                    // bubble shows the all-in
+                                                    // figure for the turn.
+                                                    t.provenance.as_ref().map(|p| {
+                                                        p.llm_cost.usd + p.tts_cost.usd
+                                                    })
                                                 }
                                                 Role::User => None,
                                             };

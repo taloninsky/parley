@@ -73,7 +73,8 @@ pub struct Turn {
 /// cost" without re-deriving from logs.
 ///
 /// Spec references: §6.3 (mid-session switching captured in
-/// provenance), §11 (cost tracking).
+/// provenance), §11 (cost tracking), and
+/// `docs/conversation-voice-slice-spec.md` §4.2 for the TTS fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnProvenance {
     /// Persona that was active when this turn was dispatched.
@@ -81,10 +82,19 @@ pub struct TurnProvenance {
     /// Model config the persona resolved to for this turn. Recorded
     /// because a persona's model can be swapped mid-session.
     pub model_config_id: ModelConfigId,
-    /// Final token accounting from the provider.
+    /// Final token accounting from the LLM provider.
     pub usage: TokenUsage,
-    /// Computed USD cost (usage × model rates).
-    pub cost: Cost,
+    /// Computed USD cost of the LLM call (usage × model rates).
+    pub llm_cost: Cost,
+    /// Total characters submitted to the TTS provider for this turn.
+    /// Zero for user/system turns and for AI turns generated when no
+    /// TTS provider is configured.
+    #[serde(default)]
+    pub tts_characters: u32,
+    /// Computed USD cost of the TTS dispatch for this turn. Zero
+    /// when no TTS provider was active.
+    #[serde(default)]
+    pub tts_cost: Cost,
 }
 
 /// Records a single (persona, model) activation window — used to
@@ -344,7 +354,9 @@ mod tests {
                 input: 10,
                 output: 5,
             },
-            cost: Cost::from_usd(0.01),
+            llm_cost: Cost::from_usd(0.01),
+            tts_characters: 0,
+            tts_cost: Cost::default(),
         };
         s.append_ai_turn("ai-scholar".into(), "hello".into(), 2, prov.clone());
         assert!(s.turns[0].provenance.is_none());
@@ -389,7 +401,9 @@ mod tests {
                 persona_id: "scholar".into(),
                 model_config_id: "claude-x".into(),
                 usage: TokenUsage::default(),
-                cost: Cost::default(),
+                llm_cost: Cost::default(),
+                tts_characters: 0,
+                tts_cost: Cost::default(),
             },
         );
         let msgs = s.to_chat_messages();
@@ -428,7 +442,9 @@ mod tests {
                 persona_id: "scholar".into(),
                 model_config_id: "claude-x".into(),
                 usage: TokenUsage::default(),
-                cost: Cost::default(),
+                llm_cost: Cost::default(),
+                tts_characters: 0,
+                tts_cost: Cost::default(),
             },
         );
         assert!(!s.has_pending_user_turn());
@@ -456,7 +472,9 @@ mod tests {
                 persona_id: "scholar".into(),
                 model_config_id: "claude-x".into(),
                 usage: TokenUsage::default(),
-                cost: Cost::default(),
+                llm_cost: Cost::default(),
+                tts_characters: 0,
+                tts_cost: Cost::default(),
             },
         );
         assert!(s.discard_pending_user_turn().is_none());
@@ -478,7 +496,9 @@ mod tests {
                     input: 1,
                     output: 1,
                 },
-                cost: Cost::from_usd(0.001),
+                llm_cost: Cost::from_usd(0.001),
+                tts_characters: 0,
+                tts_cost: Cost::default(),
             },
         );
         let json = serde_json::to_string(&s).unwrap();

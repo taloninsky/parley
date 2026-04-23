@@ -413,7 +413,9 @@ impl ConversationOrchestrator {
                 persona_id: persona_id.clone(),
                 model_config_id: model_id.clone(),
                 usage: final_usage,
-                cost,
+                llm_cost: cost,
+                tts_characters: 0,
+                tts_cost: Cost::default(),
             };
 
             let ai_turn_id = {

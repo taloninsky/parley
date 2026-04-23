@@ -13,4 +13,5 @@ pub mod conversation;
 pub mod model_config;
 pub mod persona;
 pub mod speaker;
+pub mod tts;
 pub mod word_graph;
