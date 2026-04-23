@@ -720,6 +720,14 @@ struct TtsTurn {
     /// so the AI text still appends and the user sees the response
     /// rendered (spec §4.4 "Failure handling within TTS").
     aborted: bool,
+    /// Concatenated text of every chunk dispatched so far in this
+    /// turn. Passed to providers as `SynthesisContext.previous_text`
+    /// so they can pick prosody (intonation, pacing) appropriate to
+    /// continuing speech rather than starting a new utterance. This
+    /// matters most when a chunk begins with a short function word
+    /// ("In", "So", "But") that, read in isolation, sounds like a
+    /// pause-laden sentence opener.
+    previous_text: String,
 }
 
 impl TtsTurn {
@@ -748,6 +756,7 @@ impl TtsTurn {
             total_bytes: 0,
             started: false,
             aborted: false,
+            previous_text: String::new(),
         })
     }
 
@@ -807,7 +816,28 @@ impl TtsTurn {
             voice_id,
             text: chunk.text.clone(),
         };
+        // Trim the prior-text window to a provider-friendly size.
+        // ElevenLabs documents `previous_text` as accepting up to a
+        // few hundred characters; sending more is wasted bandwidth
+        // and risks rejection. We slice on a UTF-8 char boundary by
+        // walking back from the end.
+        const PREVIOUS_TEXT_WINDOW: usize = 500;
+        let previous_text = if self.previous_text.is_empty() {
+            None
+        } else if self.previous_text.len() <= PREVIOUS_TEXT_WINDOW {
+            Some(self.previous_text.clone())
+        } else {
+            // Find the largest valid char boundary at or after
+            // `len - PREVIOUS_TEXT_WINDOW` so we never split a
+            // multi-byte codepoint.
+            let mut start = self.previous_text.len() - PREVIOUS_TEXT_WINDOW;
+            while !self.previous_text.is_char_boundary(start) {
+                start += 1;
+            }
+            Some(self.previous_text[start..].to_string())
+        };
         let synth_ctx = crate::tts::SynthesisContext {
+            previous_text,
             chunk_index: chunk.index,
             final_for_turn: chunk.final_for_turn,
             ..Default::default()
@@ -865,6 +895,24 @@ impl TtsTurn {
         let idx = self.sentence_index;
         self.sentence_index += 1;
         self.total_characters = self.total_characters.saturating_add(characters_for_chunk);
+        // Append the just-dispatched text to the rolling prior-text
+        // buffer with a single space separator so the next chunk's
+        // `previous_text` reads as continuous prose. Trim the buffer
+        // to keep memory bounded — the slice we send to the provider
+        // is already capped, but holding the full transcript would
+        // grow without limit on long turns.
+        if !self.previous_text.is_empty() {
+            self.previous_text.push(' ');
+        }
+        self.previous_text.push_str(&chunk.text);
+        const PREVIOUS_TEXT_BUFFER_CAP: usize = 4096;
+        if self.previous_text.len() > PREVIOUS_TEXT_BUFFER_CAP {
+            let mut start = self.previous_text.len() - PREVIOUS_TEXT_BUFFER_CAP;
+            while !self.previous_text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.previous_text = self.previous_text[start..].to_string();
+        }
         events.push(OrchestratorEvent::TtsSentenceDone {
             turn_id: self.turn_id.clone(),
             sentence_index: idx,
@@ -1429,6 +1477,7 @@ mod tests {
     struct MockTtsProvider {
         script: StdMutex<Vec<MockTtsCall>>,
         captured: StdMutex<Vec<TtsRequest>>,
+        captured_ctx: StdMutex<Vec<crate::tts::SynthesisContext>>,
     }
 
     impl MockTtsProvider {
@@ -1436,10 +1485,14 @@ mod tests {
             Self {
                 script: StdMutex::new(script),
                 captured: StdMutex::new(Vec::new()),
+                captured_ctx: StdMutex::new(Vec::new()),
             }
         }
         fn captured(&self) -> Vec<TtsRequest> {
             self.captured.lock().unwrap().clone()
+        }
+        fn captured_ctx(&self) -> Vec<crate::tts::SynthesisContext> {
+            self.captured_ctx.lock().unwrap().clone()
         }
     }
 
@@ -1451,9 +1504,10 @@ mod tests {
         async fn synthesize(
             &self,
             request: TtsRequest,
-            _ctx: crate::tts::SynthesisContext,
+            ctx: crate::tts::SynthesisContext,
         ) -> Result<TtsStream, TtsError> {
             self.captured.lock().unwrap().push(request);
+            self.captured_ctx.lock().unwrap().push(ctx);
             let next = {
                 let mut s = self.script.lock().unwrap();
                 if s.is_empty() {
@@ -1851,5 +1905,62 @@ mod tests {
         let snap = o.session_snapshot().await;
         let prov = snap.turns[1].provenance.as_ref().unwrap();
         assert_eq!(prov.tts_characters, 6);
+    }
+
+    #[tokio::test]
+    async fn previous_text_accumulates_across_chunks() {
+        // The orchestrator must pass each chunk's predecessors as
+        // `SynthesisContext.previous_text` so providers (notably
+        // ElevenLabs v3) can pick continuation prosody. We force a
+        // multi-chunk turn via a paragraph break (R2) and then
+        // inspect the captured contexts.
+        let llm = Arc::new(MockProvider::new(
+            "p",
+            vec![MockItem::Text(
+                "Para one. Sentence two.\n\nPara two. Sentence two.".into(),
+            )],
+            TokenUsage::default(),
+        ));
+        let mock_tts = StdArc::new(MockTtsProvider::new(vec![
+            MockTtsCall::Ok {
+                audio_chunks: vec![vec![0x01]],
+                characters: 23,
+            },
+            MockTtsCall::Ok {
+                audio_chunks: vec![vec![0x02]],
+                characters: 23,
+            },
+        ]));
+        let (o, _hub, _tmp) = build_with_tts(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            llm,
+            mock_tts.clone(),
+        );
+
+        let _events = drain(&o, "hi").await;
+
+        let calls = mock_tts.captured();
+        let ctxs = mock_tts.captured_ctx();
+        assert_eq!(calls.len(), 2, "expected two chunks via paragraph break");
+        assert_eq!(ctxs.len(), 2);
+        // Chunk 0: no prior context.
+        assert!(
+            ctxs[0].previous_text.is_none(),
+            "first chunk must have no previous_text, got {:?}",
+            ctxs[0].previous_text
+        );
+        assert_eq!(ctxs[0].chunk_index, 0);
+        // Chunk 1: previous_text must contain chunk 0's text.
+        let prev = ctxs[1]
+            .previous_text
+            .as_deref()
+            .expect("second chunk must carry previous_text");
+        assert!(
+            prev.contains(calls[0].text.trim()),
+            "previous_text {prev:?} should contain prior chunk text {:?}",
+            calls[0].text,
+        );
+        assert_eq!(ctxs[1].chunk_index, 1);
     }
 }

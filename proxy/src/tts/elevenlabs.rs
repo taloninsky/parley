@@ -91,19 +91,23 @@ impl TtsProvider for ElevenLabsTts {
     async fn synthesize(
         &self,
         request: TtsRequest,
-        _ctx: SynthesisContext,
+        ctx: SynthesisContext,
     ) -> Result<TtsStream, TtsError> {
-        // The v3 model handles cross-chunk prosody internally and
-        // does not consume `previous_request_ids`/`previous_text`,
-        // so `_ctx` is intentionally ignored. A future v2-stitching
-        // adapter would read `ctx.provider_state` here.
+        // `ctx.previous_text` is forwarded as ElevenLabs'
+        // `previous_text` field so v3 picks prosody appropriate to
+        // continuing speech rather than treating each chunk as a
+        // fresh utterance. Without this, paragraph-leading function
+        // words like "In", "So", "But" get read with an exaggerated
+        // sentence-opener intonation and a small leading pause.
+        // `provider_state` (v2 request-id stitching) is still
+        // unused; a future v2 adapter would read it here.
         if request.text.is_empty() {
             return Err(TtsError::Other("empty text".into()));
         }
         let characters = request.text.chars().count() as u32;
 
         let url = self.url_for(&request.voice_id);
-        let body = json!({
+        let mut body = json!({
             "text": request.text,
             "model_id": ELEVENLABS_MODEL_ID,
             "voice_settings": {
@@ -111,6 +115,15 @@ impl TtsProvider for ElevenLabsTts {
                 "similarity_boost": 0.75,
             }
         });
+        if let Some(prev) = ctx.previous_text.as_deref()
+            && !prev.is_empty()
+        {
+            // `as_object_mut().unwrap()` is safe: we just built `body`
+            // as an object literal above.
+            body.as_object_mut()
+                .unwrap()
+                .insert("previous_text".to_string(), json!(prev));
+        }
 
         let resp = self
             .client
@@ -282,5 +295,111 @@ mod tests {
     fn id_returns_stable_string() {
         let p = ElevenLabsTts::new("k", reqwest::Client::new());
         assert_eq!(p.id(), "elevenlabs");
+    }
+
+    #[tokio::test]
+    async fn synthesize_forwards_previous_text_when_set() {
+        // When `SynthesisContext.previous_text` is `Some(...)`, the
+        // request body must include a `previous_text` field with
+        // that value. This is what tells v3 to continue prosody
+        // instead of treating the chunk as a fresh utterance.
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/text-to-speech/voice-1/stream"))
+            .and(body_partial_json(serde_json::json!({
+                "text": "Lean is great.",
+                "previous_text": "Tactics are how you build proofs.",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"\xff\xfb\x90\x00fake" as &[u8]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let p = provider(&server);
+        let mut stream = p
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: "Lean is great.".into(),
+                },
+                SynthesisContext {
+                    previous_text: Some("Tactics are how you build proofs.".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Drain the stream so the request actually fires before the
+        // mock server is dropped.
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        // `expect(1)` on the mock asserts on drop.
+    }
+
+    #[tokio::test]
+    async fn synthesize_omits_previous_text_when_absent_or_empty() {
+        // With no `previous_text` (or an empty one), the request
+        // body must NOT include the field. We capture the request
+        // bodies and inspect them directly.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/text-to-speech/voice-1/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"x" as &[u8]),
+            )
+            .mount(&server)
+            .await;
+
+        let p = provider(&server);
+        // First call: previous_text = None.
+        let mut s1 = p
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: "First.".into(),
+                },
+                SynthesisContext::default(),
+            )
+            .await
+            .unwrap();
+        while let Some(item) = s1.next().await {
+            item.unwrap();
+        }
+        // Second call: previous_text = Some("") — also omitted.
+        let mut s2 = p
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: "Second.".into(),
+                },
+                SynthesisContext {
+                    previous_text: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        while let Some(item) = s2.next().await {
+            item.unwrap();
+        }
+        // Inspect the captured requests directly. Neither body
+        // should mention `previous_text`.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2);
+        for req in received {
+            let body = std::str::from_utf8(&req.body).unwrap();
+            assert!(
+                !body.contains("previous_text"),
+                "request body unexpectedly carried previous_text: {body}",
+            );
+        }
     }
 }
