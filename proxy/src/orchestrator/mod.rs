@@ -44,12 +44,13 @@ use parley_core::conversation::{ConversationSession, TurnId, TurnProvenance};
 use parley_core::model_config::{ModelConfig, ModelConfigId};
 use parley_core::persona::{Persona, PersonaId, SystemPrompt};
 use parley_core::speaker::SpeakerId;
-use parley_core::tts::{SentenceChunk, SentenceChunker};
+use parley_core::tts::{ChunkPlanner, ChunkPolicy, ReleasedChunk};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::llm::{ChatOptions, LlmError, LlmProvider};
+use crate::tts::silence::SilenceSplicer;
 use crate::tts::{FsTtsCache, TtsBroadcastFrame, TtsChunk, TtsHub, TtsProvider, TtsRequest};
 
 /// One observable state in the per-turn lifecycle. This is a strict
@@ -217,6 +218,15 @@ pub struct OrchestratorContext {
     /// session. Per-persona voice override is a follow-up; this
     /// slice keeps it global.
     pub tts_voice_id: Option<String>,
+    /// Optional silence splicer used to insert short MP3 silence
+    /// prefixes between paragraph-bounded chunks. When `None`, no
+    /// silence is spliced — chunks play back-to-back. Wiring the
+    /// real ~417-byte 26 ms silent MP3 frame is a startup-time
+    /// concern handled outside this struct; the orchestrator only
+    /// consults the splicer when present.
+    ///
+    /// Spec: `docs/paragraph-tts-chunking-spec.md` §3.5.
+    pub silence_splicer: Option<Arc<SilenceSplicer>>,
 }
 
 /// Trait abstraction over "tell me the current wall-clock millis." A
@@ -454,7 +464,7 @@ impl ConversationOrchestrator {
                 && ctx.tts_cache.is_some()
                 && ctx.tts_hub.is_some()
                 && ctx.tts_voice_id.is_some();
-            let mut chunker = SentenceChunker::new();
+            let chunk_policy = model.tts_chunking;
             let mut tts = if tts_enabled {
                 match TtsTurn::open(&ctx, &session_id, ai_turn_id.clone()).await {
                     Ok(t) => Some(t),
@@ -470,31 +480,132 @@ impl ConversationOrchestrator {
             } else {
                 None
             };
+            // The chunk planner mirrors `tts`: present iff TTS is
+            // wired and `TtsTurn::open` succeeded. Built from the
+            // model's [`ChunkPolicy`] so per-model tuning flows
+            // through automatically.
+            let mut planner: Option<ChunkPlanner> = tts
+                .as_ref()
+                .map(|_| ChunkPlanner::new(chunk_policy));
 
             let mut accumulated = String::new();
             let mut final_usage = TokenUsage::default();
             let mut llm_errored = false;
 
             futures::pin_mut!(token_stream);
-            while let Some(item) = token_stream.next().await {
-                match item {
-                    Ok(ChatToken::TextDelta { text }) => {
-                        accumulated.push_str(&text);
-                        if let Some(t) = tts.as_mut() {
-                            for chunk in chunker.push(&text) {
-                                let events = t.dispatch_sentence(&ctx, chunk).await;
-                                for ev in events { yield ev; }
+
+            // Periodic tick to fire the planner's timer-driven
+            // rules (R3 paragraph wait, R5 idle timeout) when the
+            // LLM is silent. 250 ms keeps timer resolution well
+            // below the smallest configurable window
+            // (`first_chunk_max_wait_ms = 800`). Only constructed
+            // when TTS is on so text-only turns don't pay for it.
+            let mut tick_interval = if planner.is_some() {
+                let mut iv = tokio::time::interval(
+                    std::time::Duration::from_millis(250),
+                );
+                iv.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                // `interval` fires immediately on first poll;
+                // discard that tick so we don't double-fire timer
+                // rules at t=0.
+                iv.tick().await;
+                Some(iv)
+            } else {
+                None
+            };
+
+            // Main streaming loop. Inside each iteration we pull
+            // *one* event source — a token or a tick — produce at
+            // most one released chunk from the planner, then
+            // synchronously drain the single-flight dispatch chain
+            // that one chunk unlocks before looping back. This
+            // satisfies the spec §3.6 single-flight invariant
+            // without any cross-task coordination.
+            let mut llm_done = false;
+            while !llm_done {
+                // Read a single event source. Returns the chunk
+                // (if any) that the planner released as a result.
+                let released: Option<ReleasedChunk> = if let Some(iv) = tick_interval.as_mut() {
+                    tokio::select! {
+                        biased;
+                        item = token_stream.next() => match item {
+                            Some(Ok(ChatToken::TextDelta { text })) => {
+                                accumulated.push_str(&text);
+                                let chunk = planner
+                                    .as_mut()
+                                    .and_then(|p| p.push(&text, clock.now_ms()).into_iter().next());
+                                yield OrchestratorEvent::Token { delta: text };
+                                chunk
                             }
+                            Some(Ok(ChatToken::Done { usage })) => {
+                                if let Some(u) = usage { final_usage = u; }
+                                None
+                            }
+                            Some(Err(e)) => {
+                                yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
+                                llm_errored = true;
+                                llm_done = true;
+                                None
+                            }
+                            None => {
+                                llm_done = true;
+                                None
+                            }
+                        },
+                        _ = iv.tick() => {
+                            planner
+                                .as_mut()
+                                .and_then(|p| p.tick(clock.now_ms()).into_iter().next())
                         }
-                        yield OrchestratorEvent::Token { delta: text };
                     }
-                    Ok(ChatToken::Done { usage }) => {
-                        if let Some(u) = usage { final_usage = u; }
+                } else {
+                    // Text-only path: no chunker, no ticks.
+                    match token_stream.next().await {
+                        Some(Ok(ChatToken::TextDelta { text })) => {
+                            accumulated.push_str(&text);
+                            yield OrchestratorEvent::Token { delta: text };
+                            None
+                        }
+                        Some(Ok(ChatToken::Done { usage })) => {
+                            if let Some(u) = usage { final_usage = u; }
+                            None
+                        }
+                        Some(Err(e)) => {
+                            yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
+                            llm_errored = true;
+                            llm_done = true;
+                            None
+                        }
+                        None => {
+                            llm_done = true;
+                            None
+                        }
                     }
-                    Err(e) => {
-                        yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
-                        llm_errored = true;
-                        break;
+                };
+
+                // Single-flight dispatch chain. The planner only
+                // releases one chunk at a time (`try_release` short-
+                // circuits while `synthesis_in_flight` is true), so
+                // this inner loop can dispatch at most one chunk
+                // per LLM event — but `synthesis_completed` may
+                // unlock a second paragraph that was already
+                // waiting in the buffer, hence the `while`.
+                let mut next_chunk = released;
+                while let Some(chunk) = next_chunk.take() {
+                    let idx = chunk.index;
+                    if let Some(t) = tts.as_mut() {
+                        let events = t
+                            .dispatch_chunk(&ctx, chunk, &chunk_policy)
+                            .await;
+                        for ev in events { yield ev; }
+                    }
+                    if let Some(p) = planner.as_mut() {
+                        next_chunk = p
+                            .synthesis_completed(idx, clock.now_ms())
+                            .into_iter()
+                            .next();
                     }
                 }
             }
@@ -506,14 +617,20 @@ impl ConversationOrchestrator {
                 return;
             }
 
-            // Flush any trailing partial sentence (text without a
-            // terminator) through TTS so the cache covers the whole
-            // turn. `finish` consumes the chunker.
-            if let Some(trailing) = chunker.finish()
+            // Flush remaining buffered text on stream end. R6
+            // (`finish`) bypasses single-flight and may emit
+            // multiple chunks at once when the buffer holds more
+            // than one paragraph; dispatch them serially so the
+            // cache and broadcast frames stay ordered.
+            if let Some(p) = planner.as_mut()
                 && let Some(t) = tts.as_mut()
             {
-                let events = t.dispatch_sentence(&ctx, trailing).await;
-                for ev in events { yield ev; }
+                for chunk in p.finish(clock.now_ms()) {
+                    let events = t
+                        .dispatch_chunk(&ctx, chunk, &chunk_policy)
+                        .await;
+                    for ev in events { yield ev; }
+                }
             }
 
             let (tts_characters, tts_cost) = if let Some(t) = tts.as_ref() {
@@ -634,15 +751,23 @@ impl TtsTurn {
         })
     }
 
-    /// Synthesize one sentence, write its audio to the cache,
-    /// publish frames to the hub, and return the orchestrator
-    /// events to yield. Errors during synthesis convert to a
-    /// `Failed` event and flip `aborted` so subsequent calls are
-    /// no-ops; the LLM text path is unaffected.
-    async fn dispatch_sentence(
+    /// Synthesize one chunk, write its audio to the cache, publish
+    /// frames to the hub, and return the orchestrator events to
+    /// yield. Errors during synthesis convert to a `Failed` event
+    /// and flip `aborted` so subsequent calls are no-ops; the LLM
+    /// text path is unaffected.
+    ///
+    /// When `ctx.silence_splicer` is `Some`, a short MP3 silence
+    /// prefix is written before the chunk's audio: the
+    /// `first_chunk_silence_ms` budget for chunk 0 and
+    /// `paragraph_silence_ms` for every later chunk. The silence
+    /// counts toward `total_bytes` but not toward `total_characters`
+    /// (it isn't billable).
+    async fn dispatch_chunk(
         &mut self,
         ctx: &OrchestratorContext,
-        chunk: SentenceChunk,
+        chunk: ReleasedChunk,
+        policy: &ChunkPolicy,
     ) -> Vec<OrchestratorEvent> {
         if self.aborted {
             return Vec::new();
@@ -655,17 +780,40 @@ impl TtsTurn {
             });
         }
 
+        // Splice silence before the chunk's audio. Done before the
+        // synthesis call so the silence is always in the cache /
+        // broadcast even if synthesis errors immediately.
+        if let Some(splicer) = ctx.silence_splicer.as_ref() {
+            let silence_ms = if chunk.index == 0 {
+                policy.first_chunk_silence_ms
+            } else {
+                policy.paragraph_silence_ms
+            };
+            let bytes = splicer.silence(silence_ms);
+            if !bytes.is_empty()
+                && let Err(e) = self.write_audio_bytes(bytes).await
+            {
+                events.push(OrchestratorEvent::Failed {
+                    message: format!("tts cache write failed: {e}"),
+                });
+                self.abort(format!("tts cache write failed: {e}")).await;
+                return events;
+            }
+        }
+
         let provider = ctx.tts.as_ref().expect("tts provider present").clone();
         let voice_id = ctx.tts_voice_id.clone().expect("tts_voice_id present");
         let request = TtsRequest {
             voice_id,
             text: chunk.text.clone(),
         };
+        let synth_ctx = crate::tts::SynthesisContext {
+            chunk_index: chunk.index,
+            final_for_turn: chunk.final_for_turn,
+            ..Default::default()
+        };
 
-        let mut stream = match provider
-            .synthesize(request, crate::tts::SynthesisContext::default())
-            .await
-        {
+        let mut stream = match provider.synthesize(request, synth_ctx).await {
             Ok(s) => s,
             Err(e) => {
                 events.push(OrchestratorEvent::Failed {
@@ -679,28 +827,15 @@ impl TtsTurn {
         // The break expression is the only successful exit path,
         // so the variable is always initialized when read; failure
         // arms return early.
-        let characters_for_sentence: u32 = loop {
+        let characters_for_chunk: u32 = loop {
             match stream.next().await {
                 Some(Ok(TtsChunk::Audio(bytes))) => {
-                    // Write to cache *before* fan-out so the cache
-                    // file is always at least as long as anything
-                    // a live subscriber has seen — the late-join
-                    // handoff in §5.1 depends on this ordering.
-                    if let Some(writer) = self.cache.as_mut()
-                        && let Err(e) = writer.write(&bytes).await
-                    {
+                    if let Err(e) = self.write_audio_bytes(bytes).await {
                         events.push(OrchestratorEvent::Failed {
                             message: format!("tts cache write failed: {e}"),
                         });
                         self.abort(format!("tts cache write failed: {e}")).await;
                         return events;
-                    }
-                    if let Some(b) = self.broadcaster.as_ref() {
-                        self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
-                        b.send(TtsBroadcastFrame::Audio {
-                            bytes,
-                            total_bytes_after: self.total_bytes,
-                        });
                     }
                 }
                 Some(Ok(TtsChunk::Done { characters })) => {
@@ -716,7 +851,7 @@ impl TtsTurn {
                 None => {
                     // Stream ended without a Done frame. Treat as
                     // protocol error so the user sees a banner; the
-                    // sentence's audio so far is still in the cache.
+                    // chunk's audio so far is still in the cache.
                     events.push(OrchestratorEvent::Failed {
                         message: "tts stream ended without Done frame".into(),
                     });
@@ -729,15 +864,35 @@ impl TtsTurn {
 
         let idx = self.sentence_index;
         self.sentence_index += 1;
-        self.total_characters = self
-            .total_characters
-            .saturating_add(characters_for_sentence);
+        self.total_characters = self.total_characters.saturating_add(characters_for_chunk);
         events.push(OrchestratorEvent::TtsSentenceDone {
             turn_id: self.turn_id.clone(),
             sentence_index: idx,
-            characters: characters_for_sentence,
+            characters: characters_for_chunk,
         });
         events
+    }
+
+    /// Write `bytes` to the cache and broadcast them to live
+    /// subscribers in the spec-mandated order: cache first, then
+    /// broadcast. The cache file is always at least as long as
+    /// anything a live subscriber has seen — the late-join handoff
+    /// in §5.1 depends on this ordering.
+    async fn write_audio_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(), crate::tts::cache::CacheError> {
+        if let Some(writer) = self.cache.as_mut() {
+            writer.write(&bytes).await?;
+        }
+        if let Some(b) = self.broadcaster.as_ref() {
+            self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
+            b.send(TtsBroadcastFrame::Audio {
+                bytes,
+                total_bytes_after: self.total_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Mark this turn aborted and tear down the broadcaster with a
@@ -892,6 +1047,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         ConversationOrchestrator::with_clock(session, ctx, Arc::new(FakeClock(1_000)))
     }
@@ -1051,6 +1207,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::new(session, ctx);
         let err = match o.submit_user_turn("gavin".into(), "hi".into()).await {
@@ -1081,6 +1238,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::new(session, ctx);
         let err = match o.submit_user_turn("gavin".into(), "hi".into()).await {
@@ -1133,6 +1291,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::with_clock(session, ctx, Arc::new(FakeClock(1)));
 
@@ -1207,6 +1366,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::with_clock(session, ctx, Arc::new(FakeClock(1)));
         let _ = drain(&o, "hi").await;
@@ -1238,6 +1398,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::new(session, ctx);
         let err = match o.submit_user_turn("gavin".into(), "hi".into()).await {
@@ -1355,6 +1516,7 @@ mod tests {
             tts_cache: Some(cache),
             tts_hub: Some(hub.clone()),
             tts_voice_id: Some("voice-jarnathan".into()),
+            silence_splicer: None,
         };
         let o = ConversationOrchestrator::with_clock(session, ctx, Arc::new(FakeClock(1_000)));
         (o, hub, tmp)
@@ -1362,9 +1524,12 @@ mod tests {
 
     #[tokio::test]
     async fn two_sentences_dispatch_per_sentence_to_tts() {
-        // LLM emits "Hello world. " and "Goodbye world." \u2014 two
-        // complete sentences, so the chunker should fire twice and
-        // we expect exactly two TTS dispatches plus one TtsFinished.
+        // LLM emits "Hello world. " and "Goodbye world." — two
+        // complete sentences arriving on a single first chunk. The
+        // chunker's R1 fast-path packs both sentences into the
+        // first dispatched chunk (under the default 220-char cap),
+        // so we expect a single TTS dispatch covering all 26
+        // characters.
         let llm = Arc::new(MockProvider::new(
             "p",
             vec![
@@ -1376,16 +1541,10 @@ mod tests {
                 output: 1,
             },
         ));
-        let mock_tts = StdArc::new(MockTtsProvider::new(vec![
-            MockTtsCall::Ok {
-                audio_chunks: vec![vec![0xAA, 0xBB]],
-                characters: 12,
-            },
-            MockTtsCall::Ok {
-                audio_chunks: vec![vec![0xCC]],
-                characters: 14,
-            },
-        ]));
+        let mock_tts = StdArc::new(MockTtsProvider::new(vec![MockTtsCall::Ok {
+            audio_chunks: vec![vec![0xAA, 0xBB, 0xCC]],
+            characters: 26,
+        }]));
         let (o, _hub, _tmp) = build_with_tts(
             sample_persona("scholar", "m1", "x"),
             sample_model("m1"),
@@ -1395,8 +1554,8 @@ mod tests {
 
         let events = drain(&o, "hi").await;
 
-        // Exactly one TtsStarted, two TtsSentenceDone (indices
-        // 0 and 1), one TtsFinished.
+        // Exactly one TtsStarted, one TtsSentenceDone (index 0
+        // covering both sentences), one TtsFinished.
         let started = events
             .iter()
             .filter(|e| matches!(e, OrchestratorEvent::TtsStarted { .. }))
@@ -1409,14 +1568,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sentence_dones, vec![0, 1]);
+        assert_eq!(sentence_dones, vec![0]);
         let finished_total = events.iter().find_map(|e| match e {
             OrchestratorEvent::TtsFinished {
                 total_characters, ..
             } => Some(*total_characters),
             _ => None,
         });
-        assert_eq!(finished_total, Some(12 + 14));
+        assert_eq!(finished_total, Some(26));
 
         // Speaking state appears between Streaming and Idle.
         let s = states(&events);
@@ -1431,12 +1590,12 @@ mod tests {
         assert_eq!(prov.tts_characters, 26);
         assert!((prov.tts_cost.usd - 26.0 * 0.000_015).abs() < 1e-9);
 
-        // Provider saw the right voice on every call.
+        // Provider saw the right voice and got both sentences in
+        // the single dispatched chunk.
         let calls = mock_tts.captured();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 1);
         assert!(calls.iter().all(|r| r.voice_id == "voice-jarnathan"));
-        assert_eq!(calls[0].text.trim(), "Hello world.");
-        assert_eq!(calls[1].text.trim(), "Goodbye world.");
+        assert_eq!(calls[0].text.trim(), "Hello world. Goodbye world.");
     }
 
     #[tokio::test]
@@ -1471,21 +1630,19 @@ mod tests {
 
     #[tokio::test]
     async fn tts_error_mid_turn_does_not_drop_ai_text() {
-        // First sentence succeeds; the provider then returns an
-        // error on the second. The AI turn must still be appended
-        // with the full LLM text, and a Failed event must surface.
+        // The provider errors on the only dispatched chunk
+        // ("First. Second." packs into a single chunk via R1's
+        // first-chunk fast path). The AI turn must still be
+        // appended with the full LLM text, and a Failed event
+        // must surface.
         let llm = Arc::new(MockProvider::new(
             "p",
             vec![MockItem::Text("First. Second.".into())],
             TokenUsage::default(),
         ));
-        let mock_tts = StdArc::new(MockTtsProvider::new(vec![
-            MockTtsCall::Ok {
-                audio_chunks: vec![vec![0x11]],
-                characters: 6,
-            },
-            MockTtsCall::Err(TtsError::Other("boom".into())),
-        ]));
+        let mock_tts = StdArc::new(MockTtsProvider::new(vec![MockTtsCall::Err(
+            TtsError::Other("boom".into()),
+        )]));
         let (o, hub, _tmp) = build_with_tts(
             sample_persona("scholar", "m1", "x"),
             sample_model("m1"),

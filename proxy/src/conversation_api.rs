@@ -97,6 +97,11 @@ pub struct TtsRuntime {
     /// On-disk MP3 cache. Shared with the orchestrator (writer) and
     /// the SSE / replay routes (reader).
     pub cache: Arc<FsTtsCache>,
+    /// Optional silence splicer. `None` until the silent MP3 frame
+    /// bytes are wired in at startup; the orchestrator skips silence
+    /// insertion when this is `None`. See
+    /// `docs/paragraph-tts-chunking-spec.md` §3.5.
+    pub silence_splicer: Option<Arc<crate::tts::silence::SilenceSplicer>>,
 }
 
 /// Shared state behind the conversation routes.
@@ -133,6 +138,7 @@ impl ConversationApiState {
         let tts = TtsRuntime {
             hub: Arc::new(TtsHub::new()),
             cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
+            silence_splicer: None,
         };
         Self {
             inner: Arc::new(Mutex::new(None)),
@@ -156,6 +162,7 @@ impl ConversationApiState {
         let tts = TtsRuntime {
             hub: Arc::new(TtsHub::new()),
             cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
+            silence_splicer: None,
         };
         Self {
             inner: Arc::new(Mutex::new(None)),
@@ -455,6 +462,7 @@ async fn init_session(
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
+        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -575,6 +583,7 @@ async fn switch_persona(
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
+        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let new_orchestrator = Arc::new(ConversationOrchestrator::new(snapshot, ctx));
     *state.inner.lock().await = Some(new_orchestrator);
@@ -673,6 +682,7 @@ async fn load_session(
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
+        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -1146,6 +1156,7 @@ mod tests {
             tts_cache: None,
             tts_hub: None,
             tts_voice_id: None,
+            silence_splicer: None,
         };
         let orch = Arc::new(ConversationOrchestrator::new(session, ctx));
         state.install_for_test(orch.clone()).await;
@@ -2166,6 +2177,7 @@ mod tests {
         let tts = TtsRuntime {
             hub: Arc::new(TtsHub::new()),
             cache: Arc::new(FsTtsCache::new(cache_root)),
+            silence_splicer: None,
         };
         let state = ConversationApiState::with_store_and_tts(
             registries,
