@@ -862,26 +862,77 @@ pub fn ConversationView() -> Element {
                 letter-spacing: 0.04em;
             }}
             .convo-root .convo-empty {{ color: #8888aa; font-style: italic; }}
+
+            /* Segmented Voice/Type mode switch. The wrapper draws
+               the pill, the inner buttons are flat panels that
+               flip foreground/background based on the active
+               state. Visual model: macOS / iOS segmented control. */
+            .convo-root .mode-switch {{
+                display: inline-flex;
+                background: #16213e;
+                border: 1px solid #2a3960;
+                border-radius: 999px;
+                padding: 2px;
+                gap: 0;
+            }}
+            .convo-root .mode-switch button {{
+                background: transparent;
+                color: #c0c0d0;
+                border: none;
+                border-radius: 999px;
+                padding: 0.3rem 0.9rem;
+                font-size: 0.85rem;
+                font-family: inherit;
+                cursor: pointer;
+                transition: background 0.12s, color 0.12s;
+            }}
+            .convo-root .mode-switch button:hover:not(.active) {{
+                color: #e0e0e0;
+            }}
+            .convo-root .mode-switch button.active {{
+                background: #4ecca3;
+                color: #1a1a2e;
+                font-weight: 600;
+            }}
+
+            /* Composer surfaces share a height cap. The textarea
+               grows up to ~10 lines (16rem) before scrolling
+               internally; the voice transcript bubble caps at
+               the same height. */
+            .convo-root .composer-textarea {{
+                flex: 1;
+                min-height: 4rem;
+                max-height: 16rem;
+                resize: none;
+                overflow-y: auto;
+            }}
+            .convo-root .voice-transcript-bubble {{
+                background: #12284a;
+                border: 1px solid #2a3960;
+                border-radius: 6px;
+                padding: 0.5rem 0.75rem;
+                min-height: 3rem;
+                max-height: 16rem;
+                overflow-y: auto;
+                font-family: inherit;
+                white-space: pre-wrap;
+            }}
             "#
         }
         div { class: "convo-root",
-            style: "max-width: 760px; margin: 0 auto; padding: 1rem; font-family: system-ui, sans-serif;",
+            style: "max-width: 1280px; margin: 0 auto; padding: 1rem; font-family: system-ui, sans-serif;",
 
-            // Header row: title + Voice/Type mode toggle. Toggling
-            // away from Voice while listening immediately stops
-            // capture so the mic LED clears; toggling into Voice is
-            // a no-op until the user clicks Start Turn.
+            // Header row: title + Voice/Type segmented mode
+            // switch. Toggling away from Voice while listening
+            // immediately stops capture so the mic LED clears;
+            // toggling into Voice is a no-op until the user
+            // clicks Start Turn.
             div { style: "display: flex; align-items: center; justify-content: space-between; gap: 1rem;",
                 h2 { style: "margin: 0;", "Conversation" }
-                div { style: "display: flex; gap: 0.25rem; align-items: center;",
-                    span { style: "font-size: 0.8rem; color: #8888aa;", "Mode:" }
+                div { class: "mode-switch", role: "group", aria_label: "Conversation input mode",
                     button {
-                        class: "convo-send",
-                        style: if matches!(mode(), Mode::Voice) {
-                            "padding: 0.25rem 0.6rem; background: #4ecca3; color: #1a1a2e;"
-                        } else {
-                            "padding: 0.25rem 0.6rem;"
-                        },
+                        class: if matches!(mode(), Mode::Voice) { "active" } else { "" },
+                        aria_pressed: matches!(mode(), Mode::Voice).to_string(),
                         onclick: move |_| {
                             if !matches!(mode(), Mode::Voice) {
                                 mode.set(Mode::Voice);
@@ -890,12 +941,8 @@ pub fn ConversationView() -> Element {
                         "Voice"
                     }
                     button {
-                        class: "convo-send",
-                        style: if matches!(mode(), Mode::Type) {
-                            "padding: 0.25rem 0.6rem; background: #4ecca3; color: #1a1a2e;"
-                        } else {
-                            "padding: 0.25rem 0.6rem;"
-                        },
+                        class: if matches!(mode(), Mode::Type) { "active" } else { "" },
+                        aria_pressed: matches!(mode(), Mode::Type).to_string(),
                         onclick: move |_| {
                             if !matches!(mode(), Mode::Type) {
                                 // Stop any in-flight capture so the
@@ -1409,7 +1456,7 @@ pub fn ConversationView() -> Element {
             if matches!(mode(), Mode::Type) {
                 div { style: "display: flex; gap: 0.5rem;",
                     textarea {
-                        style: "flex: 1; min-height: 4rem; resize: vertical;",
+                        class: "composer-textarea",
                         placeholder: "Type a message and press Ctrl+Enter to send.",
                         value: "{input}",
                         oninput: move |e| input.set(e.value()),
@@ -1437,8 +1484,7 @@ pub fn ConversationView() -> Element {
                 // listening (force-flushes the trailing partial
                 // and submits via the side effect below).
                 div { style: "display: flex; flex-direction: column; gap: 0.5rem;",
-                    div {
-                        style: "background: #12284a; border: 1px solid #2a3960; border-radius: 6px; padding: 0.5rem 0.75rem; min-height: 3rem; font-family: inherit; white-space: pre-wrap;",
+                    div { class: "voice-transcript-bubble",
                         if voice.final_text.read().is_empty() && voice.interim_text.read().is_empty() {
                             span { style: "color: #8888aa; font-style: italic;",
                                 match *voice.state.read() {
