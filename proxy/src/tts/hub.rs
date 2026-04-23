@@ -37,7 +37,19 @@ use tokio::sync::broadcast;
 pub enum TtsBroadcastFrame {
     /// A chunk of MP3 bytes. Concatenating every `Audio` frame in
     /// order rebuilds the same file the cache has on disk.
-    Audio(Vec<u8>),
+    ///
+    /// `total_bytes_after` is the running total of audio bytes the
+    /// orchestrator has emitted *including* this frame. Late
+    /// subscribers use it to skip frames whose bytes are already
+    /// covered by the cache snapshot they read at attach time —
+    /// this is what makes the cache-then-live handoff in §5.1
+    /// duplicate-free.
+    Audio {
+        /// Raw MP3 chunk bytes for this frame.
+        bytes: Vec<u8>,
+        /// Running cumulative byte count *including* this frame.
+        total_bytes_after: u64,
+    },
     /// Synthesis finished cleanly; subscribers can close.
     Done,
     /// Synthesis errored. Subscribers should close and the browser
@@ -151,16 +163,34 @@ mod tests {
         let hub = TtsHub::new();
         let bcast = hub.open("turn-0001".into());
         let mut rx = hub.subscribe("turn-0001").expect("live");
-        bcast.send(TtsBroadcastFrame::Audio(vec![1, 2, 3]));
-        bcast.send(TtsBroadcastFrame::Audio(vec![4, 5]));
+        bcast.send(TtsBroadcastFrame::Audio {
+            bytes: vec![1, 2, 3],
+            total_bytes_after: 3,
+        });
+        bcast.send(TtsBroadcastFrame::Audio {
+            bytes: vec![4, 5],
+            total_bytes_after: 5,
+        });
         bcast.finish();
 
         match rx.recv().await.unwrap() {
-            TtsBroadcastFrame::Audio(b) => assert_eq!(b, vec![1, 2, 3]),
+            TtsBroadcastFrame::Audio {
+                bytes,
+                total_bytes_after,
+            } => {
+                assert_eq!(bytes, vec![1, 2, 3]);
+                assert_eq!(total_bytes_after, 3);
+            }
             other => panic!("expected Audio, got {other:?}"),
         }
         match rx.recv().await.unwrap() {
-            TtsBroadcastFrame::Audio(b) => assert_eq!(b, vec![4, 5]),
+            TtsBroadcastFrame::Audio {
+                bytes,
+                total_bytes_after,
+            } => {
+                assert_eq!(bytes, vec![4, 5]);
+                assert_eq!(total_bytes_after, 5);
+            }
             other => panic!("expected Audio, got {other:?}"),
         }
         match rx.recv().await.unwrap() {

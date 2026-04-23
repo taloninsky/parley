@@ -7,6 +7,7 @@ edition = "2024"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
+base64 = "0.22"
 futures = "0.3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 parley-core = { path = "../parley-core" }

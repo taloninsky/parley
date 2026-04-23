@@ -10,6 +10,8 @@
 //! - `POST /conversation/turn`     — submit a user turn; SSE-streams `OrchestratorEvent`s
 //! - `POST /conversation/switch`   — switch the active (persona, model) for the next turn
 //! - `GET  /conversation/snapshot` — full session state as JSON
+//! - `GET  /conversation/tts/{turn_id}`         — SSE stream of MP3 audio frames for a turn
+//! - `GET  /conversation/tts/{turn_id}/replay`  — raw cached MP3 file (`audio/mpeg`)
 //!
 //! ## Scope of this slice
 //!
@@ -39,10 +41,15 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    http::{StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::{Stream, StreamExt};
 use parley_core::conversation::ConversationSession;
 use parley_core::model_config::{LlmProviderTag, ModelConfig, ModelConfigId};
@@ -59,6 +66,11 @@ use crate::orchestrator::{
 use crate::providers::ProviderId;
 use crate::secrets::{DEFAULT_CREDENTIAL, SecretsManager};
 use crate::session_store::{FsSessionStore, SessionStore, SessionStoreError};
+use crate::tts::{ElevenLabsTts, FsTtsCache, TtsBroadcastFrame, TtsHub};
+
+/// Default ElevenLabs voice id ("Jarnathan") used when an init or
+/// load request omits the `voice_id` field. Spec §6.
+pub const DEFAULT_TTS_VOICE_ID: &str = "c6SfcYrb2t09NHXiT80T";
 
 /// Immutable view of the registries loaded once at proxy boot.
 /// Cheap to share via `Arc`.
@@ -71,6 +83,20 @@ pub struct Registries {
     pub prompts_dir: PathBuf,
     /// Directory the filesystem session store writes into.
     pub sessions_dir: PathBuf,
+}
+
+/// Resolved TTS infrastructure shared across requests. The hub is
+/// always live (empty until a turn opens it); the cache is rooted
+/// at a fixed directory and scopes by session id internally.
+#[derive(Clone)]
+pub struct TtsRuntime {
+    /// Per-turn fan-out registry. Shared with the orchestrator so
+    /// dispatch publishes into the same channels the SSE route
+    /// subscribes to.
+    pub hub: Arc<TtsHub>,
+    /// On-disk MP3 cache. Shared with the orchestrator (writer) and
+    /// the SSE / replay routes (reader).
+    pub cache: Arc<FsTtsCache>,
 }
 
 /// Shared state behind the conversation routes.
@@ -88,12 +114,15 @@ pub struct ConversationApiState {
     http: reqwest::Client,
     store: Arc<dyn SessionStore>,
     secrets: Arc<SecretsManager>,
+    tts: TtsRuntime,
 }
 
 impl ConversationApiState {
     /// Build a new state wrapper around the supplied registries,
     /// HTTP client, and secrets manager. Uses a [`FsSessionStore`]
-    /// rooted at `registries.sessions_dir`.
+    /// rooted at `registries.sessions_dir` and a [`FsTtsCache`]
+    /// rooted at the same directory (per spec §4.3 the cache lives
+    /// alongside saved sessions: `{sessions_dir}/{session_id}/tts-cache/`).
     pub fn new(
         registries: Arc<Registries>,
         http: reqwest::Client,
@@ -101,12 +130,17 @@ impl ConversationApiState {
     ) -> Self {
         let store: Arc<dyn SessionStore> =
             Arc::new(FsSessionStore::new(registries.sessions_dir.clone()));
+        let tts = TtsRuntime {
+            hub: Arc::new(TtsHub::new()),
+            cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
+        };
         Self {
             inner: Arc::new(Mutex::new(None)),
             registries,
             http,
             store,
             secrets,
+            tts,
         }
     }
 
@@ -119,12 +153,38 @@ impl ConversationApiState {
         store: Arc<dyn SessionStore>,
         secrets: Arc<SecretsManager>,
     ) -> Self {
+        let tts = TtsRuntime {
+            hub: Arc::new(TtsHub::new()),
+            cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
+        };
         Self {
             inner: Arc::new(Mutex::new(None)),
             registries,
             http,
             store,
             secrets,
+            tts,
+        }
+    }
+
+    /// Build with caller-supplied store *and* TTS runtime. Lets tests
+    /// share a hub/cache with a manually-driven orchestrator (rather
+    /// than the one constructed by `init`).
+    #[cfg(test)]
+    pub fn with_store_and_tts(
+        registries: Arc<Registries>,
+        http: reqwest::Client,
+        store: Arc<dyn SessionStore>,
+        secrets: Arc<SecretsManager>,
+        tts: TtsRuntime,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            registries,
+            http,
+            store,
+            secrets,
+            tts,
         }
     }
 
@@ -152,6 +212,8 @@ pub fn router(state: ConversationApiState) -> Router {
         .route("/conversation/load", post(load_session))
         .route("/conversation/sessions", get(list_sessions))
         .route("/conversation/sessions/{id}", delete(delete_session))
+        .route("/conversation/tts/{turn_id}", get(stream_tts))
+        .route("/conversation/tts/{turn_id}/replay", get(replay_tts))
         .route("/personas", get(list_personas))
         .route("/models", get(list_models))
         .with_state(state)
@@ -179,6 +241,17 @@ pub struct InitRequest {
     /// wire.
     #[serde(default)]
     pub credential: Option<String>,
+    /// ElevenLabs voice id for in-turn TTS synthesis. Defaults to
+    /// [`DEFAULT_TTS_VOICE_ID`] when omitted.
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    /// Named credential for the ElevenLabs API key. Defaults to
+    /// `default`. When the named credential is missing, the session
+    /// runs in text-only mode (no TTS dispatch); the session still
+    /// initializes successfully so the user can configure a key
+    /// and retry via `/conversation/switch`.
+    #[serde(default)]
+    pub elevenlabs_credential: Option<String>,
 }
 
 /// Body for `POST /conversation/turn`.
@@ -219,6 +292,16 @@ pub struct LoadRequest {
     /// the loaded session's active model. Defaults to `default`.
     #[serde(default)]
     pub credential: Option<String>,
+    /// ElevenLabs voice id to use for synthesis after load. Defaults
+    /// to [`DEFAULT_TTS_VOICE_ID`].
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    /// Named credential for the ElevenLabs API key. Defaults to
+    /// `default`. Missing-credential behavior matches `/init`:
+    /// load succeeds, TTS is disabled until a credential is
+    /// configured.
+    #[serde(default)]
+    pub elevenlabs_credential: Option<String>,
 }
 
 /// Compact summary of a saved session, returned by `GET
@@ -358,15 +441,20 @@ async fn init_session(
         model.id.clone(),
     );
     let snapshot = session.clone();
+    let (tts, tts_voice_id) = resolve_tts(
+        &state,
+        req.voice_id.as_deref(),
+        req.elevenlabs_credential.as_deref(),
+    );
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
-        tts: None,
-        tts_cache: None,
-        tts_hub: None,
-        tts_voice_id: None,
+        tts,
+        tts_cache: Some(state.tts.cache.clone()),
+        tts_hub: Some(state.tts.hub.clone()),
+        tts_voice_id,
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -474,15 +562,19 @@ async fn switch_persona(
         &state.secrets,
     )?;
     snapshot.switch_persona(req.persona_id.clone(), req.model_config_id.clone());
+    // `switch` doesn't carry voice/elevenlabs fields today — reuse
+    // the default credential resolution (and the default voice).
+    // The browser can re-init with explicit values to change voice.
+    let (tts, tts_voice_id) = resolve_tts(&state, None, None);
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
-        tts: None,
-        tts_cache: None,
-        tts_hub: None,
-        tts_voice_id: None,
+        tts,
+        tts_cache: Some(state.tts.cache.clone()),
+        tts_hub: Some(state.tts.hub.clone()),
+        tts_voice_id,
     };
     let new_orchestrator = Arc::new(ConversationOrchestrator::new(snapshot, ctx));
     *state.inner.lock().await = Some(new_orchestrator);
@@ -567,15 +659,20 @@ async fn load_session(
     )?;
 
     let snapshot = session.clone();
+    let (tts, tts_voice_id) = resolve_tts(
+        &state,
+        req.voice_id.as_deref(),
+        req.elevenlabs_credential.as_deref(),
+    );
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
-        tts: None,
-        tts_cache: None,
-        tts_hub: None,
-        tts_voice_id: None,
+        tts,
+        tts_cache: Some(state.tts.cache.clone()),
+        tts_hub: Some(state.tts.hub.clone()),
+        tts_voice_id,
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -762,6 +859,190 @@ fn session_store_error_to_response(err: SessionStoreError) -> (StatusCode, Json<
         }
     };
     (status, Json(ErrorBody::new(err.to_string())))
+}
+
+/// Resolve TTS provider + voice for a session-construction request.
+///
+/// Returns `(provider, voice_id)` when an ElevenLabs key is
+/// configured for `credential` (defaulting to `default`); both are
+/// `None` when no key is configured. The session still constructs
+/// successfully on a missing key — TTS dispatch simply no-ops and
+/// the session runs in text-only mode (spec §6 "graceful
+/// degradation").
+fn resolve_tts(
+    state: &ConversationApiState,
+    voice_id: Option<&str>,
+    credential: Option<&str>,
+) -> (Option<Arc<dyn crate::tts::TtsProvider>>, Option<String>) {
+    let credential = credential.unwrap_or(DEFAULT_CREDENTIAL);
+    let key = match state.secrets.resolve(ProviderId::ElevenLabs, credential) {
+        Some(k) => k,
+        None => return (None, None),
+    };
+    let voice = voice_id.unwrap_or(DEFAULT_TTS_VOICE_ID).to_string();
+    let provider: Arc<dyn crate::tts::TtsProvider> =
+        Arc::new(ElevenLabsTts::new(key, state.http.clone()));
+    (Some(provider), Some(voice))
+}
+
+/// `GET /conversation/tts/{turn_id}` — SSE stream of MP3 audio for
+/// a turn. Combines a snapshot of the cache file (if any) with a
+/// live broadcast subscription (if any) so subscribers that connect
+/// mid-flight see every byte exactly once.
+///
+/// Cache and broadcast are subscribed to in this order:
+///
+/// 1. Subscribe to the live hub (so we don't miss frames during
+///    the cache read).
+/// 2. Snapshot cache bytes — the orchestrator always writes to the
+///    cache *before* it broadcasts, so cache length ≥ any byte
+///    count a queued frame can carry.
+/// 3. Emit the cache snapshot as a single `audio` frame.
+/// 4. Drain the live receiver, dropping any `Audio` frame whose
+///    cumulative `total_bytes_after` ≤ cache snapshot length (those
+///    bytes are already in the snapshot we sent).
+///
+/// Returns `404` when the turn id has neither a live broadcast nor
+/// a cache file. The session id is read from the active
+/// orchestrator; routes that fire before `init` get `409`.
+async fn stream_tts(
+    State(state): State<ConversationApiState>,
+    Path(turn_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorBody>)> {
+    let orchestrator = require_session(&state).await?;
+    let session_id = orchestrator.session_snapshot().await.id;
+
+    // Step 1: subscribe FIRST so frames published while we read
+    // the cache aren't lost. `None` means no live broadcast.
+    let live_rx = state.tts.hub.subscribe(&turn_id);
+
+    // Step 2: snapshot cache (best-effort). `None` means no file.
+    let cache_bytes: Option<Vec<u8>> = match state.tts.cache.reader(&session_id, &turn_id).await {
+        Ok(Some(reader)) => Some(reader.into_bytes()),
+        Ok(None) => None,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody::new(format!("tts cache read failed: {e}"))),
+            ));
+        }
+    };
+    if live_rx.is_none() && cache_bytes.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody::new(format!(
+                "no tts stream or cache for turn '{turn_id}'"
+            ))),
+        ));
+    }
+
+    let cache_len = cache_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+    let stream = async_stream::stream! {
+        // (a) Cache prefix as a single audio frame.
+        if let Some(bytes) = cache_bytes
+            && !bytes.is_empty()
+        {
+            yield Ok::<_, Infallible>(audio_event(&bytes));
+        }
+
+        // (b) Live tail. Skip frames already covered by the cache
+        // snapshot (their `total_bytes_after` ≤ cache_len).
+        if let Some(mut rx) = live_rx {
+            loop {
+                match rx.recv().await {
+                    Ok(TtsBroadcastFrame::Audio { bytes, total_bytes_after }) => {
+                        if total_bytes_after <= cache_len {
+                            continue;
+                        }
+                        yield Ok(audio_event(&bytes));
+                    }
+                    Ok(TtsBroadcastFrame::Done) => {
+                        yield Ok(done_event());
+                        break;
+                    }
+                    Ok(TtsBroadcastFrame::Error(message)) => {
+                        yield Ok(error_event(&message));
+                        break;
+                    }
+                    // Channel closed without a terminal frame
+                    // (sender dropped without finish/fail). Treat
+                    // as a normal completion — the cache prefix
+                    // covers everything that was actually emitted.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        yield Ok(done_event());
+                        break;
+                    }
+                    // Subscriber lagged — broadcaster outran us.
+                    // Skip the lost frames; later frames carry
+                    // their own `total_bytes_after` so the next
+                    // valid Audio still slots in correctly.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        } else {
+            // Cache-only: emit `done` immediately after the snapshot.
+            yield Ok(done_event());
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// `GET /conversation/tts/{turn_id}/replay` — return the cached MP3
+/// file as a single response with `Content-Type: audio/mpeg`,
+/// suitable for `<audio src="..."/>`. Returns `404` when no cache
+/// file exists; `409` when no session is active.
+async fn replay_tts(
+    State(state): State<ConversationApiState>,
+    Path(turn_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let orchestrator = require_session(&state).await?;
+    let session_id = orchestrator.session_snapshot().await.id;
+    let reader = state
+        .tts
+        .cache
+        .reader(&session_id, &turn_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody::new(format!("tts cache read failed: {e}"))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody::new(format!("no tts cache for turn '{turn_id}'"))),
+            )
+        })?;
+    let bytes = reader.into_bytes();
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, "audio/mpeg".parse().unwrap());
+    Ok(resp)
+}
+
+/// Build a single `audio` SSE frame from a chunk of MP3 bytes.
+fn audio_event(bytes: &[u8]) -> Event {
+    let payload = serde_json::json!({
+        "type": "audio",
+        "b64": BASE64_STANDARD.encode(bytes),
+    });
+    Event::default().event("audio").data(payload.to_string())
+}
+
+/// Terminal `done` SSE frame.
+fn done_event() -> Event {
+    Event::default().event("done").data(r#"{"type":"done"}"#)
+}
+
+/// Terminal `error` SSE frame with a human-readable message.
+fn error_event(message: &str) -> Event {
+    let payload = serde_json::json!({
+        "type": "error",
+        "message": message,
+    });
+    Event::default().event("error").data(payload.to_string())
 }
 
 /// Stable `event:` field name for SSE frames. Mirrors the
@@ -1861,5 +2142,333 @@ mod tests {
             "m1".to_string(),
         );
         assert_eq!(derive_session_title(&s), "");
+    }
+
+    // ── TTS routes ─────────────────────────────────────────────
+
+    /// Build a state with a TTS runtime rooted at `cache_root`. The
+    /// runtime is shared with the caller so tests can pre-populate
+    /// the cache or open broadcasts directly.
+    fn build_state_with_tts_runtime(
+        persona: Persona,
+        model: ModelConfig,
+        sessions_dir: PathBuf,
+        cache_root: PathBuf,
+    ) -> (ConversationApiState, TtsRuntime) {
+        let registries = Arc::new(Registries {
+            personas: [(persona.id.clone(), persona)].into(),
+            models: [(model.id.clone(), model)].into(),
+            prompts_dir: PathBuf::from("/nonexistent"),
+            sessions_dir: sessions_dir.clone(),
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(sessions_dir));
+        let tts = TtsRuntime {
+            hub: Arc::new(TtsHub::new()),
+            cache: Arc::new(FsTtsCache::new(cache_root)),
+        };
+        let state = ConversationApiState::with_store_and_tts(
+            registries,
+            reqwest::Client::new(),
+            store,
+            test_secrets_with_default("sk-test"),
+            tts.clone(),
+        );
+        (state, tts)
+    }
+
+    /// Pre-populate the cache file for `(session_id, turn_id)` with
+    /// `bytes`. Drives [`FsTtsCache::writer`] just like the
+    /// orchestrator does at runtime.
+    async fn seed_cache(cache: &FsTtsCache, session_id: &str, turn_id: &str, bytes: &[u8]) {
+        let mut w = cache.writer(session_id, turn_id).await.unwrap();
+        w.write(bytes).await.unwrap();
+        w.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tts_routes_404_without_active_session_become_409() {
+        // Without `init`, every conversation route returns 409 from
+        // `require_session`. Both new TTS routes are no exception
+        // \u2014 confirms they share the same gating contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, _tts) = build_state_with_tts_runtime(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        for uri in [
+            "/conversation/tts/turn-0001",
+            "/conversation/tts/turn-0001/replay",
+        ] {
+            let resp = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "uri={uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_returns_cached_mp3_with_audio_mpeg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        // Seed cache for the active session id (the test
+        // orchestrator uses "sess-test").
+        seed_cache(&tts.cache, "sess-test", "turn-0001", b"\xFF\xFB\x90payload").await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/tts/turn-0001/replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "audio/mpeg"
+        );
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"\xFF\xFB\x90payload");
+    }
+
+    #[tokio::test]
+    async fn replay_returns_404_for_unknown_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, _tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/tts/turn-9999/replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stream_tts_returns_404_when_no_live_or_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, _tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/tts/turn-9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stream_tts_emits_cache_only_when_no_live_broadcast() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+        seed_cache(&tts.cache, "sess-test", "turn-0001", b"\x01\x02\x03\x04").await;
+
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/tts/turn-0001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let frames = parse_sse(&body);
+        let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["audio", "done"]);
+
+        let audio_payload: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        assert_eq!(audio_payload["type"], "audio");
+        let decoded = BASE64_STANDARD
+            .decode(audio_payload["b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"\x01\x02\x03\x04");
+    }
+
+    #[tokio::test]
+    async fn stream_tts_late_subscriber_skips_frames_already_in_cache() {
+        // Simulate the late-join handoff: a writer has already
+        // pushed bytes to the cache, then publishes one more frame
+        // whose `total_bytes_after` is *within* the snapshot we
+        // read. The SSE handler must not re-emit the duplicate
+        // bytes, but must emit the trailing frame whose offset
+        // exceeds the snapshot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        // Open a broadcast for turn-0001 and seed the cache with
+        // 4 bytes (covers a hypothetical first frame whose
+        // `total_bytes_after = 4`).
+        let bcast = tts.hub.open("turn-0001".into());
+        seed_cache(&tts.cache, "sess-test", "turn-0001", b"\x01\x02\x03\x04").await;
+
+        // Spawn the SSE request. Drain on a separate task so we
+        // can publish broadcasts after subscribe is in flight.
+        let app = router(state);
+        let handle = tokio::spawn(async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/conversation/tts/turn-0001")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            read_body(resp).await
+        });
+
+        // Give the handler a moment to subscribe + read cache.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Frame inside the cache window \u2014 must be dropped.
+        bcast.send(TtsBroadcastFrame::Audio {
+            bytes: vec![0x01, 0x02],
+            total_bytes_after: 2,
+        });
+        // Frame past the cache window \u2014 must be emitted.
+        bcast.send(TtsBroadcastFrame::Audio {
+            bytes: vec![0x05, 0x06],
+            total_bytes_after: 6,
+        });
+        bcast.finish();
+
+        let body = handle.await.unwrap();
+        let frames = parse_sse(&body);
+        let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["audio", "audio", "done"]);
+
+        let snap_payload: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        let snap_bytes = BASE64_STANDARD
+            .decode(snap_payload["b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(snap_bytes, b"\x01\x02\x03\x04");
+
+        let tail_payload: serde_json::Value = serde_json::from_str(&frames[1].1).unwrap();
+        let tail_bytes = BASE64_STANDARD
+            .decode(tail_payload["b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(tail_bytes, vec![0x05, 0x06]);
+    }
+
+    #[tokio::test]
+    async fn stream_tts_propagates_error_frame() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let (state, tts) = build_state_with_tts_runtime(
+            persona.clone(),
+            model.clone(),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        );
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona, model, provider).await;
+
+        let bcast = tts.hub.open("turn-0001".into());
+        let app = router(state);
+        let handle = tokio::spawn(async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/conversation/tts/turn-0001")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            read_body(resp).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bcast.fail("boom".into());
+
+        let body = handle.await.unwrap();
+        let frames = parse_sse(&body);
+        let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["error"]);
+        let v: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["message"], "boom");
     }
 }

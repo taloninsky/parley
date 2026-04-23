@@ -2055,6 +2055,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64",
  "futures",
  "keyring",
  "parley-core",

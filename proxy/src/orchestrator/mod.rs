@@ -592,6 +592,11 @@ struct TtsTurn {
     broadcaster: Option<crate::tts::TtsBroadcaster>,
     sentence_index: u32,
     total_characters: u32,
+    /// Running cumulative count of audio bytes written/broadcast
+    /// for this turn. Tagged onto each broadcast frame so late
+    /// subscribers can drop frames already covered by the cache
+    /// snapshot they read at attach time.
+    total_bytes: u64,
     started: bool,
     /// Once a TTS error fires we stop dispatching further sentences
     /// for this turn — but we let the LLM stream run to completion
@@ -623,6 +628,7 @@ impl TtsTurn {
             broadcaster: Some(broadcaster),
             sentence_index: 0,
             total_characters: 0,
+            total_bytes: 0,
             started: false,
             aborted: false,
         })
@@ -687,7 +693,11 @@ impl TtsTurn {
                         return events;
                     }
                     if let Some(b) = self.broadcaster.as_ref() {
-                        b.send(TtsBroadcastFrame::Audio(bytes));
+                        self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
+                        b.send(TtsBroadcastFrame::Audio {
+                            bytes,
+                            total_bytes_after: self.total_bytes,
+                        });
                     }
                 }
                 Some(Ok(TtsChunk::Done { characters })) => {
