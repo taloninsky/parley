@@ -9,7 +9,9 @@ use tower_http::cors::CorsLayer;
 mod conversation_api;
 mod llm;
 mod orchestrator;
+mod providers;
 mod registry;
+mod secrets;
 mod session_store;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
@@ -174,7 +176,19 @@ If your output violates any of these, it will be automatically rejected.
 - If no changes are needed: {"changed": false}
 - If changes are needed:  {"changed": true, "formatted": "..."}
   where "formatted" contains the full EDITABLE text with formatting applied.
-  Do NOT include the CONTEXT in your output."#;
+  Do NOT include the CONTEXT in your output.
+
+=== JSON ESCAPING — CRITICAL ===
+The value of "formatted" is a JSON string. ALL control characters inside it
+MUST be escaped, including paragraph breaks. Specifically:
+- Encode every newline as the two-character sequence \n (backslash + n).
+- Encode every carriage return as \r and every tab as \t.
+- Encode every literal double-quote as \".
+- Encode every literal backslash as \\.
+Do NOT emit a raw newline character inside the JSON string value. A response
+with a literal newline inside "formatted" is malformed JSON and will be
+rejected. Example of a CORRECT response with a paragraph break:
+  {"changed": true, "formatted": "First paragraph.\n\nSecond paragraph."}"#;
 
 async fn format_text(
     State(state): State<Arc<AppState>>,
@@ -279,8 +293,17 @@ async fn format_text(
                 .unwrap_or("")
                 .to_string();
             let full_json = format!("{{{raw}");
-            // Parse Haiku's JSON — should be {"changed": bool, "formatted": "..."}
-            match serde_json::from_str::<serde_json::Value>(&full_json) {
+            // Parse Haiku's JSON — should be {"changed": bool, "formatted": "..."}.
+            // Models occasionally emit literal newlines/tabs/CRs inside the
+            // "formatted" string value, which is invalid JSON. Try a strict
+            // parse first, and if that fails, repair control chars inside
+            // string values and retry once before giving up.
+            let parsed_result =
+                serde_json::from_str::<serde_json::Value>(&full_json).or_else(|_| {
+                    let repaired = repair_json_string_controls(&full_json);
+                    serde_json::from_str::<serde_json::Value>(&repaired)
+                });
+            match parsed_result {
                 Ok(parsed) => {
                     // Server-side validation: reject if Haiku changed any words
                     if let Some(formatted) = parsed["formatted"].as_str()
@@ -323,10 +346,38 @@ async fn format_text(
     }
 }
 
+/// Strip out bracketed structural markers (e.g. `[Gavin]`, `[05:23]`,
+/// `[H:MM:SS]`) before word extraction. These are speaker tags and
+/// timestamps used by the multi-speaker transcript format. They are
+/// structural metadata, not transcribed words, so the validator must not
+/// count them. Removing them up front lets the formatter legitimately
+/// drop a duplicate `[Gavin]` mid-paragraph (per the multi-speaker prompt
+/// rules) without being rejected for "changing words".
+fn strip_bracketed_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth: u32 = 0;
+    for c in text.chars() {
+        if c == '[' {
+            depth = depth.saturating_add(1);
+        } else if c == ']' {
+            if depth > 0 {
+                depth -= 1;
+            } else {
+                // Unmatched ']' — treat as a regular character.
+                out.push(c);
+            }
+        } else if depth == 0 {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extract only the words from text, stripping all punctuation and lowercasing.
 /// Used to verify Haiku didn't add, remove, or change any words.
 fn extract_words(text: &str) -> Vec<String> {
-    text.split_whitespace()
+    strip_bracketed_markers(text)
+        .split_whitespace()
         .map(|w| {
             w.chars()
                 .filter(|c| c.is_alphanumeric() || *c == '\'')
@@ -335,6 +386,48 @@ fn extract_words(text: &str) -> Vec<String> {
         })
         .filter(|w| !w.is_empty())
         .collect()
+}
+
+/// Repair JSON that contains literal control characters (newline, carriage
+/// return, tab) inside string values. Walks the text tracking string vs.
+/// non-string state and the `\` escape state; inside a string, replaces
+/// raw control chars with their escaped two-character forms. Outside
+/// strings, characters are passed through unchanged.
+///
+/// This is a targeted repair for one specific failure mode of LLM JSON
+/// emission — it does NOT attempt to fix arbitrary malformed JSON.
+fn repair_json_string_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                out.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                out.push(c);
+                escaped = true;
+            } else if c == '"' {
+                out.push(c);
+                in_string = false;
+            } else if c == '\n' {
+                out.push_str("\\n");
+            } else if c == '\r' {
+                out.push_str("\\r");
+            } else if c == '\t' {
+                out.push_str("\\t");
+            } else {
+                out.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Collapse runs of two or more consecutive single-character alphanumeric
@@ -585,5 +678,99 @@ mod tests {
         // Original "U S A B" → if formatter drops "B" and outputs "USA",
         // the run collapses to "usa" vs "usab" — must fail.
         assert!(!words_match("u s a b context", "USA context"));
+    }
+
+    // ── strip_bracketed_markers ────────────────────────────────────
+
+    #[test]
+    fn strip_brackets_removes_speaker_tag() {
+        assert_eq!(strip_bracketed_markers("[Gavin] hello"), " hello");
+    }
+
+    #[test]
+    fn strip_brackets_removes_timestamp_and_tag() {
+        assert_eq!(strip_bracketed_markers("[05:23] [Dave] yeah"), "  yeah",);
+    }
+
+    #[test]
+    fn strip_brackets_handles_unmatched_close_bracket() {
+        // Stray ']' with no opener is preserved as a literal character so
+        // we don't silently mangle unrelated text.
+        assert_eq!(strip_bracketed_markers("a] b"), "a] b");
+    }
+
+    // ── words_match with multi-speaker markers ─────────────────────
+
+    #[test]
+    fn words_match_ignores_speaker_tags() {
+        // The validator must not count "[Gavin]" as a word containing "gavin".
+        assert!(words_match("[Gavin] hello world", "[Gavin] Hello, world.",));
+    }
+
+    #[test]
+    fn words_match_allows_dropping_redundant_speaker_tag() {
+        // Multi-speaker rule 5: a duplicate same-speaker tag mid-paragraph
+        // may be removed by the formatter without that counting as a word
+        // change.
+        assert!(words_match(
+            "[Gavin] first point [Gavin] follow up",
+            "[Gavin] First point, follow up.",
+        ));
+    }
+
+    #[test]
+    fn words_match_allows_dropping_timestamp_marker() {
+        assert!(words_match(
+            "[05:23] [Gavin] hello there",
+            "[Gavin] Hello there.",
+        ));
+    }
+
+    // ── repair_json_string_controls ────────────────────────────────
+
+    #[test]
+    fn repair_escapes_literal_newline_inside_string_value() {
+        let bad = "{\"changed\":true,\"formatted\":\"para one\n\npara two\"}";
+        let repaired = repair_json_string_controls(bad);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
+        assert_eq!(parsed["changed"], true);
+        assert_eq!(parsed["formatted"], "para one\n\npara two");
+    }
+
+    #[test]
+    fn repair_escapes_literal_tab_and_carriage_return() {
+        let bad = "{\"formatted\":\"a\tb\rc\"}";
+        let repaired = repair_json_string_controls(bad);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
+        assert_eq!(parsed["formatted"], "a\tb\rc");
+    }
+
+    #[test]
+    fn repair_preserves_already_escaped_sequences() {
+        // Already-valid JSON should round-trip identically.
+        let good = "{\"formatted\":\"line one\\nline two\"}";
+        let repaired = repair_json_string_controls(good);
+        assert_eq!(repaired, good);
+    }
+
+    #[test]
+    fn repair_does_not_touch_whitespace_outside_strings() {
+        // Newlines between fields in pretty-printed JSON are valid; leave them.
+        let good = "{\n  \"changed\": false\n}";
+        let repaired = repair_json_string_controls(good);
+        assert_eq!(repaired, good);
+    }
+
+    #[test]
+    fn repair_handles_escaped_quote_inside_string() {
+        // The string contains an escaped quote followed by a literal newline
+        // — the escaped quote must NOT terminate the string for repair purposes.
+        let bad = "{\"formatted\":\"she said \\\"hi\\\"\nthen left\"}";
+        let repaired = repair_json_string_controls(bad);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
+        assert_eq!(parsed["formatted"], "she said \"hi\"\nthen left");
     }
 }
