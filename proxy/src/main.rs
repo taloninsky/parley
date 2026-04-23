@@ -498,7 +498,14 @@ async fn main() {
     let cors = CorsLayer::very_permissive();
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        // No total `.timeout()` — this client is shared with the
+        // streaming LLM and TTS providers, where a single response
+        // body can legitimately take minutes (Opus replies +
+        // sentence-by-sentence ElevenLabs synthesis). A global
+        // timeout would chop those streams mid-flight and surface
+        // as "transport error: error decoding response body".
+        // Per-request deadlines for short calls (token mint,
+        // formatting) are the right pattern if we ever need them.
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build HTTP client");
