@@ -662,7 +662,10 @@ impl TtsTurn {
             text: chunk.text.clone(),
         };
 
-        let mut stream = match provider.synthesize(request).await {
+        let mut stream = match provider
+            .synthesize(request, crate::tts::SynthesisContext::default())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 events.push(OrchestratorEvent::Failed {
@@ -865,6 +868,7 @@ mod tests {
                 output_per_1m: 5.0,
             },
             options: serde_json::Value::Null,
+            tts_chunking: parley_core::tts::ChunkPolicy::default(),
         }
     }
 
@@ -1283,7 +1287,11 @@ mod tests {
         fn id(&self) -> &'static str {
             "mock-tts"
         }
-        async fn synthesize(&self, request: TtsRequest) -> Result<TtsStream, TtsError> {
+        async fn synthesize(
+            &self,
+            request: TtsRequest,
+            _ctx: crate::tts::SynthesisContext,
+        ) -> Result<TtsStream, TtsError> {
             self.captured.lock().unwrap().push(request);
             let next = {
                 let mut s = self.script.lock().unwrap();
@@ -1311,6 +1319,12 @@ mod tests {
             // $0.000015/char so the math matches ElevenLabsTts and
             // the assertion stays human-readable.
             Cost::from_usd(characters as f64 * 0.000_015)
+        }
+        fn output_format(&self) -> crate::tts::AudioFormat {
+            crate::tts::AudioFormat::Mp3_44100_128
+        }
+        fn supports_expressive_tags(&self) -> bool {
+            true
         }
     }
 

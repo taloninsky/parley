@@ -11,6 +11,8 @@
 //!
 //! Spec reference: `docs/conversation-voice-slice-spec.md` §4.1.
 
+pub mod chunking;
 pub mod sentence;
 
+pub use chunking::{ChunkPlanner, ChunkPolicy, ReleasedChunk};
 pub use sentence::{SentenceChunk, SentenceChunker};

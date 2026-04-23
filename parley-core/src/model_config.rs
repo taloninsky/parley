@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::tts::ChunkPolicy;
+
 /// Stable identifier for a model configuration. Used by personas to
 /// reference a model by id; must match the file stem of the TOML file
 /// (e.g., `~/.parley/models/claude-opus-latest.toml` →
@@ -111,6 +113,14 @@ pub struct ModelConfig {
     /// extension trait. Defaults to `null`.
     #[serde(default)]
     pub options: serde_json::Value,
+    /// Paragraph-bounded TTS chunking policy applied when a turn
+    /// dispatched against this model speaks via TTS. Defaults to
+    /// [`ChunkPolicy::default`] when the on-disk file omits the
+    /// section, so existing model files load unchanged.
+    ///
+    /// Spec: `docs/paragraph-tts-chunking-spec.md` §3.4.
+    #[serde(default)]
+    pub tts_chunking: ChunkPolicy,
 }
 
 impl ModelConfig {
@@ -142,6 +152,7 @@ mod tests {
                 "temperature": 0.7,
                 "extended_thinking": { "enabled": true, "budget_tokens": 8000 }
             }),
+            tts_chunking: ChunkPolicy::default(),
         }
     }
 
@@ -231,6 +242,45 @@ mod tests {
         assert_eq!(f.model.rates.input_per_1m, 0.0);
         assert_eq!(f.model.rates.output_per_1m, 0.0);
         assert!(f.model.options.is_null());
+        // Missing [model.tts_chunking] section must yield the default
+        // policy. Existing on-disk model files predate this section
+        // and must continue to load unchanged.
+        assert_eq!(f.model.tts_chunking, ChunkPolicy::default());
+    }
+
+    #[test]
+    fn toml_overrides_individual_chunking_fields() {
+        // Users should be able to tune one knob without restating
+        // every default. Verifies serde's per-field defaulting on
+        // ChunkPolicy itself.
+        let toml_text = r#"
+            [model]
+            id = "tuned"
+            provider = "anthropic"
+            model_name = "claude"
+            context_window = 1
+
+            [model.tts_chunking]
+            paragraph_wait_ms = 5000
+            hard_cap_chars = 800
+        "#;
+        #[derive(Deserialize)]
+        struct File {
+            model: ModelConfig,
+        }
+        let f: File = toml::from_str(toml_text).expect("parse");
+        let defaults = ChunkPolicy::default();
+        assert_eq!(f.model.tts_chunking.paragraph_wait_ms, 5000);
+        assert_eq!(f.model.tts_chunking.hard_cap_chars, 800);
+        // Untouched fields keep their defaults.
+        assert_eq!(
+            f.model.tts_chunking.first_chunk_max_sentences,
+            defaults.first_chunk_max_sentences
+        );
+        assert_eq!(
+            f.model.tts_chunking.idle_timeout_ms,
+            defaults.idle_timeout_ms
+        );
     }
 
     #[test]

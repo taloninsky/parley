@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod elevenlabs;
 pub mod hub;
+pub mod silence;
 
 use std::pin::Pin;
 
@@ -97,6 +98,53 @@ pub enum TtsError {
 /// is symmetric.
 pub type TtsStream = Pin<Box<dyn Stream<Item = Result<TtsChunk, TtsError>> + Send>>;
 
+/// Audio container/codec shape a [`TtsProvider`] returns. Today only
+/// 128 kbps stereo MP3 at 44.1 kHz is implemented (ElevenLabs); the
+/// enum exists so the `SilenceSplicer` can pick a matching silence
+/// frame and so future providers can declare a different format
+/// without leaking through the orchestrator.
+///
+/// Spec: `docs/paragraph-tts-chunking-spec.md` §3.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFormat {
+    /// 44.1 kHz, 128 kbps, stereo MP3 (CBR). ElevenLabs default.
+    Mp3_44100_128,
+}
+
+/// Provider-specific opaque continuation handle carried inside a
+/// [`SynthesisContext`]. Each provider that wants cross-chunk
+/// continuity defines its own variant.
+#[derive(Debug, Clone)]
+pub enum ProviderContinuationState {
+    /// ElevenLabs HTTP `request-id` header from the prior chunk's
+    /// response. Used to populate `previous_request_ids` on the next
+    /// request when the v2 stitching model is in play. The default
+    /// adapter (v3) ignores this.
+    ElevenLabsRequestId(String),
+}
+
+/// Cross-chunk continuity hints passed into [`TtsProvider::synthesize`].
+/// All fields are advisory — providers that don't support a given
+/// hint simply ignore it.
+///
+/// Spec: `docs/paragraph-tts-chunking-spec.md` §3.2.
+#[derive(Debug, Clone, Default)]
+pub struct SynthesisContext {
+    /// Text of the immediately prior chunk in the same turn, if any.
+    /// May be used as a `previous_text` hint for prosody.
+    pub previous_text: Option<String>,
+    /// Hint at the next chunk's text when the orchestrator already
+    /// has it buffered (rare in pure streaming).
+    pub next_text_hint: Option<String>,
+    /// Zero-based index of this chunk within the turn.
+    pub chunk_index: u32,
+    /// `true` when this is the last chunk for the turn.
+    pub final_for_turn: bool,
+    /// Provider-specific opaque continuation state from the prior
+    /// chunk's response.
+    pub provider_state: Option<ProviderContinuationState>,
+}
+
 /// Streaming TTS provider. Implementations are constructed once at
 /// proxy startup with their API key already resolved.
 #[async_trait]
@@ -108,7 +156,23 @@ pub trait TtsProvider: Send + Sync {
 
     /// Synthesize `request.text` in the requested voice. Returns a
     /// stream of audio chunks terminated by a single `Done`.
-    async fn synthesize(&self, request: TtsRequest) -> Result<TtsStream, TtsError>;
+    ///
+    /// `ctx` carries cross-chunk continuity hints. Providers that
+    /// don't use a given hint must ignore it without error.
+    async fn synthesize(
+        &self,
+        request: TtsRequest,
+        ctx: SynthesisContext,
+    ) -> Result<TtsStream, TtsError>;
+
+    /// Audio format produced by [`Self::synthesize`]. Used by the
+    /// `SilenceSplicer` to pick a matching silence frame.
+    fn output_format(&self) -> AudioFormat;
+
+    /// Whether this provider understands ElevenLabs-style expressive
+    /// annotation tags (e.g. `[whisper]`, `[laugh]`). The annotator
+    /// pass uses this to decide whether to inject tags into prompts.
+    fn supports_expressive_tags(&self) -> bool;
 
     /// Compute the USD cost for `characters` synthesized in this
     /// provider's pricing tier. Pure function — no I/O.

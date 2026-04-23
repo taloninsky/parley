@@ -25,7 +25,9 @@ use futures::StreamExt;
 use parley_core::chat::Cost;
 use serde_json::json;
 
-use super::{TtsChunk, TtsError, TtsProvider, TtsRequest, TtsStream};
+use super::{
+    AudioFormat, SynthesisContext, TtsChunk, TtsError, TtsProvider, TtsRequest, TtsStream,
+};
 
 /// Default ElevenLabs streaming endpoint base. Constructor takes an
 /// override so tests can point at a mock.
@@ -86,7 +88,15 @@ impl TtsProvider for ElevenLabsTts {
         "elevenlabs"
     }
 
-    async fn synthesize(&self, request: TtsRequest) -> Result<TtsStream, TtsError> {
+    async fn synthesize(
+        &self,
+        request: TtsRequest,
+        _ctx: SynthesisContext,
+    ) -> Result<TtsStream, TtsError> {
+        // The v3 model handles cross-chunk prosody internally and
+        // does not consume `previous_request_ids`/`previous_text`,
+        // so `_ctx` is intentionally ignored. A future v2-stitching
+        // adapter would read `ctx.provider_state` here.
         if request.text.is_empty() {
             return Err(TtsError::Other("empty text".into()));
         }
@@ -138,6 +148,18 @@ impl TtsProvider for ElevenLabsTts {
     fn cost(&self, characters: u32) -> Cost {
         Cost::from_usd(characters as f64 * ELEVENLABS_COST_PER_CHAR_USD)
     }
+
+    fn output_format(&self) -> AudioFormat {
+        // Pinned to the value sent on the query string above.
+        AudioFormat::Mp3_44100_128
+    }
+
+    fn supports_expressive_tags(&self) -> bool {
+        // ElevenLabs v3 understands the bracketed expressive tag set
+        // (`[whisper]`, `[laugh]`, etc.). The annotator pass uses
+        // this to gate tag injection.
+        true
+    }
 }
 
 #[cfg(test)]
@@ -172,10 +194,13 @@ mod tests {
 
         let p = provider(&server);
         let mut stream = p
-            .synthesize(TtsRequest {
-                voice_id: "voice-1".into(),
-                text: "hello world".into(),
-            })
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: "hello world".into(),
+                },
+                SynthesisContext::default(),
+            )
             .await
             .unwrap();
 
@@ -204,10 +229,13 @@ mod tests {
             .await;
 
         let result = provider(&server)
-            .synthesize(TtsRequest {
-                voice_id: "voice-1".into(),
-                text: "hi".into(),
-            })
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: "hi".into(),
+                },
+                SynthesisContext::default(),
+            )
             .await;
         let err = match result {
             Err(e) => e,
@@ -226,10 +254,13 @@ mod tests {
     async fn empty_text_is_rejected_locally() {
         let server = MockServer::start().await;
         let result = provider(&server)
-            .synthesize(TtsRequest {
-                voice_id: "voice-1".into(),
-                text: String::new(),
-            })
+            .synthesize(
+                TtsRequest {
+                    voice_id: "voice-1".into(),
+                    text: String::new(),
+                },
+                SynthesisContext::default(),
+            )
             .await;
         let err = match result {
             Err(e) => e,

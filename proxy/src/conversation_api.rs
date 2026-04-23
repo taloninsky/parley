@@ -1112,6 +1112,7 @@ mod tests {
                 output_per_1m: 5.0,
             },
             options: serde_json::Value::Null,
+            tts_chunking: parley_core::tts::ChunkPolicy::default(),
         }
     }
 

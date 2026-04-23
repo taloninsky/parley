@@ -115,7 +115,7 @@ impl SentenceChunker {
             let Some(boundary) = self.next_boundary() else {
                 break;
             };
-            let sentence: String = self.buf[..boundary.terminator_end].trim().to_string();
+            let sentence: String = self.buf[..boundary.text_end].trim().to_string();
             // Drop the terminator + the whitespace that followed it,
             // so the next iteration sees a clean buffer head.
             self.buf.drain(..boundary.consume_through);
@@ -138,79 +138,148 @@ impl SentenceChunker {
     /// Find the next sentence boundary in `self.buf`, if any.
     /// Returns `None` when the buffer doesn't contain enough
     /// lookahead to commit yet.
-    fn next_boundary(&self) -> Option<Boundary> {
-        // Find the first terminator.
-        let bytes = self.buf.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if matches!(b, b'.' | b'!' | b'?') {
-                // Terminator at byte i. Need at least one byte of
-                // lookahead.
-                let after = i + 1;
-                if after >= bytes.len() {
-                    return None;
-                }
-                let next = bytes[after];
-                // Condition 3: the immediate next char must be
-                // whitespace (otherwise this terminator is internal
-                // — e.g. "3.14", "wait...", "v1.0").
-                if !is_ws(next) {
-                    // Skip this terminator and keep scanning. A
-                    // hand-tuned skip past the terminator avoids
-                    // re-considering it.
-                    i = after;
-                    continue;
-                }
-                // Abbreviation guard: if the terminator is `.` and
-                // the word immediately preceding it is a known
-                // abbreviation (e.g. "Dr.", "Mr.", "St."), treat
-                // this terminator as part of the abbreviation and
-                // keep scanning.
-                if b == b'.' && preceding_word_is_abbreviation(&self.buf[..i]) {
-                    i = after;
-                    continue;
-                }
-                // Condition 4: scan past the run of whitespace; the
-                // first non-whitespace char must not be lowercase.
-                let mut j = after;
-                while j < bytes.len() && is_ws(bytes[j]) {
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    // We have whitespace but no following character
-                    // yet — can't commit (might be `Dr. ` waiting
-                    // for `Smith`).
-                    return None;
-                }
-                let next_nws = bytes[j];
-                if next_nws.is_ascii_lowercase() {
-                    // Treat as abbreviation; merge and continue.
-                    i = j;
-                    continue;
-                }
-                // Boundary committed. The chunk text ends at the
-                // terminator; consumption advances past trailing
-                // whitespace so the next iteration starts clean.
-                return Some(Boundary {
-                    terminator_end: after, // text ends just past terminator
-                    consume_through: j,    // drain through the whitespace run
-                });
-            }
-            i += 1;
-        }
-        None
+    fn next_boundary(&self) -> Option<SentenceBoundary> {
+        find_first_boundary(&self.buf)
     }
 }
 
-/// One detected boundary inside the buffer.
-struct Boundary {
+/// One detected sentence boundary inside a text buffer. Returned by
+/// [`find_first_boundary`] and [`find_all_boundaries`] so callers
+/// outside [`SentenceChunker`] (e.g. the paragraph-bounded
+/// `ChunkPlanner`) can reuse the same boundary-detection rules
+/// described in [`sentence`](self) without owning a chunker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentenceBoundary {
     /// Byte offset just past the terminator. Sentence text is
-    /// `buf[..terminator_end]` after trimming.
-    terminator_end: usize,
+    /// `buf[..text_end]` (after trimming trailing whitespace).
+    pub text_end: usize,
     /// Byte offset to drain through (terminator + trailing
     /// whitespace) so the next scan starts on real content.
-    consume_through: usize,
+    pub consume_through: usize,
+}
+
+/// Find the first sentence boundary in `buf`, if one is fully
+/// confirmed by the rules in this module's docs. Returns `None`
+/// when the buffer doesn't contain enough lookahead to commit yet.
+///
+/// Pure function — does not mutate `buf`. Used by both
+/// [`SentenceChunker`] (which drains its own buffer) and the
+/// paragraph-bounded `ChunkPlanner` in [`crate::tts::chunking`]
+/// (which only needs to *count* boundaries without consuming).
+pub fn find_first_boundary(buf: &str) -> Option<SentenceBoundary> {
+    let bytes = buf.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'.' | b'!' | b'?') {
+            // Terminator at byte i. Need at least one byte of
+            // lookahead.
+            let after = i + 1;
+            if after >= bytes.len() {
+                return None;
+            }
+            let next = bytes[after];
+            // Condition 3: the immediate next char must be
+            // whitespace (otherwise this terminator is internal
+            // — e.g. "3.14", "wait...", "v1.0").
+            if !is_ws(next) {
+                i = after;
+                continue;
+            }
+            // Abbreviation guard: if the terminator is `.` and
+            // the word immediately preceding it is a known
+            // abbreviation (e.g. "Dr.", "Mr.", "St."), treat
+            // this terminator as part of the abbreviation and
+            // keep scanning.
+            if b == b'.' && preceding_word_is_abbreviation(&buf[..i]) {
+                i = after;
+                continue;
+            }
+            // Condition 4: scan past the run of whitespace; the
+            // first non-whitespace char must not be lowercase.
+            let mut j = after;
+            while j < bytes.len() && is_ws(bytes[j]) {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                // We have whitespace but no following character
+                // yet — can't commit (might be `Dr. ` waiting
+                // for `Smith`).
+                return None;
+            }
+            let next_nws = bytes[j];
+            if next_nws.is_ascii_lowercase() {
+                // Treat as abbreviation; merge and continue.
+                i = j;
+                continue;
+            }
+            return Some(SentenceBoundary {
+                text_end: after,
+                consume_through: j,
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find every sentence boundary in `buf`, in order. Equivalent to
+/// repeatedly applying [`find_first_boundary`] to the unconsumed
+/// suffix.
+///
+/// Like [`find_first_boundary`], this is a pure function and does
+/// not mutate `buf`. Returned offsets are absolute (relative to
+/// the start of `buf`).
+pub fn find_all_boundaries(buf: &str) -> Vec<SentenceBoundary> {
+    let mut out = Vec::new();
+    let mut offset: usize = 0;
+    while offset < buf.len() {
+        let suffix = &buf[offset..];
+        let Some(b) = find_first_boundary(suffix) else {
+            break;
+        };
+        out.push(SentenceBoundary {
+            text_end: offset + b.text_end,
+            consume_through: offset + b.consume_through,
+        });
+        offset += b.consume_through;
+    }
+    out
+}
+
+/// Like [`find_all_boundaries`], plus one additional "EOF-relaxed"
+/// boundary when the buffer ends with a sentence terminator
+/// (followed only by whitespace, if any). Used by the
+/// paragraph-bounded `ChunkPlanner` so that timer-driven release
+/// rules can treat a trailing `Hello.` as a complete sentence
+/// without waiting for additional lookahead.
+///
+/// The strict abbreviation guard still applies: a trailing `Dr.`
+/// is NOT promoted to a sentence boundary.
+pub fn find_all_boundaries_relaxed(buf: &str) -> Vec<SentenceBoundary> {
+    let mut out = find_all_boundaries(buf);
+    let scan_from = out.last().map(|b| b.consume_through).unwrap_or(0);
+    if scan_from >= buf.len() {
+        return out;
+    }
+    let suffix = &buf[scan_from..];
+    let trimmed = suffix.trim_end();
+    if trimmed.is_empty() {
+        return out;
+    }
+    let last_char = trimmed.chars().next_back().expect("non-empty");
+    if !matches!(last_char, '.' | '!' | '?') {
+        return out;
+    }
+    let abs_term = scan_from + trimmed.len() - last_char.len_utf8();
+    if last_char == '.' && preceding_word_is_abbreviation(&buf[..abs_term]) {
+        return out;
+    }
+    out.push(SentenceBoundary {
+        text_end: abs_term + last_char.len_utf8(),
+        consume_through: buf.len(),
+    });
+    out
 }
 
 #[inline]
