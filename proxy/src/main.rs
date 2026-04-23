@@ -15,6 +15,9 @@ mod secrets;
 mod secrets_api;
 mod session_store;
 
+use providers::ProviderId;
+use secrets::{DEFAULT_CREDENTIAL, SecretsManager};
+
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -23,21 +26,36 @@ const TOKEN_MAX_RETRIES: u32 = 3;
 /// Delay between token fetch retries.
 const TOKEN_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Shared application state holding a reusable HTTP client.
+/// Shared application state holding a reusable HTTP client and the
+/// secrets manager used to resolve provider API keys for the
+/// `/token` and `/format` endpoints.
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
+    secrets: Arc<SecretsManager>,
 }
 
-#[derive(Deserialize)]
-struct TokenRequest {
-    api_key: String,
+/// JSON body returned when an upstream provider has no `default`
+/// credential configured. Spec §6.
+fn provider_not_configured(provider: ProviderId) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({
+            "error": "provider_not_configured",
+            "provider": provider.as_str(),
+            "credential": DEFAULT_CREDENTIAL,
+        })),
+    )
 }
 
-async fn fetch_token(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<TokenRequest>,
-) -> impl IntoResponse {
+async fn fetch_token(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let api_key = match state
+        .secrets
+        .resolve(ProviderId::AssemblyAi, DEFAULT_CREDENTIAL)
+    {
+        Some(key) => key,
+        None => return provider_not_configured(ProviderId::AssemblyAi),
+    };
     let client = &state.client;
     let url = format!("{}?expires_in_seconds=480", ASSEMBLYAI_TOKEN_URL);
 
@@ -50,7 +68,7 @@ async fn fetch_token(
 
         let resp = match client
             .get(&url)
-            .header("Authorization", &body.api_key)
+            .header("Authorization", &api_key)
             .send()
             .await
         {
@@ -107,7 +125,6 @@ async fn fetch_token(
 
 #[derive(Deserialize)]
 struct FormatRequest {
-    anthropic_key: String,
     /// Read-only context paragraphs (may be empty).
     #[serde(default)]
     context: String,
@@ -195,6 +212,13 @@ async fn format_text(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FormatRequest>,
 ) -> impl IntoResponse {
+    let api_key = match state
+        .secrets
+        .resolve(ProviderId::Anthropic, DEFAULT_CREDENTIAL)
+    {
+        Some(key) => key,
+        None => return provider_not_configured(ProviderId::Anthropic),
+    };
     let client = &state.client;
 
     // Build user message with optional context section
@@ -253,7 +277,7 @@ async fn format_text(
 
     let resp = match client
         .post(ANTHROPIC_MESSAGES_URL)
-        .header("x-api-key", &body.anthropic_key)
+        .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&payload)
@@ -478,8 +502,6 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
-    let state = Arc::new(AppState { client });
-
     // Conversation Mode dependency: load persona / model registries from
     // ~/.parley/. Loaders are non-fatal — missing dirs and bad files are
     // logged, the proxy still serves token + format. The orchestrator
@@ -512,8 +534,6 @@ async fn main() {
         prompts_dir: prompts_dir.clone(),
         sessions_dir: parley_dir.join("sessions"),
     });
-    let conversation_state =
-        conversation_api::ConversationApiState::new(registries, state.client.clone());
 
     // Secrets manager: backed by the OS keystore in production, env-var
     // override for the `default` credential, and a small JSON index file
@@ -524,6 +544,13 @@ async fn main() {
         Box::new(secrets::ProcessEnv),
         parley_dir.join("credentials.json"),
     ));
+
+    let state = Arc::new(AppState {
+        client: client.clone(),
+        secrets: secrets_manager.clone(),
+    });
+    let conversation_state =
+        conversation_api::ConversationApiState::new(registries, client, secrets_manager.clone());
     let secrets_state = secrets_api::SecretsApiState::new(secrets_manager);
 
     let app = Router::new()

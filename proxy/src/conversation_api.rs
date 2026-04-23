@@ -18,8 +18,10 @@
 //!   slice.
 //! - Provider construction supports Anthropic only; other
 //!   `LlmProviderTag` values return `501 Not Implemented`. The
-//!   `anthropic_key` is kept in memory inside the constructed
-//!   `AnthropicLlm`; it is never logged or echoed.
+//!   provider's API key is resolved at request time from the proxy's
+//!   [`SecretsManager`] using the optional `credential` field on the
+//!   request body (defaults to the `default` credential). Keys are
+//!   never logged or echoed.
 //! - SSE frames carry one [`OrchestratorEvent`] per `data:` line as
 //!   JSON. Stream terminates after `ai_turn_appended` (or after
 //!   `failed` followed by the final `state_changed` -> `idle`).
@@ -54,6 +56,8 @@ use crate::llm::anthropic::AnthropicLlm;
 use crate::orchestrator::{
     ConversationOrchestrator, OrchestratorContext, OrchestratorError, OrchestratorEvent,
 };
+use crate::providers::ProviderId;
+use crate::secrets::{DEFAULT_CREDENTIAL, SecretsManager};
 use crate::session_store::{FsSessionStore, SessionStore, SessionStoreError};
 
 /// Immutable view of the registries loaded once at proxy boot.
@@ -74,20 +78,27 @@ pub struct Registries {
 /// `inner` holds the live orchestrator (None until first `init`).
 /// `registries` is the immutable view of personas/models loaded at
 /// boot. `http` is the shared reqwest client used to construct
-/// real providers. `store` persists sessions to disk.
+/// real providers. `store` persists sessions to disk. `secrets`
+/// resolves provider API keys at request time from the proxy's
+/// keystore-backed credential vault.
 #[derive(Clone)]
 pub struct ConversationApiState {
     inner: Arc<Mutex<Option<Arc<ConversationOrchestrator>>>>,
     registries: Arc<Registries>,
     http: reqwest::Client,
     store: Arc<dyn SessionStore>,
+    secrets: Arc<SecretsManager>,
 }
 
 impl ConversationApiState {
-    /// Build a new state wrapper around the supplied registries and
-    /// HTTP client. Uses a [`FsSessionStore`] rooted at
-    /// `registries.sessions_dir`.
-    pub fn new(registries: Arc<Registries>, http: reqwest::Client) -> Self {
+    /// Build a new state wrapper around the supplied registries,
+    /// HTTP client, and secrets manager. Uses a [`FsSessionStore`]
+    /// rooted at `registries.sessions_dir`.
+    pub fn new(
+        registries: Arc<Registries>,
+        http: reqwest::Client,
+        secrets: Arc<SecretsManager>,
+    ) -> Self {
         let store: Arc<dyn SessionStore> =
             Arc::new(FsSessionStore::new(registries.sessions_dir.clone()));
         Self {
@@ -95,6 +106,7 @@ impl ConversationApiState {
             registries,
             http,
             store,
+            secrets,
         }
     }
 
@@ -105,12 +117,14 @@ impl ConversationApiState {
         registries: Arc<Registries>,
         http: reqwest::Client,
         store: Arc<dyn SessionStore>,
+        secrets: Arc<SecretsManager>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
             registries,
             http,
             store,
+            secrets,
         }
     }
 
@@ -158,11 +172,13 @@ pub struct InitRequest {
     pub ai_speaker_id: SpeakerId,
     /// Display label for the AI agent.
     pub ai_speaker_label: String,
-    /// Anthropic API key, used only when the active model's provider
-    /// tag is `Anthropic`. Kept in memory inside the constructed
-    /// `AnthropicLlm`. Never logged.
+    /// Named credential to draw the provider API key from. Defaults
+    /// to the `default` credential when omitted. The key itself is
+    /// resolved at request time from the proxy's [`SecretsManager`]
+    /// (env-var override allowed for `default`); it never crosses the
+    /// wire.
     #[serde(default)]
-    pub anthropic_key: Option<String>,
+    pub credential: Option<String>,
 }
 
 /// Body for `POST /conversation/turn`.
@@ -181,27 +197,28 @@ pub struct SwitchRequest {
     pub persona_id: PersonaId,
     /// Model config id to pair with that persona.
     pub model_config_id: ModelConfigId,
-    /// Anthropic API key — required when switching to a model whose
-    /// provider tag is `Anthropic` and that provider isn't already
-    /// registered on the active orchestrator. Same credential rules
-    /// as `/init` and `/load`.
+    /// Named credential to draw the provider API key from. Defaults
+    /// to `default` when omitted. Same resolution rules as
+    /// [`InitRequest::credential`].
     #[serde(default)]
-    pub anthropic_key: Option<String>,
+    pub credential: Option<String>,
 }
 
 /// Body for `POST /conversation/load`.
 ///
-/// Credentials are *not* persisted with the session, so loading
-/// requires re-supplying them. Same provider-construction rules as
-/// `/init`: only Anthropic is wired today.
+/// Credentials are *not* persisted with the session. Loading
+/// re-resolves the provider key from the proxy's [`SecretsManager`]
+/// using the optional `credential` field (defaults to `default`).
+/// Same provider-construction rules as `/init`: only Anthropic is
+/// wired today.
 #[derive(Debug, Deserialize)]
 pub struct LoadRequest {
     /// Id of a previously saved session.
     pub session_id: String,
-    /// Anthropic API key — required when the active model's provider
-    /// tag is `Anthropic`.
+    /// Named credential to use when reconstructing the provider for
+    /// the loaded session's active model. Defaults to `default`.
     #[serde(default)]
-    pub anthropic_key: Option<String>,
+    pub credential: Option<String>,
 }
 
 /// Compact summary of a saved session, returned by `GET
@@ -327,7 +344,12 @@ async fn init_session(
 
     // Build the provider for this model. Only Anthropic is wired in
     // this slice; other tags surface as 501.
-    let provider = build_provider(&model, &req, &state.http)?;
+    let provider = build_provider(
+        &model,
+        req.credential.as_deref(),
+        &state.http,
+        &state.secrets,
+    )?;
 
     let session = ConversationSession::new(
         req.session_id,
@@ -441,14 +463,12 @@ async fn switch_persona(
     // over unchanged; `switch_persona` then records the activation
     // so the next turn dispatches against the new pair.
     let mut snapshot = orchestrator.session_snapshot().await;
-    let synthetic = InitRequest {
-        session_id: snapshot.id.clone(),
-        persona_id: req.persona_id.clone(),
-        ai_speaker_id: String::new(),
-        ai_speaker_label: String::new(),
-        anthropic_key: req.anthropic_key.clone(),
-    };
-    let provider = build_provider(&model, &synthetic, &state.http)?;
+    let provider = build_provider(
+        &model,
+        req.credential.as_deref(),
+        &state.http,
+        &state.secrets,
+    )?;
     snapshot.switch_persona(req.persona_id.clone(), req.model_config_id.clone());
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
@@ -497,7 +517,12 @@ async fn load_session(
     // been deleted from disk) is a 422 — the file is fine, but the
     // current registries can no longer drive it.
     let active = session.active().clone();
-    let persona = state
+    // Verify the saved persona still exists in the live registry.
+    // The value itself is unused here (the orchestrator looks it up
+    // again at dispatch time), but the lookup must happen so we can
+    // surface drift as 422 rather than crashing on a missing key
+    // later.
+    let _persona = state
         .registries
         .personas
         .get(&active.persona_id)
@@ -526,17 +551,12 @@ async fn load_session(
             )
         })?;
 
-    // Synthesize an InitRequest just to reuse `build_provider`'s
-    // credential-policy logic. Speaker fields are unused in that
-    // path, so we pass placeholders.
-    let synthetic = InitRequest {
-        session_id: session.id.clone(),
-        persona_id: persona.id.clone(),
-        ai_speaker_id: String::new(),
-        ai_speaker_label: String::new(),
-        anthropic_key: req.anthropic_key.clone(),
-    };
-    let provider = build_provider(&model, &synthetic, &state.http)?;
+    let provider = build_provider(
+        &model,
+        req.credential.as_deref(),
+        &state.http,
+        &state.secrets,
+    )?;
 
     let snapshot = session.clone();
     let ctx = OrchestratorContext {
@@ -663,19 +683,24 @@ async fn require_session(
 
 fn build_provider(
     model: &ModelConfig,
-    req: &InitRequest,
+    credential: Option<&str>,
     http: &reqwest::Client,
+    secrets: &SecretsManager,
 ) -> Result<Arc<dyn LlmProvider>, (StatusCode, Json<ErrorBody>)> {
     match model.provider {
         LlmProviderTag::Anthropic => {
-            let key = req.anthropic_key.clone().ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorBody::new(
-                        "model uses Anthropic but no `anthropic_key` was supplied",
-                    )),
-                )
-            })?;
+            let credential = credential.unwrap_or(DEFAULT_CREDENTIAL);
+            let key = match secrets.resolve(ProviderId::Anthropic, credential) {
+                Some(k) => k,
+                None => {
+                    return Err((
+                        StatusCode::PRECONDITION_FAILED,
+                        Json(ErrorBody::new(format!(
+                            "no Anthropic credential '{credential}' configured—set one via /api/secrets first",
+                        ))),
+                    ));
+                }
+            };
             let id = format!("anthropic:{}", model.model_name);
             Ok(Arc::new(AnthropicLlm::new(
                 id,
@@ -746,6 +771,7 @@ mod tests {
     use super::*;
     use crate::llm::test_support::{MockItem, MockProvider};
     use crate::orchestrator::{ConversationOrchestrator, OrchestratorContext};
+    use crate::secrets::{InMemoryKeyStore, StaticEnv};
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request};
     use parley_core::chat::TokenUsage;
@@ -826,7 +852,40 @@ mod tests {
     }
 
     fn build_state(persona: Persona, model: ModelConfig) -> ConversationApiState {
-        ConversationApiState::new(registries_with(persona, model), reqwest::Client::new())
+        ConversationApiState::new(
+            registries_with(persona, model),
+            reqwest::Client::new(),
+            test_secrets_with_default("sk-test"),
+        )
+    }
+
+    /// Construct an in-memory [`SecretsManager`] that already has an
+    /// Anthropic `default` credential present. Used by the
+    /// happy-path tests that drive `init`/`switch`/`load` and need
+    /// `build_provider` to resolve a key.
+    fn test_secrets_with_default(key: &str) -> Arc<SecretsManager> {
+        let store = Box::new(InMemoryKeyStore::new());
+        let env = Box::new(StaticEnv::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = SecretsManager::new(store, env, tmp.path().join("credentials.json"));
+        mgr.set(ProviderId::Anthropic, DEFAULT_CREDENTIAL, key)
+            .unwrap();
+        // Leak the tempdir handle so the index file outlives the
+        // builder. Tests are short-lived; the OS reclaims on exit.
+        std::mem::forget(tmp);
+        Arc::new(mgr)
+    }
+
+    /// Construct an empty in-memory [`SecretsManager`] \u2014 use this
+    /// to verify `build_provider` returns 412 when no credential is
+    /// configured.
+    fn empty_test_secrets() -> Arc<SecretsManager> {
+        let store = Box::new(InMemoryKeyStore::new());
+        let env = Box::new(StaticEnv::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = SecretsManager::new(store, env, tmp.path().join("credentials.json"));
+        std::mem::forget(tmp);
+        Arc::new(mgr)
     }
 
     /// Drain the body of a 200 response into a String.
@@ -1203,7 +1262,11 @@ mod tests {
             prompts_dir: PathBuf::from("/x"),
             sessions_dir: PathBuf::from("/x-sessions"),
         });
-        let state = ConversationApiState::new(registries, reqwest::Client::new());
+        let state = ConversationApiState::new(
+            registries,
+            reqwest::Client::new(),
+            test_secrets_with_default("sk-test"),
+        );
         let provider: Arc<dyn LlmProvider> =
             Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
         install_orchestrator(&state, persona, model.clone(), provider).await;
@@ -1298,8 +1361,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_anthropic_without_key_is_400() {
-        let state = build_state(sample_persona("scholar", "m1", "x"), sample_model("m1"));
+    async fn init_anthropic_without_configured_credential_is_412() {
+        // build_state seeds a `default` Anthropic credential, so use
+        // an explicit empty manager to verify the missing-credential
+        // path returns `412 Precondition Failed` per the secrets
+        // storage spec §6.
+        let state = ConversationApiState::new(
+            registries_with(sample_persona("scholar", "m1", "x"), sample_model("m1")),
+            reqwest::Client::new(),
+            empty_test_secrets(),
+        );
         let app = router(state);
         let resp = app
             .oneshot(
@@ -1320,7 +1391,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
@@ -1380,7 +1451,12 @@ mod tests {
             sessions_dir: store_dir.clone(),
         });
         let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(store_dir));
-        ConversationApiState::with_store(registries, reqwest::Client::new(), store)
+        ConversationApiState::with_store(
+            registries,
+            reqwest::Client::new(),
+            store,
+            test_secrets_with_default("sk-test"),
+        )
     }
 
     #[tokio::test]
@@ -1537,7 +1613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_without_anthropic_key_is_400() {
+    async fn load_without_configured_credential_is_412() {
         let tmp = tempfile::TempDir::new().unwrap();
         let persona = sample_persona("scholar", "m1", "x");
         let model = sample_model("m1");
@@ -1551,7 +1627,20 @@ mod tests {
         let store = FsSessionStore::new(tmp.path());
         store.save(&session).await.unwrap();
 
-        let state = build_state_with_store_dir(persona, model, tmp.path().to_path_buf());
+        // Empty SecretsManager: load must hit `provider_not_configured`.
+        let registries = Arc::new(Registries {
+            personas: [(persona.id.clone(), persona)].into(),
+            models: [(model.id.clone(), model)].into(),
+            prompts_dir: PathBuf::from("/nonexistent"),
+            sessions_dir: tmp.path().to_path_buf(),
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(FsSessionStore::new(tmp.path()));
+        let state = ConversationApiState::with_store(
+            registries,
+            reqwest::Client::new(),
+            store,
+            empty_test_secrets(),
+        );
         let resp = router(state)
             .oneshot(
                 Request::builder()
@@ -1563,7 +1652,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
