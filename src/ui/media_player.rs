@@ -237,7 +237,9 @@ impl MediaSourcePlayer {
     /// after the last buffered MP3 frame has played out following
     /// an [`Self::end`] call.
     pub fn on_ended(&self, cb: Box<dyn Fn()>) {
-        let closure = Closure::<dyn FnMut()>::new(move || cb());
+        // `Box<dyn Fn()>` already satisfies `FnMut`, so we can hand
+        // it straight to `Closure::new` without an extra wrapper.
+        let closure = Closure::<dyn FnMut()>::new(cb);
         self.audio
             .set_onended(Some(closure.as_ref().unchecked_ref()));
         // Drop any previously installed handler and store the new

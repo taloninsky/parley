@@ -27,10 +27,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
+
+use crate::ui::media_player::MediaSourcePlayer;
+use crate::ui::use_voice_input::{VoiceInputHandle, VoiceState, use_voice_input};
 
 const PROXY_BASE: &str = "http://127.0.0.1:3033";
 
@@ -103,6 +108,10 @@ struct WireSession {
 
 #[derive(Debug, Clone, Deserialize)]
 struct WireTurn {
+    /// Server-assigned turn id. Used by the conversation view to
+    /// address the per-turn TTS cache for replay.
+    #[serde(default)]
+    id: String,
     /// `"user" | "assistant" | "system"` — drives the bubble color.
     role: String,
     content: String,
@@ -162,6 +171,33 @@ enum WireEvent {
         #[serde(default)]
         cost: WireCost,
     },
+    /// First sentence of the AI turn was dispatched to TTS.
+    /// Carries the AI turn id so the browser can open the audio
+    /// sibling stream (`GET /conversation/tts/{turn_id}`).
+    TtsStarted {
+        #[serde(default)]
+        turn_id: String,
+    },
+    /// One synthesized sentence finished. Not consumed in this
+    /// slice (the audio sibling stream carries the bytes); kept
+    /// in the enum so the SSE consumer doesn't drop the frame.
+    TtsSentenceDone {
+        #[serde(default)]
+        turn_id: String,
+        #[serde(default)]
+        sentence_index: u32,
+        #[serde(default)]
+        characters: u32,
+    },
+    /// All sentences for the AI turn finished synthesizing. The
+    /// proxy's cache is now complete; the audio sibling SSE will
+    /// emit `done` shortly. Triggers auto-listen in voice mode.
+    TtsFinished {
+        #[serde(default)]
+        turn_id: String,
+        #[serde(default)]
+        total_characters: u32,
+    },
     Failed {
         message: String,
     },
@@ -202,6 +238,23 @@ struct Message {
     /// historical assistant turns whose session file lacks
     /// provenance (older sessions).
     cost_usd: Option<f64>,
+    /// Server-assigned turn id, used to address the per-turn TTS
+    /// cache (`GET /conversation/tts/{turn_id}/replay`). `None`
+    /// for user turns and for AI turns from sessions that
+    /// pre-date the voice slice (no cache file on disk).
+    turn_id: Option<String>,
+}
+
+/// Conversation interaction mode. Drives whether the composer
+/// shows the text input or the voice push-to-talk surface, and
+/// whether auto-listen kicks in after a TTS playback completes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    /// Push-to-talk + auto-listen-after-AI. Default when an
+    /// ElevenLabs key is configured (TTS available).
+    Voice,
+    /// Text input only. Auto-listen suppressed.
+    Type,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -388,10 +441,179 @@ fn extract_data_payload(frame: &str) -> Option<String> {
     data
 }
 
+// ── TTS audio sibling stream ─────────────────────────────────────────
+
+/// Single SSE frame from `/conversation/tts/{turn_id}`. Mirrors the
+/// payloads produced by `proxy::conversation_api::stream_tts`. The
+/// proxy uses the JSON discriminant on every frame; the SSE
+/// `event:` line is informational and ignored.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TtsFrame {
+    /// Base64-encoded MP3 chunk.
+    Audio { b64: String },
+    /// Synthesis finished cleanly; cache is now closed.
+    Done,
+    /// Synthesis failed; the AI text has already landed but
+    /// playback won't complete.
+    Error { message: String },
+}
+
+/// Open `/conversation/tts/{turn_id}` and pump audio chunks into
+/// `player`. Returns when the stream closes (either `done` or an
+/// error). On `done`, calls `player.end()` so the `MediaSource`
+/// finalizes after the last buffered frame plays out. On error,
+/// stops the player and surfaces the message via `console.warn`.
+async fn consume_tts_stream(turn_id: String, player: MediaSourcePlayer) {
+    let url = format!("{PROXY_BASE}/conversation/tts/{turn_id}");
+    let req = match build_get(&url) {
+        Ok(r) => r,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("tts stream: build_get failed: {e}").into());
+            player.stop();
+            return;
+        }
+    };
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => {
+            player.stop();
+            return;
+        }
+    };
+    let resp_val = match JsFuture::from(window.fetch_with_request(&req)).await {
+        Ok(v) => v,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("tts stream: fetch failed: {e:?}").into());
+            player.stop();
+            return;
+        }
+    };
+    let resp: web_sys::Response = match resp_val.dyn_into() {
+        Ok(r) => r,
+        Err(_) => {
+            player.stop();
+            return;
+        }
+    };
+    if !resp.ok() {
+        web_sys::console::warn_1(&format!("tts stream: HTTP {}", resp.status()).into());
+        player.stop();
+        return;
+    }
+
+    let body = match resp.body() {
+        Some(b) => b,
+        None => {
+            player.stop();
+            return;
+        }
+    };
+    let reader = match body
+        .get_reader()
+        .dyn_into::<web_sys::ReadableStreamDefaultReader>()
+    {
+        Ok(r) => r,
+        Err(_) => {
+            player.stop();
+            return;
+        }
+    };
+    let decoder = match web_sys::TextDecoder::new_with_label("utf-8") {
+        Ok(d) => d,
+        Err(_) => {
+            player.stop();
+            return;
+        }
+    };
+
+    let mut buffer = String::new();
+    loop {
+        let read_result = match JsFuture::from(reader.read()).await {
+            Ok(v) => v,
+            Err(_) => {
+                player.stop();
+                return;
+            }
+        };
+        let done = js_sys::Reflect::get(&read_result, &"done".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let value = js_sys::Reflect::get(&read_result, &"value".into()).ok();
+
+        if let Some(value) = value
+            && !value.is_undefined()
+            && !value.is_null()
+        {
+            let chunk = decoder
+                .decode_with_buffer_source(&value.into())
+                .unwrap_or_default();
+            buffer.push_str(&chunk);
+            while let Some(idx) = buffer.find("\n\n") {
+                let frame = buffer[..idx].to_string();
+                buffer = buffer[idx + 2..].to_string();
+                let Some(json) = extract_data_payload(&frame) else {
+                    continue;
+                };
+                let Ok(parsed) = serde_json::from_str::<TtsFrame>(&json) else {
+                    continue;
+                };
+                match parsed {
+                    TtsFrame::Audio { b64 } => match B64.decode(b64.as_bytes()) {
+                        Ok(bytes) => {
+                            if let Err(e) = player.append(&bytes) {
+                                web_sys::console::warn_1(
+                                    &format!("tts append failed: {e:?}").into(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            web_sys::console::warn_1(
+                                &format!("tts base64 decode failed: {e}").into(),
+                            );
+                        }
+                    },
+                    TtsFrame::Done => {
+                        let _ = player.end();
+                        return;
+                    }
+                    TtsFrame::Error { message } => {
+                        web_sys::console::warn_1(&format!("tts stream error: {message}").into());
+                        player.stop();
+                        return;
+                    }
+                }
+            }
+        }
+
+        if done {
+            // Stream closed without an explicit `done` frame —
+            // finalize the player anyway so playback can complete.
+            let _ = player.end();
+            return;
+        }
+    }
+}
+
 // ── Component ────────────────────────────────────────────────────────
 
-/// Top-level Dioxus view that drives a single conversation against the
-/// proxy.
+/// Coarse playback state for the live TTS player. Drives the
+/// Pause/Play/Stop button visibility on the live AI bubble.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlaybackStatus {
+    /// No live player attached.
+    Idle,
+    /// Audio is actively playing (or buffering).
+    Playing,
+    /// User clicked Pause; resume via Play.
+    Paused,
+    /// User clicked Stop; player is detached, no resume possible.
+    Stopped,
+}
+
+/// Top-level Dioxus view that drives a single conversation against
+/// the proxy.
 #[component]
 pub fn ConversationView() -> Element {
     // ── Local signals ────────────────────────────────────────────
@@ -428,6 +650,64 @@ pub fn ConversationView() -> Element {
     // "Switch" button uses that delta to decide if it's actionable.
     let mut applied_persona = use_signal(String::new);
     let mut applied_model = use_signal(String::new);
+
+    // ── Voice / TTS signals ──────────────────────────────────────
+    // Default to Type mode so the page doesn't grab the mic on
+    // load. Users flip to Voice via the header toggle. The
+    // voice-input hook owns its own AssemblyAI session lifecycle.
+    let mut mode = use_signal(|| Mode::Type);
+    let voice = use_voice_input();
+    // Live TTS playback for the most recently dispatched AI turn.
+    // The player itself is non-Send (web-sys handles), but
+    // Dioxus's default `UnsyncStorage` on WASM accepts that.
+    // Cleared back to `None` when the user clicks Stop or the
+    // audio's `ended` event fires.
+    let mut live_player: Signal<Option<MediaSourcePlayer>> = use_signal(|| None);
+    let mut live_player_turn: Signal<Option<String>> = use_signal(|| None);
+    let mut playback_status = use_signal(|| PlaybackStatus::Idle);
+
+    // ── Voice → submit bridge ────────────────────────────────────
+    // The voice hook flips through Listening → Finalizing → Idle
+    // when Send Turn is clicked; once it lands on Idle and we have
+    // collected final text, copy it into `input` and submit. The
+    // dedicated `last_voice_state` signal lets us detect the
+    // transition rather than firing on every Idle render.
+    let mut last_voice_state = use_signal(|| VoiceState::Idle);
+    use_effect(move || {
+        let current = voice.state.read().clone();
+        let previous = last_voice_state.peek().clone();
+        if current != previous {
+            last_voice_state.set(current.clone());
+            // We only care about the Finalizing → Idle edge; that's
+            // when the hook has flushed AssemblyAI and the final
+            // text is stable. Any other transition is bookkeeping.
+            if matches!(previous, VoiceState::Finalizing) && matches!(current, VoiceState::Idle) {
+                let text = voice.final_text.peek().trim().to_string();
+                if !text.is_empty() {
+                    input.set(text);
+                    submit_turn(SendHandles {
+                        selected_credential,
+                        selected_persona,
+                        selected_model,
+                        session_id,
+                        session_initialized,
+                        messages,
+                        streaming,
+                        input,
+                        status,
+                        available_sessions,
+                        applied_persona,
+                        applied_model,
+                        mode,
+                        voice,
+                        live_player,
+                        live_player_turn,
+                        playback_status,
+                    });
+                }
+            }
+        }
+    });
 
     // ── Bootstrap: load personas + models on mount ───────────────
     use_future(move || async move {
@@ -484,6 +764,11 @@ pub fn ConversationView() -> Element {
         available_sessions,
         applied_persona,
         applied_model,
+        mode,
+        voice,
+        live_player,
+        live_player_turn,
+        playback_status,
     };
 
     rsx! {
@@ -582,7 +867,50 @@ pub fn ConversationView() -> Element {
         div { class: "convo-root",
             style: "max-width: 760px; margin: 0 auto; padding: 1rem; font-family: system-ui, sans-serif;",
 
-            h2 { "Conversation" }
+            // Header row: title + Voice/Type mode toggle. Toggling
+            // away from Voice while listening immediately stops
+            // capture so the mic LED clears; toggling into Voice is
+            // a no-op until the user clicks Start Turn.
+            div { style: "display: flex; align-items: center; justify-content: space-between; gap: 1rem;",
+                h2 { style: "margin: 0;", "Conversation" }
+                div { style: "display: flex; gap: 0.25rem; align-items: center;",
+                    span { style: "font-size: 0.8rem; color: #8888aa;", "Mode:" }
+                    button {
+                        class: "convo-send",
+                        style: if matches!(mode(), Mode::Voice) {
+                            "padding: 0.25rem 0.6rem; background: #4ecca3; color: #1a1a2e;"
+                        } else {
+                            "padding: 0.25rem 0.6rem;"
+                        },
+                        onclick: move |_| {
+                            if !matches!(mode(), Mode::Voice) {
+                                mode.set(Mode::Voice);
+                            }
+                        },
+                        "Voice"
+                    }
+                    button {
+                        class: "convo-send",
+                        style: if matches!(mode(), Mode::Type) {
+                            "padding: 0.25rem 0.6rem; background: #4ecca3; color: #1a1a2e;"
+                        } else {
+                            "padding: 0.25rem 0.6rem;"
+                        },
+                        onclick: move |_| {
+                            if !matches!(mode(), Mode::Type) {
+                                // Stop any in-flight capture so the
+                                // mic releases immediately on the
+                                // mode flip.
+                                if matches!(*voice.state.peek(), VoiceState::Listening) {
+                                    voice.stop.call(());
+                                }
+                                mode.set(Mode::Type);
+                            }
+                        },
+                        "Type"
+                    }
+                }
+            }
 
             if let Some(err) = bootstrap_error() {
                 div { style: "color: #ff6b81; padding: 0.5rem; border: 1px solid #e94560; border-radius: 4px; margin-bottom: 1rem; background: #3a1020;",
@@ -670,6 +998,11 @@ pub fn ConversationView() -> Element {
                                                 role,
                                                 content: t.content,
                                                 cost_usd,
+                                                turn_id: if t.id.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(t.id)
+                                                },
                                             });
                                         }
                                     }
@@ -940,6 +1273,86 @@ pub fn ConversationView() -> Element {
                                 "${usd:.4}"
                             }
                         }
+                        // Per-turn audio controls. AI turns only.
+                        // Live turn (turn id matches the live
+                        // player's binding): Pause / Play / Stop.
+                        // Historical turn with a known turn id:
+                        // Play (replay via the cached MP3) /
+                        // Stop. User turns and AI turns without
+                        // a turn id (older sessions, errors)
+                        // get no controls.
+                        if matches!(msg.role, Role::Assistant)
+                            && let Some(tid) = msg.turn_id.as_ref()
+                        {
+                            {
+                                let is_live = live_player_turn
+                                    .read()
+                                    .as_ref()
+                                    .is_some_and(|t| t == tid);
+                                let tid_owned = tid.clone();
+                                rsx! {
+                                    div { style: "margin-top: 0.5rem; display: flex; gap: 0.4rem;",
+                                        if is_live {
+                                            // Live controls drive
+                                            // the in-memory
+                                            // MediaSourcePlayer.
+                                            if matches!(playback_status(), PlaybackStatus::Playing) {
+                                                button {
+                                                    class: "convo-send",
+                                                    style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
+                                                    onclick: move |_| {
+                                                        if let Some(p) = live_player.peek().clone() {
+                                                            p.pause();
+                                                            playback_status.set(PlaybackStatus::Paused);
+                                                        }
+                                                    },
+                                                    "Pause"
+                                                }
+                                            } else if matches!(playback_status(), PlaybackStatus::Paused) {
+                                                button {
+                                                    class: "convo-send",
+                                                    style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
+                                                    onclick: move |_| {
+                                                        if let Some(p) = live_player.peek().clone() {
+                                                            let _ = p.play();
+                                                            playback_status.set(PlaybackStatus::Playing);
+                                                        }
+                                                    },
+                                                    "Play"
+                                                }
+                                            }
+                                            button {
+                                                class: "convo-send",
+                                                style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
+                                                onclick: move |_| {
+                                                    if let Some(p) = live_player.peek().clone() {
+                                                        p.stop();
+                                                    }
+                                                    live_player.set(None);
+                                                    live_player_turn.set(None);
+                                                    playback_status.set(PlaybackStatus::Stopped);
+                                                },
+                                                "Stop"
+                                            }
+                                        } else {
+                                            // Historical replay via
+                                            // the cached MP3.
+                                            // `<audio>` element
+                                            // owns its own UI;
+                                            // simplest path is to
+                                            // expose the browser's
+                                            // native controls.
+                                            audio {
+                                                src: "{PROXY_BASE}/conversation/tts/{tid_owned}/replay",
+                                                controls: true,
+                                                preload: "none",
+                                                style: "height: 1.6rem;",
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if !streaming().is_empty() {
@@ -990,26 +1403,91 @@ pub fn ConversationView() -> Element {
             }
 
             // ── Composer ─────────────────────────────────────
-            div { style: "display: flex; gap: 0.5rem;",
-                textarea {
-                    style: "flex: 1; min-height: 4rem; resize: vertical;",
-                    placeholder: "Type a message and press Ctrl+Enter to send.",
-                    value: "{input}",
-                    oninput: move |e| input.set(e.value()),
-                    onkeydown: move |e| {
-                        let key = e.key();
-                        let is_enter = matches!(key, Key::Enter);
-                        if is_enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
-                            e.prevent_default();
-                            submit_turn(handles);
-                        }
-                    },
+            // Two surfaces; only one is shown based on `mode`.
+            // Type: textarea + Send. Voice: live transcript +
+            // Start/Send Turn buttons.
+            if matches!(mode(), Mode::Type) {
+                div { style: "display: flex; gap: 0.5rem;",
+                    textarea {
+                        style: "flex: 1; min-height: 4rem; resize: vertical;",
+                        placeholder: "Type a message and press Ctrl+Enter to send.",
+                        value: "{input}",
+                        oninput: move |e| input.set(e.value()),
+                        onkeydown: move |e| {
+                            let key = e.key();
+                            let is_enter = matches!(key, Key::Enter);
+                            if is_enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
+                                e.prevent_default();
+                                submit_turn(handles);
+                            }
+                        },
+                    }
+                    button {
+                        class: "convo-send",
+                        disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                        onclick: move |_| submit_turn(handles),
+                        "Send"
+                    }
                 }
-                button {
-                    class: "convo-send",
-                    disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
-                    onclick: move |_| submit_turn(handles),
-                    "Send"
+            } else {
+                // Voice composer. Live transcript shows the
+                // accumulating final text plus the most recent
+                // partial. The Start/Send buttons are mutually
+                // exclusive: Start while idle, Send while
+                // listening (force-flushes the trailing partial
+                // and submits via the side effect below).
+                div { style: "display: flex; flex-direction: column; gap: 0.5rem;",
+                    div {
+                        style: "background: #12284a; border: 1px solid #2a3960; border-radius: 6px; padding: 0.5rem 0.75rem; min-height: 3rem; font-family: inherit; white-space: pre-wrap;",
+                        if voice.final_text.read().is_empty() && voice.interim_text.read().is_empty() {
+                            span { style: "color: #8888aa; font-style: italic;",
+                                match *voice.state.read() {
+                                    VoiceState::Idle => "Press Start Turn and speak…",
+                                    VoiceState::Listening => "Listening…",
+                                    VoiceState::Finalizing => "Finalizing…",
+                                    VoiceState::Error(_) => "Voice error — see status row",
+                                }
+                            }
+                        } else {
+                            span { "{voice.final_text.read()}" }
+                            if !voice.interim_text.read().is_empty() {
+                                if !voice.final_text.read().is_empty() {
+                                    " "
+                                }
+                                span { style: "color: #c0c0d0;",
+                                    "{voice.interim_text.read()}"
+                                }
+                            }
+                        }
+                    }
+                    div { style: "display: flex; gap: 0.5rem; align-items: center;",
+                        if matches!(*voice.state.read(), VoiceState::Listening | VoiceState::Finalizing) {
+                            button {
+                                class: "convo-send",
+                                disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming)
+                                    || matches!(*voice.state.read(), VoiceState::Finalizing),
+                                onclick: move |_| {
+                                    // Force-end AssemblyAI; the
+                                    // hook transitions through
+                                    // Finalizing → Idle, and the
+                                    // use_effect below submits
+                                    // when the final text is ready.
+                                    voice.stop.call(());
+                                },
+                                "Send Turn"
+                            }
+                        } else {
+                            button {
+                                class: "convo-send",
+                                disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                                onclick: move |_| voice.start.call(()),
+                                "Start Turn"
+                            }
+                        }
+                        if let VoiceState::Error(msg) = &*voice.state.read() {
+                            span { style: "color: #ff6b81; font-size: 0.8rem;", "{msg}" }
+                        }
+                    }
                 }
             }
         }
@@ -1040,6 +1518,22 @@ struct SendHandles {
     /// when the dropdowns have drifted from the active state.
     applied_persona: Signal<String>,
     applied_model: Signal<String>,
+    /// Voice/Type interaction mode. Drives the composer surface
+    /// and whether auto-listen kicks in after TTS completes.
+    mode: Signal<Mode>,
+    /// Voice input hook handle. Used by the consumer to trigger
+    /// auto-listen after the AI's TTS playback finishes.
+    voice: VoiceInputHandle,
+    /// The currently-attached live `MediaSourcePlayer`, if any.
+    /// `None` between turns and after Stop. Bubble UI consults
+    /// this (paired with `live_player_turn`) to decide whether
+    /// to show live (Pause/Play/Stop) or replay (Play/Stop)
+    /// controls.
+    live_player: Signal<Option<MediaSourcePlayer>>,
+    /// AI turn id the live player is bound to.
+    live_player_turn: Signal<Option<String>>,
+    /// Reactive playback state for the live player.
+    playback_status: Signal<PlaybackStatus>,
 }
 
 /// Validate inputs, optimistically render the user turn, kick off the
@@ -1064,6 +1558,11 @@ fn submit_turn(h: SendHandles) {
         available_sessions,
         mut applied_persona,
         mut applied_model,
+        mode,
+        voice,
+        live_player,
+        live_player_turn,
+        playback_status,
     } = h;
 
     let user_text = input.peek().trim().to_string();
@@ -1087,6 +1586,7 @@ fn submit_turn(h: SendHandles) {
             role: Role::User,
             content: user_text.clone(),
             cost_usd: None,
+            turn_id: None,
         })
     });
     input.set(String::new());
@@ -1181,7 +1681,19 @@ fn submit_turn(h: SendHandles) {
         }
 
         status.set(SendStatus::Streaming);
-        consume_turn_response(resp, messages, streaming, status, available_sessions).await;
+        consume_turn_response(
+            resp,
+            messages,
+            streaming,
+            status,
+            available_sessions,
+            mode,
+            voice,
+            live_player,
+            live_player_turn,
+            playback_status,
+        )
+        .await;
     });
 }
 
@@ -1195,6 +1707,11 @@ fn retry_pending(h: SendHandles) {
         streaming,
         mut status,
         available_sessions,
+        mode,
+        voice,
+        live_player,
+        live_player_turn,
+        playback_status,
         ..
     } = h;
     status.set(SendStatus::Sending);
@@ -1235,7 +1752,19 @@ fn retry_pending(h: SendHandles) {
             return;
         }
         status.set(SendStatus::Streaming);
-        consume_turn_response(resp, messages, streaming, status, available_sessions).await;
+        consume_turn_response(
+            resp,
+            messages,
+            streaming,
+            status,
+            available_sessions,
+            mode,
+            voice,
+            live_player,
+            live_player_turn,
+            playback_status,
+        )
+        .await;
     });
 }
 
@@ -1295,15 +1824,21 @@ fn dismiss_pending(h: SendHandles) {
 
 /// Drain an SSE response body from `/conversation/turn` (or
 /// `/conversation/retry`) into the message log. Owns the post-stream
-/// status update + auto-save + picker refresh. Extracted so both
-/// fresh submissions and retries share the exact same consumer
-/// behavior.
+/// status update + auto-save + picker refresh + TTS audio sibling
+/// stream wiring + auto-listen handoff. Extracted so both fresh
+/// submissions and retries share the exact same consumer behavior.
+#[allow(clippy::too_many_arguments)]
 async fn consume_turn_response(
     resp: web_sys::Response,
     mut messages: Signal<Vec<Message>>,
     mut streaming: Signal<String>,
     mut status: Signal<SendStatus>,
     mut available_sessions: Signal<Vec<SessionSummary>>,
+    mode: Signal<Mode>,
+    voice: VoiceInputHandle,
+    mut live_player: Signal<Option<MediaSourcePlayer>>,
+    mut live_player_turn: Signal<Option<String>>,
+    mut playback_status: Signal<PlaybackStatus>,
 ) {
     // `drain_sse` takes an `FnMut`, so the closure can capture
     // signal handles by value (they're Copy) and mutate them
@@ -1314,25 +1849,79 @@ async fn consume_turn_response(
     // Auto-save signaling rides on the same channel: when the
     // assistant turn finalizes we set `saved_pending = true` and
     // fire the `/conversation/save` POST after the stream ends.
+    //
+    // TTS coordination: `TtsStarted` triggers creation of a
+    // `MediaSourcePlayer` and a sibling SSE consumer task that
+    // pumps audio chunks into it. `TtsFinished` (or
+    // `AiTurnAppended` when TTS is off) drives the `had_tts`
+    // flag, which the post-stream block uses to decide whether
+    // to wait on the player's `ended` event before auto-listen
+    // — versus triggering auto-listen immediately when there
+    // was no audio to wait for.
     let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let save_pending: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let had_tts: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let failure_inner = failure.clone();
     let save_inner = save_pending.clone();
+    let had_tts_inner = had_tts.clone();
     drain_sse(resp, move |ev| match ev {
         WireEvent::Token { delta } => {
             streaming.with_mut(|s| s.push_str(&delta));
         }
-        WireEvent::AiTurnAppended { cost, .. } => {
+        WireEvent::AiTurnAppended { turn_id, cost } => {
             let final_text = streaming.peek().clone();
             streaming.set(String::new());
+            let id = if turn_id.is_empty() {
+                None
+            } else {
+                Some(turn_id)
+            };
             messages.with_mut(|m| {
                 m.push(Message {
                     role: Role::Assistant,
                     content: final_text,
                     cost_usd: Some(cost.usd),
+                    turn_id: id,
                 })
             });
             *save_inner.borrow_mut() = true;
+        }
+        WireEvent::TtsStarted { turn_id } => {
+            if turn_id.is_empty() {
+                return;
+            }
+            // Replace any prior live player with a fresh one. The
+            // previous player (if it survived through to here)
+            // gets dropped, which detaches its audio element.
+            // Spec: `MediaSourcePlayer::stop` revokes the object
+            // URL so the browser reclaims the buffer.
+            if let Some(prev) = live_player.peek().clone() {
+                prev.stop();
+            }
+            match MediaSourcePlayer::new() {
+                Ok(player) => {
+                    let player_for_task = player.clone();
+                    let tid_for_task = turn_id.clone();
+                    spawn_local(async move {
+                        consume_tts_stream(tid_for_task, player_for_task).await;
+                    });
+                    let _ = player.play();
+                    live_player.set(Some(player));
+                    live_player_turn.set(Some(turn_id));
+                    playback_status.set(PlaybackStatus::Playing);
+                    *had_tts_inner.borrow_mut() = true;
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!("MediaSourcePlayer::new failed: {e:?}").into(),
+                    );
+                }
+            }
+        }
+        WireEvent::TtsFinished { .. } | WireEvent::TtsSentenceDone { .. } => {
+            // Synthesis-side bookkeeping; playback continues
+            // until the audio sibling stream emits `done` and
+            // the player's underlying buffer drains.
         }
         WireEvent::Failed { message } => {
             *failure_inner.borrow_mut() = Some(message);
@@ -1373,6 +1962,55 @@ async fn consume_turn_response(
                 status.set(SendStatus::Failed(format!("auto-save build failed: {e}")));
             }
         }
+    }
+
+    // ── Auto-listen handoff ─────────────────────────────────
+    // Skip when the turn failed (don't barge on the user with
+    // an open mic on top of an error banner) or when the user
+    // is in Type mode.
+    let is_voice = matches!(*mode.peek(), Mode::Voice);
+    let failed = failure.borrow().is_some();
+    if failed || !is_voice {
+        return;
+    }
+    if *had_tts.borrow() {
+        // Defer auto-listen until the audio element fires its
+        // `ended` event. The `MediaSourcePlayer::on_ended` hook
+        // also flips `playback_status` back to `Idle` so the
+        // bubble UI demotes from live controls to a replay
+        // button.
+        if let Some(player) = live_player.peek().clone() {
+            voice.start.call(());
+            let cb_voice = voice;
+            // Replace any previous on_ended; the closure clears
+            // the live player slot too so the UI picks up the
+            // transition. Signals are `Copy`, so we shadow with
+            // local `mut` bindings inside the closure body —
+            // `Fn` closures can't borrow their captures mutably,
+            // but they can copy them on each invocation.
+            let lp = live_player;
+            let lpt = live_player_turn;
+            let ps = playback_status;
+            player.on_ended(Box::new(move || {
+                let mut lp = lp;
+                let mut lpt = lpt;
+                let mut ps = ps;
+                lp.set(None);
+                lpt.set(None);
+                ps.set(PlaybackStatus::Idle);
+                cb_voice.start.call(());
+            }));
+        } else {
+            // Edge case: TtsStarted never fired (synthesis
+            // failed before the first audio chunk). Trigger
+            // auto-listen anyway so the user isn't stuck
+            // waiting for audio that won't come.
+            voice.start.call(());
+        }
+    } else {
+        // TTS off (no provider configured). The AI turn just
+        // landed; pick up the mic immediately.
+        voice.start.call(());
     }
 }
 
