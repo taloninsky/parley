@@ -82,6 +82,26 @@ impl ElevenLabsTts {
     }
 }
 
+/// Whether the given ElevenLabs model id accepts the `previous_text`
+/// (and `next_text`) request fields.
+///
+/// As of 2026-04 the v3 model returns HTTP 400 with
+/// `"unsupported_model"` when these fields are present, while the
+/// pre-v3 models (`eleven_turbo_v2_5`, `eleven_multilingual_v2`,
+/// `eleven_monolingual_v1`) accept them. We therefore allow-list the
+/// pre-v3 family and deny everything else by default; if ElevenLabs
+/// adds support to v3 later, flipping this to a deny-list of just
+/// `eleven_v3` is a one-line change.
+fn model_supports_previous_text(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "eleven_turbo_v2_5"
+            | "eleven_turbo_v2"
+            | "eleven_multilingual_v2"
+            | "eleven_monolingual_v1"
+    )
+}
+
 #[async_trait]
 impl TtsProvider for ElevenLabsTts {
     fn id(&self) -> &'static str {
@@ -93,12 +113,21 @@ impl TtsProvider for ElevenLabsTts {
         request: TtsRequest,
         ctx: SynthesisContext,
     ) -> Result<TtsStream, TtsError> {
-        // `ctx.previous_text` is forwarded as ElevenLabs'
-        // `previous_text` field so v3 picks prosody appropriate to
-        // continuing speech rather than treating each chunk as a
-        // fresh utterance. Without this, paragraph-leading function
-        // words like "In", "So", "But" get read with an exaggerated
-        // sentence-opener intonation and a small leading pause.
+        // `ctx.previous_text` would normally be forwarded as
+        // ElevenLabs' `previous_text` field for cross-chunk prosody
+        // continuity \u2014 but the v3 model explicitly rejects it
+        // (HTTP 400 "unsupported_model: Providing previous_text or
+        // next_text is not yet supported with the 'eleven_v3'
+        // model."). The pre-v3 turbo / multilingual models accept
+        // it. We therefore gate on the model id: only forward when
+        // the model is known to support it.
+        //
+        // Trade-off: on v3 (our current default), paragraph-leading
+        // short words like "In", "So", "But" can be read with an
+        // exaggerated sentence-opener intonation. Switching to
+        // `eleven_turbo_v2_5` or `eleven_multilingual_v2` fixes the
+        // prosody but loses expressive-tag support.
+        //
         // `provider_state` (v2 request-id stitching) is still
         // unused; a future v2 adapter would read it here.
         if request.text.is_empty() {
@@ -115,7 +144,8 @@ impl TtsProvider for ElevenLabsTts {
                 "similarity_boost": 0.75,
             }
         });
-        if let Some(prev) = ctx.previous_text.as_deref()
+        if model_supports_previous_text(ELEVENLABS_MODEL_ID)
+            && let Some(prev) = ctx.previous_text.as_deref()
             && !prev.is_empty()
         {
             // `as_object_mut().unwrap()` is safe: we just built `body`
@@ -298,25 +328,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synthesize_forwards_previous_text_when_set() {
-        // When `SynthesisContext.previous_text` is `Some(...)`, the
-        // request body must include a `previous_text` field with
-        // that value. This is what tells v3 to continue prosody
-        // instead of treating the chunk as a fresh utterance.
-        use wiremock::matchers::body_partial_json;
+    async fn synthesize_omits_previous_text_on_v3_even_when_provided() {
+        // The v3 model (our pinned default) rejects `previous_text`
+        // with HTTP 400. Even if the orchestrator provides context,
+        // the body must omit the field.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/text-to-speech/voice-1/stream"))
-            .and(body_partial_json(serde_json::json!({
-                "text": "Lean is great.",
-                "previous_text": "Tactics are how you build proofs.",
-            })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "audio/mpeg")
                     .set_body_bytes(b"\xff\xfb\x90\x00fake" as &[u8]),
             )
-            .expect(1)
             .mount(&server)
             .await;
 
@@ -334,12 +357,33 @@ mod tests {
             )
             .await
             .unwrap();
-        // Drain the stream so the request actually fires before the
-        // mock server is dropped.
         while let Some(item) = stream.next().await {
             item.unwrap();
         }
-        // `expect(1)` on the mock asserts on drop.
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body = std::str::from_utf8(&received[0].body).unwrap();
+        assert!(
+            !body.contains("previous_text"),
+            "v3 request body must not include previous_text: {body}",
+        );
+        // Sanity: the model id is the v3 default we're guarding
+        // against.
+        assert!(body.contains("\"model_id\":\"eleven_v3\""));
+    }
+
+    #[test]
+    fn model_support_table_matches_known_eleven_models() {
+        // Pre-v3 models accept previous_text.
+        assert!(model_supports_previous_text("eleven_turbo_v2_5"));
+        assert!(model_supports_previous_text("eleven_multilingual_v2"));
+        assert!(model_supports_previous_text("eleven_monolingual_v1"));
+        // v3 (our default) does not.
+        assert!(!model_supports_previous_text(ELEVENLABS_MODEL_ID));
+        assert!(!model_supports_previous_text("eleven_v3"));
+        // Unknown ids deny by default \u2014 safer than guessing.
+        assert!(!model_supports_previous_text("eleven_v4"));
     }
 
     #[tokio::test]
