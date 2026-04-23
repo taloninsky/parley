@@ -12,6 +12,7 @@ mod orchestrator;
 mod providers;
 mod registry;
 mod secrets;
+mod secrets_api;
 mod session_store;
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
@@ -514,11 +515,23 @@ async fn main() {
     let conversation_state =
         conversation_api::ConversationApiState::new(registries, state.client.clone());
 
+    // Secrets manager: backed by the OS keystore in production, env-var
+    // override for the `default` credential, and a small JSON index file
+    // at `~/.parley/credentials.json` recording which named credentials
+    // exist (the `keyring` crate has no portable enumeration API).
+    let secrets_manager = Arc::new(secrets::SecretsManager::new(
+        Box::new(secrets::KeyringStore::new()),
+        Box::new(secrets::ProcessEnv),
+        parley_dir.join("credentials.json"),
+    ));
+    let secrets_state = secrets_api::SecretsApiState::new(secrets_manager);
+
     let app = Router::new()
         .route("/token", post(fetch_token))
         .route("/format", post(format_text))
         .with_state(state)
         .merge(conversation_api::router(conversation_state))
+        .merge(secrets_api::router(secrets_state))
         .layer(cors);
 
     let addr = "127.0.0.1:3033";
