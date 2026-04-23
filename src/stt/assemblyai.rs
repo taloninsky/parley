@@ -157,9 +157,11 @@ impl AssemblyAiSession {
             let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 if let Ok(text) = event.data().dyn_into::<js_sys::JsString>() {
                     let text: String = text.into();
-                    web_sys::console::log_1(
-                        &format!("AssemblyAI msg: {}", &text[..text.len().min(300)]).into(),
-                    );
+                    // Truncate the log preview by char count, not
+                    // byte count — slicing inside a multi-byte
+                    // UTF-8 sequence (e.g. an em-dash) panics.
+                    let preview: String = text.chars().take(300).collect();
+                    web_sys::console::log_1(&format!("AssemblyAI msg: {preview}").into());
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
                         match parsed.get("type").and_then(|t| t.as_str()) {
                             Some("Turn") => {
