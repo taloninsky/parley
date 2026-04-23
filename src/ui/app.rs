@@ -829,11 +829,11 @@ pub fn App() -> Element {
 
     // ── Record (core logic) ─────────────────────────────────────────
     let mut start_recording = move || {
-        let key = (api_key)().trim().to_string();
-        if key.is_empty() {
-            error_msg.set(Some("Set your API key in Settings first.".into()));
-            return;
-        }
+        // The AssemblyAI key now lives in the proxy's keystore;
+        // we just hit /token and let the proxy return 412 if it's
+        // not configured. The cookie-backed `api_key` signal is
+        // legacy and will be removed in the upcoming Settings UI
+        // pass.
         error_msg.set(None);
         status_msg.set("Connecting…".into());
         rec_state.set(RecState::Recording);
@@ -845,7 +845,7 @@ pub fn App() -> Element {
         spawn(async move {
             // Fetch token for speaker 1
             status_msg.set("Fetching token…".into());
-            let token1 = match fetch_temp_token(&key).await {
+            let token1 = match fetch_temp_token().await {
                 Ok(t) => t,
                 Err(e) => {
                     error_msg.set(Some(format!("Token fetch failed: {e}")));
@@ -857,7 +857,7 @@ pub fn App() -> Element {
 
             // Fetch token for speaker 2 if multi-speaker
             let token2 = if multi {
-                match fetch_temp_token(&key).await {
+                match fetch_temp_token().await {
                     Ok(t) => Some(t),
                     Err(e) => {
                         error_msg.set(Some(format!("Token fetch (speaker 2) failed: {e}")));
@@ -1755,7 +1755,7 @@ pub fn App() -> Element {
                     }
                     // Full-transcript Sonnet pass on stop
                     if do_format_on_stop {
-                        let sonnet = "claude-sonnet-4-6-20250514";
+                        let sonnet = "claude-sonnet-4-6";
                         let text = (t)();
                         if !text.is_empty()
                             && let Some(result) =
@@ -1786,7 +1786,7 @@ pub fn App() -> Element {
                 let mut t = transcript;
                 let mut llm = llm_cost;
                 spawn(async move {
-                    let sonnet = "claude-sonnet-4-6-20250514";
+                    let sonnet = "claude-sonnet-4-6";
                     let text = (t)();
                     if !text.is_empty()
                         && let Some(result) =
@@ -1960,7 +1960,7 @@ pub fn App() -> Element {
     // ── Reformat (on-demand, full transcript) ───────────────────────
     let on_reformat = move |_: Event<MouseData>| {
         let key = (anthropic_key)();
-        let model = "claude-sonnet-4-6-20250514".to_string();
+        let model = "claude-sonnet-4-6".to_string();
         let multi = (speaker2_enabled)();
         let mut t = transcript;
         let mut r = reformatting;
@@ -2297,7 +2297,7 @@ pub fn App() -> Element {
                                         save("parley_format_model", &val);
                                     },
                                     option { value: "claude-haiku-4-5-20251001", "Haiku 4.5 (fast, cheap)" }
-                                    option { value: "claude-sonnet-4-6-20250514", "Sonnet 4.6 (better)" }
+                                    option { value: "claude-sonnet-4-6", "Sonnet 4.6 (better)" }
                                 }
 
                                 label { class: "checkbox-label",

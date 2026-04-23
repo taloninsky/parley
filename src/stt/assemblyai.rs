@@ -33,10 +33,12 @@ pub struct TurnEvent {
 }
 
 /// Fetch a temporary streaming token via the local proxy server.
-/// The proxy runs at localhost:3033 and forwards the request to AssemblyAI's
-/// v3 token endpoint, avoiding browser CORS restrictions.
+/// The proxy runs at localhost:3033 and forwards the request to
+/// AssemblyAI's v3 token endpoint, avoiding browser CORS
+/// restrictions and keeping the AssemblyAI API key on the proxy
+/// (resolved from the OS keystore via the proxy's [`SecretsManager`]).
 /// Retries up to 3 times with exponential backoff on failure.
-pub async fn fetch_temp_token(api_key: &str) -> Result<String, String> {
+pub async fn fetch_temp_token() -> Result<String, String> {
     let mut last_err = String::new();
 
     for attempt in 0..3u32 {
@@ -46,7 +48,7 @@ pub async fn fetch_temp_token(api_key: &str) -> Result<String, String> {
             gloo_timers::future::TimeoutFuture::new(delay_ms).await;
         }
 
-        match fetch_temp_token_once(api_key).await {
+        match fetch_temp_token_once().await {
             Ok(token) => return Ok(token),
             Err(e) => {
                 web_sys::console::warn_1(
@@ -60,21 +62,16 @@ pub async fn fetch_temp_token(api_key: &str) -> Result<String, String> {
     Err(last_err)
 }
 
-async fn fetch_temp_token_once(api_key: &str) -> Result<String, String> {
+async fn fetch_temp_token_once() -> Result<String, String> {
     let window = web_sys::window().ok_or("no window")?;
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("POST");
 
-    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|e| format!("{e:?}"))?;
-    opts.set_headers(&headers);
-
-    let body = format!(r#"{{"api_key":"{}"}}"#, api_key);
-    opts.set_body(&JsValue::from_str(&body));
-
+    // No request body: the proxy resolves the AssemblyAI key from
+    // its SecretsManager. A 412 here means no `default` AssemblyAI
+    // credential is configured — surfaced verbatim to the caller so
+    // the UI can prompt the user to set one in Settings.
     let request = web_sys::Request::new_with_str_and_init("http://127.0.0.1:3033/token", &opts)
         .map_err(|e| format!("{e:?}"))?;
 
