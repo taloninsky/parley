@@ -2,3 +2,4 @@
 pub mod app;
 pub mod conversation;
 pub mod root;
+pub mod secrets;

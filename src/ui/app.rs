@@ -6,6 +6,7 @@ use wasm_bindgen::JsCast;
 
 use crate::audio::capture::BrowserCapture;
 use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
+use crate::ui::secrets;
 use parley_core::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
@@ -129,8 +130,13 @@ struct FormatResult {
 /// Send the last unformatted chunk to Haiku.  If Haiku says formatting is
 /// needed it returns the formatted text which we splice back into the
 /// transcript.  Returns None if no change is needed or on error.
+///
+/// Authentication: the proxy resolves its Anthropic key from the OS
+/// keystore via the proxy's `SecretsManager`. The browser never sends
+/// a key on this request — a `412 Precondition Failed` from the proxy
+/// indicates the user hasn't configured one in Settings yet, which we
+/// surface as a `None` (caller treats this as "no change").
 async fn check_formatting(
-    anthropic_key: &str,
     full_transcript: &str,
     multi_speaker: bool,
     model: &str,
@@ -156,7 +162,6 @@ async fn check_formatting(
         );
 
         let body = serde_json::json!({
-            "anthropic_key": anthropic_key,
             "context": "",
             "text": full_transcript,
             "multi_speaker": multi_speaker,
@@ -282,7 +287,6 @@ async fn check_formatting(
     );
 
     let body = serde_json::json!({
-        "anthropic_key": anthropic_key,
         "context": context_text,
         "text": editable_text,
         "multi_speaker": multi_speaker,
@@ -687,13 +691,40 @@ pub fn App() -> Element {
     let mut status_msg = use_signal(|| "Ready".to_string());
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
     let mut show_settings = use_signal(|| false);
-    let mut api_key = use_signal(|| load("parley_api_key").unwrap_or_default());
+
+    // Secrets-status hook: source of truth for whether Anthropic and
+    // AssemblyAI have a `default` credential configured. Replaces
+    // the old cookie-backed `api_key` / `anthropic_key` signals;
+    // values themselves never reach the browser, only configuration
+    // status. Mutations (set/delete from Settings) call
+    // `secrets_refresh.refresh()` so the gates below re-derive.
+    let (secrets_status, mut secrets_refresh) = secrets::use_secrets_status();
+    let anthropic_configured = use_memo(move || {
+        matches!(
+            &*secrets_status.read_unchecked(),
+            Some(Ok(s)) if s
+                .provider("anthropic")
+                .and_then(|p| p.credential("default"))
+                .map(|c| c.configured)
+                .unwrap_or(false),
+        )
+    });
+    let assemblyai_configured = use_memo(move || {
+        matches!(
+            &*secrets_status.read_unchecked(),
+            Some(Ok(s)) if s
+                .provider("assemblyai")
+                .and_then(|p| p.credential("default"))
+                .map(|c| c.configured)
+                .unwrap_or(false),
+        )
+    });
+
     let mut idle_minutes = use_signal(|| {
         load("parley_idle_minutes")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(5)
     });
-    let mut anthropic_key = use_signal(|| load("parley_anthropic_key").unwrap_or_default());
     let mut countdown_secs: Signal<Option<u32>> = use_signal(|| None);
     let mut auto_scroll = use_signal(|| true);
 
@@ -996,7 +1027,7 @@ pub fn App() -> Element {
                                         restore_cursor(s, e);
                                     }
                                 }
-                                if !(anthropic_key)().is_empty() && (auto_format_enabled)() {
+                                if anthropic_configured() && (auto_format_enabled)() {
                                     tcc.set(tcc.get() + 1);
                                     if tcc.get().is_multiple_of((format_nth)()) {
                                         npc.set(true);
@@ -1154,8 +1185,7 @@ pub fn App() -> Element {
                                                 }
                                                 drop(words);
                                                 ltv.set(ltv() + 1);
-                                                if !(anthropic_key)().is_empty()
-                                                    && (auto_format_enabled)()
+                                                if anthropic_configured() && (auto_format_enabled)()
                                                 {
                                                     tcc.set(tcc.get() + 1);
                                                     if tcc.get().is_multiple_of((format_nth)()) {
@@ -1302,7 +1332,6 @@ pub fn App() -> Element {
                             // Paragraph detection
                             if ticker_needs_para.get() {
                                 ticker_needs_para.set(false);
-                                let key = (anthropic_key)();
                                 let model = (format_model)();
                                 let depth = (format_depth)();
                                 let ctx_depth = (format_context_depth)();
@@ -1311,10 +1340,9 @@ pub fn App() -> Element {
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty()
-                                        && let Some(result) = check_formatting(
-                                            &key, &text, multi, &model, depth, ctx_depth,
-                                        )
-                                        .await
+                                        && let Some(result) =
+                                            check_formatting(&text, multi, &model, depth, ctx_depth)
+                                                .await
                                     {
                                         // Accumulate LLM cost
                                         let model_val = (format_model)();
@@ -1719,11 +1747,12 @@ pub fn App() -> Element {
                     live_turns_version.set(live_turns_version() + 1);
                 }
             }
-            // Run paragraph detection (gated by trigger strategy)
-            let akey = (anthropic_key)();
+            // Run paragraph detection (gated by trigger strategy).
+            // Authentication lives in the proxy; we always fire the
+            // request and let it 412 if no key is configured.
             let do_auto_format = (auto_format_enabled)();
             let do_format_on_stop = (format_on_stop)();
-            if !akey.is_empty() && do_auto_format {
+            if do_auto_format {
                 let model = (format_model)();
                 let depth = (format_depth)();
                 let ctx_depth = (format_context_depth)();
@@ -1733,7 +1762,7 @@ pub fn App() -> Element {
                     let text = (t)();
                     if !text.is_empty()
                         && let Some(result) =
-                            check_formatting(&akey, &text, multi, &model, depth, ctx_depth).await
+                            check_formatting(&text, multi, &model, depth, ctx_depth).await
                     {
                         let (in_rate, out_rate) = llm_rates(&model);
                         llm.set(
@@ -1758,8 +1787,7 @@ pub fn App() -> Element {
                         let sonnet = "claude-sonnet-4-6";
                         let text = (t)();
                         if !text.is_empty()
-                            && let Some(result) =
-                                check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                            && let Some(result) = check_formatting(&text, multi, sonnet, 0, 0).await
                         {
                             let (in_rate, out_rate) = llm_rates(sonnet);
                             llm.set(
@@ -1781,7 +1809,7 @@ pub fn App() -> Element {
                         }
                     }
                 });
-            } else if !akey.is_empty() && do_format_on_stop {
+            } else if do_format_on_stop {
                 // Auto-format disabled — skip incremental but still do the full Sonnet pass
                 let mut t = transcript;
                 let mut llm = llm_cost;
@@ -1789,8 +1817,7 @@ pub fn App() -> Element {
                     let sonnet = "claude-sonnet-4-6";
                     let text = (t)();
                     if !text.is_empty()
-                        && let Some(result) =
-                            check_formatting(&akey, &text, multi, sonnet, 0, 0).await
+                        && let Some(result) = check_formatting(&text, multi, sonnet, 0, 0).await
                     {
                         let (in_rate, out_rate) = llm_rates(sonnet);
                         llm.set(
@@ -1959,7 +1986,6 @@ pub fn App() -> Element {
 
     // ── Reformat (on-demand, full transcript) ───────────────────────
     let on_reformat = move |_: Event<MouseData>| {
-        let key = (anthropic_key)();
         let model = "claude-sonnet-4-6".to_string();
         let multi = (speaker2_enabled)();
         let mut t = transcript;
@@ -1969,8 +1995,7 @@ pub fn App() -> Element {
             r.set(true);
             let text = (t)();
             if !text.is_empty()
-                && !key.is_empty()
-                && let Some(result) = check_formatting(&key, &text, multi, &model, 0, 0).await
+                && let Some(result) = check_formatting(&text, multi, &model, 0, 0).await
             {
                 let (in_rate, out_rate) = llm_rates(&model);
                 llm.set(
@@ -2261,7 +2286,7 @@ pub fn App() -> Element {
                         "Clear"
                     }
                 }
-                if !(anthropic_key)().is_empty() {
+                if anthropic_configured() {
                     div { class: "format-combo",
                         button {
                             class: "btn btn-reformat-main",
@@ -2413,18 +2438,26 @@ pub fn App() -> Element {
                 div { class: "settings-drawer",
                     h2 { "Settings" }
 
-                    label { r#for: "api-key", "AssemblyAI API Key" }
-                    input {
-                        id: "api-key",
-                        r#type: "password",
-                        class: "settings-input",
-                        placeholder: "Enter your API key\u{2026}",
-                        value: "{api_key}",
-                        oninput: move |evt: Event<FormData>| {
-                            let val = evt.value();
-                            api_key.set(val.clone());
-                            save("parley_api_key", &val);
-                        },
+                    // ── API keys (proxy-managed) ──────────────────────
+                    // Keys live in the OS keystore via the proxy's
+                    // `/api/secrets` surface. This panel manages the
+                    // `default` credential for each provider; named
+                    // credentials (multi-account) are managed via the
+                    // proxy directly until v2 expands the UI.
+                    h3 { class: "settings-section-heading", "API Keys" }
+                    SecretsKeyRow {
+                        provider: "assemblyai",
+                        label: "AssemblyAI API Key",
+                        hint: "Used for live transcription.",
+                        configured: assemblyai_configured(),
+                        on_changed: move |_| secrets_refresh.refresh(),
+                    }
+                    SecretsKeyRow {
+                        provider: "anthropic",
+                        label: "Anthropic API Key",
+                        hint: "Used for paragraph detection and conversation mode.",
+                        configured: anthropic_configured(),
+                        on_changed: move |_| secrets_refresh.refresh(),
                     }
 
                     label { r#for: "idle-timeout", "Idle timeout (minutes)" }
@@ -2445,24 +2478,6 @@ pub fn App() -> Element {
 
                     p { class: "settings-hint",
                         "Auto-disconnect after this many minutes of silence to save costs."
-                    }
-
-                    label { r#for: "anthropic-key", "Anthropic API Key (paragraph detection)" }
-                    input {
-                        id: "anthropic-key",
-                        r#type: "password",
-                        class: "settings-input",
-                        placeholder: "sk-ant-... (optional)",
-                        value: "{anthropic_key}",
-                        oninput: move |evt: Event<FormData>| {
-                            let val = evt.value();
-                            anthropic_key.set(val.clone());
-                            save("parley_anthropic_key", &val);
-                        },
-                    }
-
-                    p { class: "settings-hint",
-                        "If set, Claude will automatically detect paragraph breaks in your transcript."
                     }
 
                     // ── Cost meter toggle ────────────────────────────
@@ -2608,6 +2623,127 @@ pub fn App() -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Settings-drawer row for managing one provider's `default`
+/// credential via the proxy's `/api/secrets` surface.
+///
+/// Renders three states:
+/// - **Unconfigured**: shows a password input + "Save" button.
+/// - **Configured**: shows a "configured" badge with "Replace" and
+///   "Remove" buttons; "Replace" toggles the input back on.
+/// - **Error**: shows the proxy's error message inline so the user
+///   can retry.
+///
+/// Calls `on_changed` after any successful mutation so the parent
+/// can refresh its `use_secrets_status` resource.
+#[component]
+fn SecretsKeyRow(
+    provider: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    configured: bool,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let mut value = use_signal(String::new);
+    let mut editing = use_signal(|| !configured);
+    let mut error = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+
+    // When the parent flips `configured` (e.g. after a delete from
+    // another row), collapse back to the badge view automatically.
+    use_effect(use_reactive!(|configured| {
+        editing.set(!configured);
+        if configured {
+            value.set(String::new());
+        }
+    }));
+
+    let input_id = format!("secret-{provider}");
+    let on_save = move |_| {
+        let key = value.peek().clone();
+        if key.trim().is_empty() {
+            error.set("Key cannot be empty".to_string());
+            return;
+        }
+        busy.set(true);
+        error.set(String::new());
+        spawn(async move {
+            match secrets::set_credential(provider, "default", &key).await {
+                Ok(_) => {
+                    value.set(String::new());
+                    editing.set(false);
+                    on_changed.call(());
+                }
+                Err(e) => error.set(e),
+            }
+            busy.set(false);
+        });
+    };
+    let on_remove = move |_| {
+        busy.set(true);
+        error.set(String::new());
+        spawn(async move {
+            match secrets::delete_credential(provider, "default").await {
+                Ok(()) => {
+                    on_changed.call(());
+                }
+                Err(e) => error.set(e),
+            }
+            busy.set(false);
+        });
+    };
+
+    rsx! {
+        label { r#for: "{input_id}", "{label}" }
+        if editing() {
+            div { class: "settings-row",
+                input {
+                    id: "{input_id}",
+                    r#type: "password",
+                    class: "settings-input",
+                    placeholder: "Enter your API key\u{2026}",
+                    value: "{value}",
+                    disabled: busy(),
+                    oninput: move |evt: Event<FormData>| value.set(evt.value()),
+                }
+                button {
+                    class: "btn",
+                    disabled: busy(),
+                    onclick: on_save,
+                    if busy() { "Saving\u{2026}" } else { "Save" }
+                }
+                if configured {
+                    button {
+                        class: "btn",
+                        disabled: busy(),
+                        onclick: move |_| editing.set(false),
+                        "Cancel"
+                    }
+                }
+            }
+        } else {
+            div { class: "settings-row",
+                span { class: "settings-badge", "Configured" }
+                button {
+                    class: "btn",
+                    disabled: busy(),
+                    onclick: move |_| editing.set(true),
+                    "Replace"
+                }
+                button {
+                    class: "btn",
+                    disabled: busy(),
+                    onclick: on_remove,
+                    if busy() { "Removing\u{2026}" } else { "Remove" }
+                }
+            }
+        }
+        p { class: "settings-hint", "{hint}" }
+        if !error().is_empty() {
+            p { class: "settings-error", "{error}" }
         }
     }
 }
@@ -3211,4 +3347,32 @@ select.settings-input {
     width: 100%;
 }
 .btn-close-settings:hover { background: #1a4a7a; }
+
+/* Secrets / API key rows */
+.settings-section-heading {
+    font-size: 0.95rem;
+    color: #c0c0d0;
+    margin-top: 1rem;
+    margin-bottom: 0.25rem;
+}
+.settings-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.25rem;
+}
+.settings-row .settings-input { flex: 1; }
+.settings-badge {
+    flex: 1;
+    padding: 0.4rem 0.6rem;
+    background: #1a4a3a;
+    color: #4ecca3;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+.settings-error {
+    color: #e94560;
+    font-size: 0.8rem;
+    margin-top: 0.25rem;
+}
 "#;

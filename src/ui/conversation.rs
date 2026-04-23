@@ -5,8 +5,10 @@
 //! 1. Lists the proxy's available personas and models on mount
 //!    (`GET /personas`, `GET /models`).
 //! 2. On the first user turn, calls `POST /conversation/init` with the
-//!    selected persona + model + a generated session id and the
-//!    `parley_anthropic_key` cookie.
+//!    selected persona + model + a generated session id. Anthropic
+//!    credentials are resolved server-side from the proxy's keystore;
+//!    the user picks which named credential to use via the dropdown
+//!    (defaults to `default`).
 //! 3. On every user turn, calls `POST /conversation/turn` and consumes
 //!    the SSE response body chunk-by-chunk, accumulating
 //!    `OrchestratorEvent::Token { delta }` into a streaming
@@ -168,7 +170,11 @@ struct InitRequest<'a> {
     persona_id: &'a str,
     ai_speaker_id: String,
     ai_speaker_label: &'a str,
-    anthropic_key: Option<String>,
+    /// Named Anthropic credential to use. `None` means the proxy's
+    /// `default` credential. The literal key never crosses the wire
+    /// from the browser: the proxy resolves it from the keystore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,34 +207,6 @@ enum SendStatus {
     Sending,
     Streaming,
     Failed(String),
-}
-
-// ── Cookie helpers (mirrors `app::load`/`app::save`) ────────────────
-
-fn read_cookie(key: &str) -> Option<String> {
-    let doc = web_sys::window()?.document()?;
-    let cookies = js_sys::Reflect::get(&doc, &"cookie".into())
-        .ok()?
-        .as_string()?;
-    for pair in cookies.split(';') {
-        let pair = pair.trim();
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
-fn write_cookie(key: &str, value: &str) {
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        let cookie = format!(
-            "{}={}; path=/; max-age=315360000; SameSite=Strict",
-            key, value
-        );
-        let _ = js_sys::Reflect::set(&doc, &"cookie".into(), &cookie.into());
-    }
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────
@@ -414,7 +392,15 @@ fn extract_data_payload(frame: &str) -> Option<String> {
 #[component]
 pub fn ConversationView() -> Element {
     // ── Local signals ────────────────────────────────────────────
-    let mut anthropic_key = use_signal(|| read_cookie("parley_anthropic_key").unwrap_or_default());
+    // Secrets status drives both the "is Anthropic configured?"
+    // gate and the credential picker. Values themselves never reach
+    // the browser — only configuration metadata.
+    let (secrets_status, _) = crate::ui::secrets::use_secrets_status();
+    let anthropic_credentials = use_memo(move || match &*secrets_status.read_unchecked() {
+        Some(Ok(s)) => s.credential_names("anthropic"),
+        _ => Vec::new(),
+    });
+    let mut selected_credential = use_signal(|| "default".to_string());
     let mut personas = use_signal(Vec::<PersonaSummary>::new);
     let mut models = use_signal(Vec::<ModelSummary>::new);
     let mut selected_persona = use_signal(String::new);
@@ -483,7 +469,7 @@ pub fn ConversationView() -> Element {
     // event handlers (button click + Ctrl+Enter) without sharing a
     // single FnMut closure between them.
     let handles = SendHandles {
-        anthropic_key,
+        selected_credential,
         selected_persona,
         selected_model,
         session_id,
@@ -628,18 +614,12 @@ pub fn ConversationView() -> Element {
                         if sid.is_empty() {
                             return;
                         }
-                        let key = anthropic_key.peek().clone();
-                        if key.is_empty() {
-                            status.set(SendStatus::Failed(
-                                "set an Anthropic key before loading".into(),
-                            ));
-                            return;
-                        }
+                        let credential = selected_credential.peek().clone();
                         status.set(SendStatus::Sending);
                         spawn_local(async move {
                             let body = match serde_json::to_string(&serde_json::json!({
                                 "session_id": sid,
-                                "anthropic_key": key,
+                                "credential": credential,
                             })) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -800,17 +780,20 @@ pub fn ConversationView() -> Element {
 
             // ── Settings row ──────────────────────────────────
             div { style: "display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 0.75rem; align-items: center; margin-bottom: 0.75rem;",
-                label { r#for: "convo-key", "Anthropic key" }
-                input {
-                    id: "convo-key",
-                    r#type: "password",
-                    value: "{anthropic_key}",
-                    placeholder: "sk-ant-...",
-                    oninput: move |e| {
-                        let v = e.value();
-                        write_cookie("parley_anthropic_key", &v);
-                        anthropic_key.set(v);
-                    },
+                label { r#for: "convo-credential", "Anthropic credential" }
+                select {
+                    id: "convo-credential",
+                    value: "{selected_credential}",
+                    disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming)
+                        || anthropic_credentials().is_empty(),
+                    onchange: move |e| selected_credential.set(e.value()),
+                    if anthropic_credentials().is_empty() {
+                        option { value: "default", "(no credentials configured)" }
+                    } else {
+                        for name in anthropic_credentials().iter() {
+                            option { key: "{name}", value: "{name}", "{name}" }
+                        }
+                    }
                 }
 
                 label { r#for: "convo-persona", "Persona" }
@@ -861,19 +844,13 @@ pub fn ConversationView() -> Element {
                     onclick: move |_| {
                         let new_persona = selected_persona.peek().clone();
                         let new_model = selected_model.peek().clone();
-                        let key = anthropic_key.peek().clone();
-                        if key.is_empty() {
-                            status.set(SendStatus::Failed(
-                                "set an Anthropic key in the field above".into(),
-                            ));
-                            return;
-                        }
+                        let credential = selected_credential.peek().clone();
                         status.set(SendStatus::Sending);
                         spawn_local(async move {
                             let body = match serde_json::to_string(&serde_json::json!({
                                 "persona_id": new_persona,
                                 "model_config_id": new_model,
-                                "anthropic_key": key,
+                                "credential": credential,
                             })) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -1037,7 +1014,7 @@ pub fn ConversationView() -> Element {
 /// closures fighting over a single FnMut.
 #[derive(Copy, Clone)]
 struct SendHandles {
-    anthropic_key: Signal<String>,
+    selected_credential: Signal<String>,
     selected_persona: Signal<String>,
     selected_model: Signal<String>,
     session_id: Signal<String>,
@@ -1067,7 +1044,7 @@ fn submit_turn(h: SendHandles) {
     // the render scope and must not call `read()` (would panic) — we
     // use `peek()` here and then move owned `String`s into the future.
     let SendHandles {
-        anthropic_key,
+        selected_credential,
         selected_persona,
         selected_model,
         session_id,
@@ -1085,7 +1062,7 @@ fn submit_turn(h: SendHandles) {
     if user_text.is_empty() {
         return;
     }
-    let key = anthropic_key.peek().clone();
+    let credential = selected_credential.peek().clone();
     let persona = selected_persona.peek().clone();
     let model = selected_model.peek().clone();
     let sid = session_id.peek().clone();
@@ -1093,12 +1070,6 @@ fn submit_turn(h: SendHandles) {
 
     if persona.is_empty() {
         status.set(SendStatus::Failed("select a persona first".into()));
-        return;
-    }
-    if key.is_empty() {
-        status.set(SendStatus::Failed(
-            "set an Anthropic key in the field above".into(),
-        ));
         return;
     }
 
@@ -1122,7 +1093,7 @@ fn submit_turn(h: SendHandles) {
                 persona_id: &persona,
                 ai_speaker_id: format!("ai-{persona}"),
                 ai_speaker_label: &persona,
-                anthropic_key: Some(key.clone()),
+                credential: Some(credential.as_str()),
             }) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1296,7 +1267,10 @@ fn dismiss_pending(h: SendHandles) {
                 }
             }
             Err(e) => {
-                status.set(SendStatus::Failed(format!("dismiss request failed: {:?}", e)));
+                status.set(SendStatus::Failed(format!(
+                    "dismiss request failed: {:?}",
+                    e
+                )));
                 return;
             }
         }
@@ -1378,8 +1352,7 @@ async fn consume_turn_response(
                     // the conversation itself is fine, only persistence
                     // failed. The user can retry on their next turn.
                     status.set(SendStatus::Failed(format!("auto-save failed: {e}")));
-                } else if let Ok(req) =
-                    build_get(&format!("{PROXY_BASE}/conversation/sessions"))
+                } else if let Ok(req) = build_get(&format!("{PROXY_BASE}/conversation/sessions"))
                     && let Ok(resp) = fetch_json::<SessionListResponse>(req).await
                 {
                     // Refresh the picker so a brand-new session id
