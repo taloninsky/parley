@@ -1498,6 +1498,29 @@ mod tests {
         provider: Arc<dyn LlmProvider>,
         mock_tts: StdArc<MockTtsProvider>,
     ) -> (ConversationOrchestrator, Arc<TtsHub>, tempfile::TempDir) {
+        build_with_tts_inner(persona, model, provider, mock_tts, None)
+    }
+
+    /// Same as [`build_with_tts`] but also wires a [`SilenceSplicer`]
+    /// so tests can verify the silence prefix appears in cache and
+    /// broadcast frames.
+    fn build_with_tts_and_silence(
+        persona: Persona,
+        model: ModelConfig,
+        provider: Arc<dyn LlmProvider>,
+        mock_tts: StdArc<MockTtsProvider>,
+        splicer: Arc<SilenceSplicer>,
+    ) -> (ConversationOrchestrator, Arc<TtsHub>, tempfile::TempDir) {
+        build_with_tts_inner(persona, model, provider, mock_tts, Some(splicer))
+    }
+
+    fn build_with_tts_inner(
+        persona: Persona,
+        model: ModelConfig,
+        provider: Arc<dyn LlmProvider>,
+        mock_tts: StdArc<MockTtsProvider>,
+        splicer: Option<Arc<SilenceSplicer>>,
+    ) -> (ConversationOrchestrator, Arc<TtsHub>, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = Arc::new(FsTtsCache::new(tmp.path()));
         let hub = Arc::new(TtsHub::new());
@@ -1516,7 +1539,7 @@ mod tests {
             tts_cache: Some(cache),
             tts_hub: Some(hub.clone()),
             tts_voice_id: Some("voice-jarnathan".into()),
-            silence_splicer: None,
+            silence_splicer: splicer,
         };
         let o = ConversationOrchestrator::with_clock(session, ctx, Arc::new(FakeClock(1_000)));
         (o, hub, tmp)
@@ -1762,5 +1785,71 @@ mod tests {
         // The cache file exists with the synthesized bytes.
         // (Implicit \u2014 finish was called; this is exercised by the
         // tts cache module's own tests.)
+    }
+
+    #[tokio::test]
+    async fn silence_splicer_prefixes_first_chunk_audio() {
+        // When a `SilenceSplicer` is wired, the orchestrator must
+        // prepend `policy.first_chunk_silence_ms` of silence before
+        // the first chunk's synthesized audio. With the default
+        // policy (100 ms) and a 26 ms frame, that's 4 frames =
+        // 4 * 418 = 1672 bytes of silence ahead of the provider's
+        // output bytes. We assert on the cache file (single source
+        // of truth for cumulative bytes).
+        use crate::tts::silence::{SILENCE_FRAME_44100_128_STEREO, SilenceSplicer};
+        let llm = Arc::new(MockProvider::new(
+            "p",
+            vec![MockItem::Text("Hello.".into())],
+            TokenUsage::default(),
+        ));
+        let provider_audio = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mock_tts = StdArc::new(MockTtsProvider::new(vec![MockTtsCall::Ok {
+            audio_chunks: vec![provider_audio.clone()],
+            characters: 6,
+        }]));
+        let splicer = Arc::new(SilenceSplicer::default_44100_128_stereo());
+        let (o, _hub, tmp) = build_with_tts_and_silence(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            llm,
+            mock_tts,
+            splicer,
+        );
+
+        let _events = drain(&o, "hi").await;
+
+        // Read the cache file directly. Path layout matches
+        // `FsTtsCache::writer` (tts-cache subdir per session).
+        let cache_path = tmp
+            .path()
+            .join("sess-tts")
+            .join("tts-cache")
+            .join("turn-0001.mp3");
+        let bytes = std::fs::read(&cache_path).expect("cache file exists");
+        // 4 silence frames + provider audio.
+        let expected_silence_len = 4 * SILENCE_FRAME_44100_128_STEREO.len();
+        assert_eq!(
+            bytes.len(),
+            expected_silence_len + provider_audio.len(),
+            "cache must hold silence prefix + provider audio"
+        );
+        // Each silence frame matches the canonical bytes.
+        for i in 0..4 {
+            let start = i * SILENCE_FRAME_44100_128_STEREO.len();
+            let end = start + SILENCE_FRAME_44100_128_STEREO.len();
+            assert_eq!(
+                &bytes[start..end],
+                SILENCE_FRAME_44100_128_STEREO,
+                "silence frame {i} mismatch",
+            );
+        }
+        // The provider audio follows the silence prefix verbatim.
+        assert_eq!(&bytes[expected_silence_len..], provider_audio.as_slice());
+
+        // Provenance only counts billable characters (silence is
+        // not billable).
+        let snap = o.session_snapshot().await;
+        let prov = snap.turns[1].provenance.as_ref().unwrap();
+        assert_eq!(prov.tts_characters, 6);
     }
 }

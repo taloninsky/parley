@@ -138,7 +138,9 @@ impl ConversationApiState {
         let tts = TtsRuntime {
             hub: Arc::new(TtsHub::new()),
             cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
-            silence_splicer: None,
+            silence_splicer: Some(Arc::new(
+                crate::tts::silence::SilenceSplicer::default_44100_128_stereo(),
+            )),
         };
         Self {
             inner: Arc::new(Mutex::new(None)),
@@ -162,7 +164,9 @@ impl ConversationApiState {
         let tts = TtsRuntime {
             hub: Arc::new(TtsHub::new()),
             cache: Arc::new(FsTtsCache::new(registries.sessions_dir.clone())),
-            silence_splicer: None,
+            silence_splicer: Some(Arc::new(
+                crate::tts::silence::SilenceSplicer::default_44100_128_stereo(),
+            )),
         };
         Self {
             inner: Arc::new(Mutex::new(None)),
