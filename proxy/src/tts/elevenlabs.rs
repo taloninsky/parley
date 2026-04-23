@@ -8,7 +8,7 @@
 //! POST https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream
 //!     ?output_format=mp3_44100_128
 //! Headers: xi-api-key: <KEY>, content-type: application/json
-//! Body: {"text": "...", "model_id": "eleven_v3",
+//! Body: {"text": "...", "model_id": "eleven_multilingual_v2",
 //!        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
 //! ```
 //!
@@ -37,9 +37,14 @@ pub const ELEVENLABS_BASE_URL: &str = "https://api.elevenlabs.io/v1/text-to-spee
 /// per the spec — generous quality, trivial cost.
 pub const ELEVENLABS_OUTPUT_FORMAT: &str = "mp3_44100_128";
 
-/// Model id passed in the JSON body. Pinned to the v3 conversational
-/// model.
-pub const ELEVENLABS_MODEL_ID: &str = "eleven_v3";
+/// Model id passed in the JSON body. Pinned to `eleven_multilingual_v2`:
+/// the highest-quality pre-v3 model. Unlike `eleven_v3` it accepts
+/// `previous_text` for cross-chunk prosody continuity (which is why
+/// we picked it over v3); it does not support v3's bracketed
+/// expressive tags (`[whisper]`, `[laugh]`, etc.). Per-character
+/// price matches v3 ($0.000015 on the Creator tier), so
+/// [`ELEVENLABS_COST_PER_CHAR_USD`] stays the same.
+pub const ELEVENLABS_MODEL_ID: &str = "eleven_multilingual_v2";
 
 /// Per-character USD cost on the Creator tier. Spec §6.
 pub const ELEVENLABS_COST_PER_CHAR_USD: f64 = 0.000_015;
@@ -113,20 +118,21 @@ impl TtsProvider for ElevenLabsTts {
         request: TtsRequest,
         ctx: SynthesisContext,
     ) -> Result<TtsStream, TtsError> {
-        // `ctx.previous_text` would normally be forwarded as
-        // ElevenLabs' `previous_text` field for cross-chunk prosody
-        // continuity \u2014 but the v3 model explicitly rejects it
-        // (HTTP 400 "unsupported_model: Providing previous_text or
-        // next_text is not yet supported with the 'eleven_v3'
-        // model."). The pre-v3 turbo / multilingual models accept
-        // it. We therefore gate on the model id: only forward when
-        // the model is known to support it.
+        // `ctx.previous_text` is forwarded as ElevenLabs'
+        // `previous_text` field so the model picks prosody
+        // appropriate to continuing speech rather than treating each
+        // chunk as a fresh utterance. Without this, paragraph-leading
+        // short words like "In", "So", "But" get read with an
+        // exaggerated sentence-opener intonation and a small leading
+        // pause.
         //
-        // Trade-off: on v3 (our current default), paragraph-leading
-        // short words like "In", "So", "But" can be read with an
-        // exaggerated sentence-opener intonation. Switching to
-        // `eleven_turbo_v2_5` or `eleven_multilingual_v2` fixes the
-        // prosody but loses expressive-tag support.
+        // ElevenLabs' v3 model rejects this field with HTTP 400; the
+        // pre-v3 family (multilingual v2, turbo v2.5, monolingual v1)
+        // accepts it. We therefore allow-list those models via
+        // [`model_supports_previous_text`] and silently omit the
+        // field for any model not on the list. Our default
+        // ([`ELEVENLABS_MODEL_ID`]) is `eleven_multilingual_v2`,
+        // which is on the allow-list.
         //
         // `provider_state` (v2 request-id stitching) is still
         // unused; a future v2 adapter would read it here.
@@ -198,10 +204,13 @@ impl TtsProvider for ElevenLabsTts {
     }
 
     fn supports_expressive_tags(&self) -> bool {
-        // ElevenLabs v3 understands the bracketed expressive tag set
-        // (`[whisper]`, `[laugh]`, etc.). The annotator pass uses
-        // this to gate tag injection.
-        true
+        // The pre-v3 family (our default `eleven_multilingual_v2`
+        // included) does not interpret v3's bracketed expressive
+        // tag set (`[whisper]`, `[laugh]`, etc.) — those tags would
+        // be read literally as text. The annotator pass uses this
+        // flag to gate tag injection, so it stays disabled until we
+        // (optionally) move back to a v3-family model.
+        false
     }
 }
 
@@ -328,10 +337,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synthesize_omits_previous_text_on_v3_even_when_provided() {
-        // The v3 model (our pinned default) rejects `previous_text`
-        // with HTTP 400. Even if the orchestrator provides context,
-        // the body must omit the field.
+    async fn synthesize_forwards_previous_text_on_default_model() {
+        // Our pinned default (`eleven_multilingual_v2`) accepts
+        // `previous_text`. When the orchestrator supplies context,
+        // the request body must include the field.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/text-to-speech/voice-1/stream"))
@@ -365,12 +374,11 @@ mod tests {
         assert_eq!(received.len(), 1);
         let body = std::str::from_utf8(&received[0].body).unwrap();
         assert!(
-            !body.contains("previous_text"),
-            "v3 request body must not include previous_text: {body}",
+            body.contains("\"previous_text\":\"Tactics are how you build proofs.\""),
+            "default model request body must include previous_text: {body}",
         );
-        // Sanity: the model id is the v3 default we're guarding
-        // against.
-        assert!(body.contains("\"model_id\":\"eleven_v3\""));
+        // Sanity: the model id is the default we expect.
+        assert!(body.contains("\"model_id\":\"eleven_multilingual_v2\""));
     }
 
     #[test]
@@ -379,10 +387,11 @@ mod tests {
         assert!(model_supports_previous_text("eleven_turbo_v2_5"));
         assert!(model_supports_previous_text("eleven_multilingual_v2"));
         assert!(model_supports_previous_text("eleven_monolingual_v1"));
-        // v3 (our default) does not.
-        assert!(!model_supports_previous_text(ELEVENLABS_MODEL_ID));
+        // Our pinned default is on the allow-list.
+        assert!(model_supports_previous_text(ELEVENLABS_MODEL_ID));
+        // v3 is not.
         assert!(!model_supports_previous_text("eleven_v3"));
-        // Unknown ids deny by default \u2014 safer than guessing.
+        // Unknown ids deny by default — safer than guessing.
         assert!(!model_supports_previous_text("eleven_v4"));
     }
 
