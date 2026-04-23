@@ -310,6 +310,17 @@ impl ConversationSession {
         self.next_turn_seq += 1;
         id
     }
+
+    /// Peek the [`TurnId`] that the *next* `append_*_turn` call
+    /// would produce. Pure — does not mutate the session. The
+    /// orchestrator uses this to pre-allocate the AI turn id before
+    /// streaming begins, so per-turn artifacts (e.g. the TTS cache
+    /// filename) can be addressed by id during synthesis even though
+    /// the turn isn't written into the session until the stream
+    /// finishes.
+    pub fn peek_next_turn_id(&self) -> TurnId {
+        format!("turn-{:04}", self.next_turn_seq)
+    }
 }
 
 #[cfg(test)]

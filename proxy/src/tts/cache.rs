@@ -268,11 +268,19 @@ mod tests {
         w2.finish().await.unwrap();
 
         assert_eq!(
-            c.reader("sess-a", "turn-0001").await.unwrap().unwrap().as_slice(),
+            c.reader("sess-a", "turn-0001")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"alpha"
         );
         assert_eq!(
-            c.reader("sess-b", "turn-0001").await.unwrap().unwrap().as_slice(),
+            c.reader("sess-b", "turn-0001")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"beta"
         );
     }

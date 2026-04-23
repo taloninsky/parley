@@ -52,7 +52,7 @@ let mut format_model = use_signal(||
 | Display label | Model ID |
 |---------------|----------|
 | Haiku 4.5 | `claude-haiku-4-5-20251001` |
-| Sonnet 4.6 | `claude-sonnet-4-6-20250514` |
+| Sonnet 4.6 | `claude-sonnet-4-6` |
 
 Cookie: `parley_format_model`.
 
@@ -164,7 +164,7 @@ Cookie: `parley_format_on_stop`. Default: `true`.
 
 ### 4.2 Behavior
 
-When recording stops and this checkbox is enabled, after any incremental auto-format pass completes, a **full-transcript** formatting pass is triggered using Sonnet 4.6 (`claude-sonnet-4-6-20250514`) with `depth=0, context_depth=0`.
+When recording stops and this checkbox is enabled, after any incremental auto-format pass completes, a **full-transcript** formatting pass is triggered using Sonnet 4.6 (`claude-sonnet-4-6`) with `depth=0, context_depth=0`.
 
 If auto-format is disabled but format-on-stop is enabled, only the full Sonnet pass runs (the incremental pass is skipped).
 

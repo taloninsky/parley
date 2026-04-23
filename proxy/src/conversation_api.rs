@@ -363,6 +363,10 @@ async fn init_session(
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        tts: None,
+        tts_cache: None,
+        tts_hub: None,
+        tts_voice_id: None,
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -475,6 +479,10 @@ async fn switch_persona(
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        tts: None,
+        tts_cache: None,
+        tts_hub: None,
+        tts_voice_id: None,
     };
     let new_orchestrator = Arc::new(ConversationOrchestrator::new(snapshot, ctx));
     *state.inner.lock().await = Some(new_orchestrator);
@@ -564,6 +572,10 @@ async fn load_session(
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        tts: None,
+        tts_cache: None,
+        tts_hub: None,
+        tts_voice_id: None,
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -762,6 +774,9 @@ fn event_name(event: &OrchestratorEvent) -> &'static str {
         OrchestratorEvent::UserTurnAppended { .. } => "user_turn_appended",
         OrchestratorEvent::Token { .. } => "token",
         OrchestratorEvent::AiTurnAppended { .. } => "ai_turn_appended",
+        OrchestratorEvent::TtsStarted { .. } => "tts_started",
+        OrchestratorEvent::TtsSentenceDone { .. } => "tts_sentence_done",
+        OrchestratorEvent::TtsFinished { .. } => "tts_finished",
         OrchestratorEvent::Failed { .. } => "failed",
     }
 }
@@ -845,6 +860,10 @@ mod tests {
             models: [(model.id.clone(), model.clone())].into(),
             providers: [(model.id.clone(), provider)].into(),
             prompts_dir: PathBuf::from("/nonexistent"),
+            tts: None,
+            tts_cache: None,
+            tts_hub: None,
+            tts_voice_id: None,
         };
         let orch = Arc::new(ConversationOrchestrator::new(session, ctx));
         state.install_for_test(orch.clone()).await;

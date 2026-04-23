@@ -9,6 +9,7 @@
 
 pub mod cache;
 pub mod elevenlabs;
+pub mod hub;
 
 use std::pin::Pin;
 
@@ -17,8 +18,17 @@ use futures::Stream;
 use parley_core::chat::Cost;
 use thiserror::Error;
 
+// Re-exports kept here so the orchestrator and HTTP layer can
+// reference `crate::tts::Foo` instead of going through the
+// submodule path. `TtsCacheReader` and `ElevenLabsTts` aren't yet
+// referenced through the re-export (only by absolute path / from
+// startup wiring landing in Task 8); allow the dead-code lint until
+// then.
+#[allow(unused_imports)]
 pub use cache::{FsTtsCache, TtsCacheReader, TtsCacheWriter};
+#[allow(unused_imports)]
 pub use elevenlabs::ElevenLabsTts;
+pub use hub::{TtsBroadcastFrame, TtsBroadcaster, TtsHub};
 
 /// One synthesis request handed to a [`TtsProvider`]. The
 /// orchestrator builds these from [`parley_core::tts::SentenceChunk`]
