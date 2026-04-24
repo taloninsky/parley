@@ -32,6 +32,8 @@
 
 #![allow(dead_code)] // Skeleton: no production callsite yet. Tests cover the surface.
 
+pub mod stt_router;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
