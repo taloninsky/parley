@@ -2,17 +2,16 @@
 //!
 //! Spec: `docs/xai-speech-integration-spec.md` §8.3.
 //!
-//! Unary (non-streaming) `POST /api/tts/synthesize` lands here. The
-//! streaming bridge (`GET /api/tts/stream`) is deferred to Step 4 WS
-//! per spec §12.1; voice catalog endpoint (`GET /api/tts/voices`) is
-//! deferred to Step 8 when `TtsProvider::voices()` is added.
+//! Unary (non-streaming) `POST /api/tts/synthesize` and the voice
+//! catalog endpoint `GET /api/tts/voices` land here. The streaming
+//! bridge (`GET /api/tts/stream`) is deferred to Step 4 WS per spec
+//! §12.1.
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use futures::StreamExt;
@@ -46,6 +45,7 @@ impl TtsApiState {
 pub fn router(state: TtsApiState) -> Router {
     Router::new()
         .route("/api/tts/synthesize", post(synthesize))
+        .route("/api/tts/voices", get(voices))
         .with_state(state)
 }
 
@@ -138,6 +138,54 @@ async fn synthesize(
     )
 }
 
+// ── voices catalog ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct VoicesQuery {
+    provider: String,
+    #[serde(default = "default_credential")]
+    credential: String,
+}
+
+async fn voices(
+    State(state): State<TtsApiState>,
+    Query(q): Query<VoicesQuery>,
+) -> (StatusCode, Json<Value>) {
+    let provider_id: ProviderId = match q.provider.parse() {
+        Ok(p) => p,
+        Err(UnknownProvider(raw)) => {
+            return bad_request("unknown_provider", &format!("{raw} is not a known provider"));
+        }
+    };
+
+    let api_key = match state.secrets.resolve(provider_id, &q.credential) {
+        Some(k) => k,
+        None => return provider_not_configured(provider_id, &q.credential),
+    };
+
+    let provider: Box<dyn TtsProvider> = match provider_id {
+        ProviderId::Xai => Box::new(XaiTts::new(api_key, state.client.clone())),
+        ProviderId::ElevenLabs => Box::new(ElevenLabsTts::new(api_key, state.client.clone())),
+        other => {
+            return bad_request(
+                "unsupported_provider_for_tts",
+                &format!("{} cannot synthesize speech", other.as_str()),
+            );
+        }
+    };
+
+    match provider.voices().await {
+        Ok(list) => (
+            StatusCode::OK,
+            Json(json!({
+                "provider": provider_id.as_str(),
+                "voices": list,
+            })),
+        ),
+        Err(e) => map_tts_error(provider_id, e),
+    }
+}
+
 fn audio_format_str(f: AudioFormat) -> &'static str {
     match f {
         AudioFormat::Mp3_44100_128 => "mp3_44100_128",
@@ -226,6 +274,14 @@ fn map_tts_error(provider: ProviderId, err: TtsError) -> (StatusCode, Json<Value
             })),
         ),
         TtsError::Other(detail) => bad_request("invalid_request", &detail),
+        TtsError::Unsupported(detail) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "unsupported",
+                "provider": provider.as_str(),
+                "detail": detail,
+            })),
+        ),
     }
 }
 
@@ -399,5 +455,43 @@ mod tests {
     #[test]
     fn audio_format_str_stable() {
         assert_eq!(audio_format_str(AudioFormat::Mp3_44100_128), "mp3_44100_128");
+    }
+
+    #[test]
+    fn map_tts_error_unsupported_goes_to_501() {
+        let (status, body) = map_tts_error(
+            ProviderId::Xai,
+            TtsError::Unsupported("voices catalog".into()),
+        );
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body.0["error"], "unsupported");
+        assert_eq!(body.0["provider"], "xai");
+    }
+
+    #[tokio::test]
+    async fn voices_unknown_provider_returns_400() {
+        let app = app_with(secrets_with(None));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/tts/voices?provider=made-up")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = body_to_value(app.oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "unknown_provider");
+    }
+
+    #[tokio::test]
+    async fn voices_missing_credential_returns_412() {
+        let app = app_with(secrets_with(None));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/tts/voices?provider=xai")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = body_to_value(app.oneshot(req).await.unwrap()).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["error"], "provider_not_configured");
+        assert_eq!(body["provider"], "xai");
     }
 }

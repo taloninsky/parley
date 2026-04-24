@@ -18,6 +18,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use parley_core::chat::Cost;
+use parley_core::tts::VoiceDescriptor;
 use thiserror::Error;
 
 // Re-exports kept here so the orchestrator and HTTP layer can
@@ -88,6 +89,10 @@ pub enum TtsError {
     /// frame, unexpected EOF mid-chunk).
     #[error("tts protocol error: {0}")]
     Protocol(String),
+    /// Feature not supported by this provider (e.g. requesting a
+    /// voices catalog from a provider that doesn't publish one).
+    #[error("tts unsupported: {0}")]
+    Unsupported(String),
     /// Catch-all for provider-specific failures that don't fit the
     /// above buckets.
     #[error("tts error: {0}")]
@@ -178,4 +183,22 @@ pub trait TtsProvider: Send + Sync {
     /// Compute the USD cost for `characters` synthesized in this
     /// provider's pricing tier. Pure function — no I/O.
     fn cost(&self, characters: u32) -> Cost;
+
+    /// List available voices for the provider's voice picker UI.
+    ///
+    /// Providers that serve a catalog (xAI: `GET /v1/tts/voices`,
+    /// ElevenLabs: `GET /v1/voices`) fetch it and map into the shared
+    /// [`VoiceDescriptor`] shape. Providers with a fixed, documented
+    /// voice list can return it synthetically. Providers that don't
+    /// expose voice selection at all return
+    /// [`TtsError::Unsupported`] — the default impl does that so
+    /// existing test providers keep compiling.
+    ///
+    /// Implementations SHOULD cache the upstream response (see spec
+    /// §5.6: 24-hour TTL is the proxy contract) so that the voice
+    /// picker doesn't re-hit the upstream on every render. The cache
+    /// is an implementation detail, not part of the trait.
+    async fn voices(&self) -> Result<Vec<VoiceDescriptor>, TtsError> {
+        Err(TtsError::Unsupported("voices catalog not implemented".into()))
+    }
 }

@@ -19,11 +19,15 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use parley_core::chat::Cost;
+use parley_core::tts::VoiceDescriptor;
+use serde::Deserialize;
 use serde_json::json;
 
 use super::{
@@ -33,6 +37,13 @@ use super::{
 /// Default REST endpoint. Constructor takes an override so tests can
 /// point at a `wiremock` server.
 pub const XAI_TTS_REST_URL: &str = "https://api.x.ai/v1/tts";
+
+/// Default voices catalog endpoint (spec §5.6). 24-hour cache TTL
+/// matches the server-side contract.
+pub const XAI_TTS_VOICES_URL: &str = "https://api.x.ai/v1/tts/voices";
+
+/// TTL for the voices-catalog cache. Spec §5.6 mandates 24h.
+pub const XAI_TTS_VOICES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Pinned MP3 sample rate in Hz — matches [`AudioFormat::Mp3_44100_128`]
 /// so the silence splicer can crossfade without re-encoding.
@@ -60,25 +71,49 @@ pub const XAI_TTS_KNOWN_VOICES: &[&str] = &["eve", "ara", "rex", "sal", "leo"];
 pub struct XaiTts {
     api_key: Arc<str>,
     endpoint: Arc<str>,
+    voices_endpoint: Arc<str>,
     client: reqwest::Client,
+    voices_cache: Arc<Mutex<Option<VoicesCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct VoicesCacheEntry {
+    fetched_at: Instant,
+    voices: Vec<VoiceDescriptor>,
 }
 
 impl XaiTts {
-    /// Build a provider pointed at the production endpoint.
+    /// Build a provider pointed at the production endpoints.
     pub fn new(api_key: impl Into<String>, client: reqwest::Client) -> Self {
-        Self::with_endpoint(api_key, XAI_TTS_REST_URL, client)
+        Self::with_endpoints(api_key, XAI_TTS_REST_URL, XAI_TTS_VOICES_URL, client)
     }
 
-    /// Build a provider with a custom endpoint — used by tests.
+    /// Build a provider with a custom synthesize endpoint. Voices URL
+    /// defaults to the production catalog — callers who want to stub
+    /// both should use [`Self::with_endpoints`].
     pub fn with_endpoint(
         api_key: impl Into<String>,
         endpoint: impl Into<String>,
         client: reqwest::Client,
     ) -> Self {
+        Self::with_endpoints(api_key, endpoint, XAI_TTS_VOICES_URL, client)
+    }
+
+    /// Build a provider with overrides for both the synthesize and
+    /// voices-catalog endpoints — used by tests that stand up a
+    /// `wiremock` server.
+    pub fn with_endpoints(
+        api_key: impl Into<String>,
+        endpoint: impl Into<String>,
+        voices_endpoint: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             api_key: api_key.into().into(),
             endpoint: endpoint.into().into(),
+            voices_endpoint: voices_endpoint.into().into(),
             client,
+            voices_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -166,6 +201,105 @@ impl TtsProvider for XaiTts {
         // xAI's models don't interpret ElevenLabs-style bracketed
         // expressive tags; they'd be read literally.
         false
+    }
+
+    async fn voices(&self) -> Result<Vec<VoiceDescriptor>, TtsError> {
+        if let Some(cached) = self.voices_from_cache() {
+            return Ok(cached);
+        }
+
+        let resp = self
+            .client
+            .get(self.voices_endpoint.as_ref())
+            .bearer_auth(self.api_key.as_ref())
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| TtsError::Transport(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TtsError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body: VoicesResponse = resp
+            .json()
+            .await
+            .map_err(|e| TtsError::Protocol(format!("voices parse: {e}")))?;
+        let voices = body.into_descriptors();
+        self.store_voices_cache(&voices);
+        Ok(voices)
+    }
+}
+
+impl XaiTts {
+    fn voices_from_cache(&self) -> Option<Vec<VoiceDescriptor>> {
+        let guard = self.voices_cache.lock().ok()?;
+        let entry = guard.as_ref()?;
+        if entry.fetched_at.elapsed() < XAI_TTS_VOICES_TTL {
+            Some(entry.voices.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_voices_cache(&self, voices: &[VoiceDescriptor]) {
+        if let Ok(mut guard) = self.voices_cache.lock() {
+            *guard = Some(VoicesCacheEntry {
+                fetched_at: Instant::now(),
+                voices: voices.to_vec(),
+            });
+        }
+    }
+}
+
+/// xAI's documented voices response is `{ "voices": [ { "id": "eve",
+/// ... }, ... ] }` (spec §5.6 — exact schema unstable; we only
+/// depend on `id` plus optional `display_name`/`language_tags`).
+#[derive(Debug, Deserialize)]
+struct VoicesResponse {
+    #[serde(default)]
+    voices: Vec<VoiceEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceEntry {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    language_tags: Vec<String>,
+    // Accepted for forward-compat even if we don't project them into
+    // `VoiceDescriptor` today.
+    #[serde(default)]
+    #[allow(dead_code)]
+    description: Option<String>,
+}
+
+impl VoicesResponse {
+    fn into_descriptors(self) -> Vec<VoiceDescriptor> {
+        self.voices
+            .into_iter()
+            .map(|v| VoiceDescriptor {
+                display_name: v
+                    .display_name
+                    .unwrap_or_else(|| title_case(&v.id)),
+                id: v.id,
+                language_tags: v.language_tags,
+            })
+            .collect()
+    }
+}
+
+fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -364,5 +498,115 @@ mod tests {
             assert!(XAI_TTS_KNOWN_VOICES.contains(&id), "missing voice: {id}");
         }
         assert_eq!(XAI_TTS_KNOWN_VOICES.len(), 5);
+    }
+
+    // ── voices() catalog ────────────────────────────────────────────
+
+    fn provider_with_voices(server: &MockServer) -> XaiTts {
+        XaiTts::with_endpoints(
+            "test-key",
+            format!("{}/v1/tts", server.uri()),
+            format!("{}/v1/tts/voices", server.uri()),
+            reqwest::Client::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn voices_parses_catalog_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tts/voices"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"voices":[
+                    {"id":"eve","display_name":"Eve","language_tags":["en-US","es-MX"]},
+                    {"id":"rex","language_tags":["en-US"]},
+                    {"id":"sal"}
+                ]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let voices = provider_with_voices(&server).voices().await.unwrap();
+        assert_eq!(voices.len(), 3);
+        assert_eq!(voices[0].id, "eve");
+        assert_eq!(voices[0].display_name, "Eve");
+        assert_eq!(voices[0].language_tags, vec!["en-US", "es-MX"]);
+        // Missing display_name falls back to title-cased id.
+        assert_eq!(voices[1].id, "rex");
+        assert_eq!(voices[1].display_name, "Rex");
+        // Missing language_tags decodes as empty.
+        assert_eq!(voices[2].id, "sal");
+        assert_eq!(voices[2].display_name, "Sal");
+        assert!(voices[2].language_tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn voices_second_call_uses_cache() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tts/voices"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"voices":[{"id":"eve"}]}"#,
+            ))
+            .expect(1) // second .voices() must not hit the mock
+            .mount(&server)
+            .await;
+
+        let p = provider_with_voices(&server);
+        let first = p.voices().await.unwrap();
+        let second = p.voices().await.unwrap();
+        assert_eq!(first, second);
+        // `expect(1)` above is the real assertion — wiremock panics on
+        // Drop if the mount count doesn't match.
+    }
+
+    #[tokio::test]
+    async fn voices_surfaces_http_error_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tts/voices"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&server)
+            .await;
+
+        match provider_with_voices(&server).voices().await {
+            Err(TtsError::Http { status, body }) => {
+                assert_eq!(status, 401);
+                assert_eq!(body, "bad key");
+            }
+            Err(other) => panic!("expected Http, got {other:?}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn voices_surfaces_protocol_error_on_bad_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tts/voices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("not-json"),
+            )
+            .mount(&server)
+            .await;
+
+        match provider_with_voices(&server).voices().await {
+            Err(TtsError::Protocol(msg)) => {
+                assert!(msg.contains("voices parse"));
+            }
+            Err(other) => panic!("expected Protocol, got {other:?}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn title_case_capitalizes_first_char_only() {
+        assert_eq!(title_case("eve"), "Eve");
+        assert_eq!(title_case(""), "");
+        assert_eq!(title_case("e"), "E");
+        assert_eq!(title_case("MiXeD"), "MiXeD");
     }
 }
