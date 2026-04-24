@@ -14,6 +14,7 @@ mod registry;
 mod secrets;
 mod secrets_api;
 mod session_store;
+mod stt;
 mod tts;
 
 use providers::ProviderId;

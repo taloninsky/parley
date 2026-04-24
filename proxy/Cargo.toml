@@ -11,7 +11,7 @@ base64 = "0.22"
 futures = "0.3"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 parley-core = { path = "../parley-core" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
