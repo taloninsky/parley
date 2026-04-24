@@ -703,7 +703,7 @@ API keys for upstream providers (Anthropic, AssemblyAI, eventually TTS) live exc
 
 
 
-- Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
+- Audio capture / STT / TTS integration: ✅ landed via the conversation-voice slice and `docs/xai-speech-integration-spec.md`. Browser-direct AssemblyAI capture (Phase 4f), ElevenLabs and xAI TTS via the proxy with sentence chunking and per-turn audio cache, voice / STT-provider pickers, and the `(stt|tts).provider` profile schema with registry-backed validation. The `Capturing`, `Speaking`, `Paused` states from the original spec are still partial — pause/stop/barge-in remain deferred (see below).
 - Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)
 - Pause / Stop / Play / barge-in
 - Context compaction
