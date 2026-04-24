@@ -164,12 +164,29 @@ async fn connect(
             .parse()
             .map_err(|e| anyhow!("bearer header parse: {e}"))?,
     );
-    let (ws, resp) = tokio_tungstenite::connect_async(req).await?;
-    tracing::info!(status = %resp.status(), "connected");
-    for (name, value) in resp.headers() {
-        tracing::debug!(header = %name, value = ?value, "response header");
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, resp)) => {
+            tracing::info!(status = %resp.status(), "connected");
+            for (name, value) in resp.headers() {
+                tracing::info!(header = %name, value = ?value, "response header");
+            }
+            Ok(ws)
+        }
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            tracing::error!(status = %resp.status(), "handshake rejected");
+            for (name, value) in resp.headers() {
+                tracing::error!(header = %name, value = ?value, "response header");
+            }
+            if let Some(body) = resp.body() {
+                let txt = String::from_utf8_lossy(body);
+                tracing::error!(body = %txt, "response body");
+            } else {
+                tracing::error!("no response body");
+            }
+            Err(anyhow!("WS handshake failed: {}", resp.status()))
+        }
+        Err(e) => Err(anyhow!("WS connect error: {e}")),
     }
-    Ok(ws)
 }
 
 async fn run_stt(
