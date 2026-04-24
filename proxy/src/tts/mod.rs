@@ -11,6 +11,7 @@ pub mod cache;
 pub mod elevenlabs;
 pub mod hub;
 pub mod silence;
+pub mod xai;
 
 use std::pin::Pin;
 
