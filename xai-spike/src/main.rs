@@ -52,7 +52,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Mode {
     /// Exercise the STT streaming WebSocket.
-    StttWs {
+    SttWs {
         /// Optional path to a WAV/PCM/Opus file. Default: synthetic
         /// 2-second 16 kHz PCM16 440 Hz sine tone.
         #[arg(long)]
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
 
     match cli.mode {
-        Mode::StttWs {
+        Mode::SttWs {
             audio,
             audio_format,
             language,
