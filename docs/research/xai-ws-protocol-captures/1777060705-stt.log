@@ -1,0 +1,8 @@
+URL: wss://api.x.ai/v1/stt?model=grok-stt&language=en
+---
+>> sent audio.done
+<< TEXT {"type":"transcript.created","id":"cdf33ce2-3ad8-4a23-a5c0-dd39425479c5"}
+<< TEXT {"type":"transcript.partial","text":"","words":[],"is_final":true,"speech_final":false,"start":0.0,"duration":0.04}
+<< TEXT {"type":"transcript.partial","text":"","words":[],"is_final":true,"speech_final":false,"start":0.04,"duration":1.52}
+<< TEXT {"type":"transcript.done","text":"","words":[],"duration":2.0}
+<< ERR WebSocket protocol error: Connection reset without closing handshake
