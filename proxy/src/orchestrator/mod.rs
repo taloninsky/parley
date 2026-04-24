@@ -672,6 +672,10 @@ impl ConversationOrchestrator {
                 llm_cost: cost,
                 tts_characters,
                 tts_cost,
+                // STT runs outside the orchestrator today (browser-direct
+                // capture). Reserve the slot; populated when the proxy
+                // captures STT itself. Spec §7.
+                stt_cost: parley_core::chat::Cost::default(),
             };
 
             let appended_turn_id = {

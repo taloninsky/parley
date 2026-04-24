@@ -95,6 +95,12 @@ pub struct TurnProvenance {
     /// when no TTS provider was active.
     #[serde(default)]
     pub tts_cost: Cost,
+    /// Computed USD cost of the STT capture for this turn. Zero
+    /// when STT ran outside the orchestrator (e.g. browser-direct
+    /// AssemblyAI capture) or when the turn has no associated audio.
+    /// Spec: `docs/xai-speech-integration-spec.md` §7.
+    #[serde(default)]
+    pub stt_cost: Cost,
 }
 
 /// Records a single (persona, model) activation window — used to
@@ -368,6 +374,7 @@ mod tests {
             llm_cost: Cost::from_usd(0.01),
             tts_characters: 0,
             tts_cost: Cost::default(),
+            stt_cost: Cost::default(),
         };
         s.append_ai_turn("ai-scholar".into(), "hello".into(), 2, prov.clone());
         assert!(s.turns[0].provenance.is_none());
@@ -415,6 +422,7 @@ mod tests {
                 llm_cost: Cost::default(),
                 tts_characters: 0,
                 tts_cost: Cost::default(),
+                stt_cost: Cost::default(),
             },
         );
         let msgs = s.to_chat_messages();
@@ -456,6 +464,7 @@ mod tests {
                 llm_cost: Cost::default(),
                 tts_characters: 0,
                 tts_cost: Cost::default(),
+                stt_cost: Cost::default(),
             },
         );
         assert!(!s.has_pending_user_turn());
@@ -486,6 +495,7 @@ mod tests {
                 llm_cost: Cost::default(),
                 tts_characters: 0,
                 tts_cost: Cost::default(),
+                stt_cost: Cost::default(),
             },
         );
         assert!(s.discard_pending_user_turn().is_none());
@@ -510,6 +520,7 @@ mod tests {
                 llm_cost: Cost::from_usd(0.001),
                 tts_characters: 0,
                 tts_cost: Cost::default(),
+                stt_cost: Cost::default(),
             },
         );
         let json = serde_json::to_string(&s).unwrap();
@@ -517,6 +528,39 @@ mod tests {
         assert_eq!(parsed.turns.len(), 2);
         assert_eq!(parsed.persona_history.len(), 1);
         assert_eq!(parsed.id, "sess-1");
+    }
+
+    #[test]
+    fn turn_provenance_decodes_legacy_json_without_stt_cost() {
+        // Pre-step-12 session files lack `stt_cost`. The default
+        // attribute must zero-fill the field so older sessions
+        // continue to load.
+        let json = r#"{
+            "persona_id": "scholar",
+            "model_config_id": "claude-x",
+            "usage": {"input": 1, "output": 1},
+            "llm_cost": {"usd": 0.001},
+            "tts_characters": 0,
+            "tts_cost": {"usd": 0.0}
+        }"#;
+        let prov: TurnProvenance = serde_json::from_str(json).expect("legacy decode");
+        assert_eq!(prov.stt_cost, Cost::default());
+    }
+
+    #[test]
+    fn turn_provenance_round_trips_stt_cost() {
+        let prov = TurnProvenance {
+            persona_id: "scholar".into(),
+            model_config_id: "claude-x".into(),
+            usage: TokenUsage::default(),
+            llm_cost: Cost::default(),
+            tts_characters: 0,
+            tts_cost: Cost::default(),
+            stt_cost: Cost::from_usd(0.0042),
+        };
+        let s = serde_json::to_string(&prov).unwrap();
+        let back: TurnProvenance = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.stt_cost, Cost::from_usd(0.0042));
     }
 
     #[test]
