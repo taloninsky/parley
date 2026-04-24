@@ -9,6 +9,7 @@ use tower_http::cors::CorsLayer;
 mod conversation_api;
 mod llm;
 mod orchestrator;
+mod profile;
 mod providers;
 mod registry;
 mod secrets;
