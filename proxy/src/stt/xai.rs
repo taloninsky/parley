@@ -26,11 +26,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use parley_core::chat::Cost;
 use parley_core::stt::{
     SttAudioFormat, SttRequest, SttStreamConfig, Transcript, TranscriptEvent, TranscriptSegment,
 };
 use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 use super::{SttError, SttProvider, SttResult, SttStreamHandle};
 use crate::providers::ProviderId;
@@ -59,7 +63,6 @@ pub const XAI_STT_COST_STREAM_PER_SECOND: f64 = 0.20 / 3600.0;
 pub struct XaiStt {
     api_key: Arc<str>,
     rest_url: Arc<str>,
-    #[allow(dead_code)] // wired up in Step 3 WS
     ws_url: Arc<str>,
     client: reqwest::Client,
 }
@@ -262,11 +265,8 @@ impl SttProvider for XaiStt {
         })
     }
 
-    async fn stream(&self, _config: SttStreamConfig) -> SttResult<SttStreamHandle> {
-        // Lands in Step 3 WS — see `docs/xai-speech-integration-spec.md` §10.2.
-        Err(SttError::Unsupported(
-            "xAI STT streaming WS lands in Step 3 WS".into(),
-        ))
+    async fn stream(&self, config: SttStreamConfig) -> SttResult<SttStreamHandle> {
+        open_stream(self.ws_url.as_ref(), self.api_key.as_ref(), config).await
     }
 
     fn cost(&self, seconds: f64, streaming: bool) -> Cost {
@@ -279,10 +279,190 @@ impl SttProvider for XaiStt {
     }
 }
 
-// Silence the unused-import lint until `TranscriptEvent` is referenced
-// by the WS client in Step 3 WS.
-#[allow(dead_code)]
-const _TRANSCRIPT_EVENT_PLACEHOLDER: Option<TranscriptEvent> = None;
+/// Outcome of parsing one xAI WS text frame.
+///
+/// Factored out so parsing logic is testable without standing up a
+/// real WebSocket server. The [`open_stream`] reader task applies the
+/// same match below on live frames.
+#[derive(Debug, PartialEq)]
+enum ParsedFrame {
+    /// Drop this frame (e.g., `transcript.created` session ack or an
+    /// unrecognized type we deliberately ignore).
+    Skip,
+    /// Emit this event to the consumer.
+    Emit(TranscriptEvent),
+    /// Emit this event and then close the stream. `transcript.done` is
+    /// the only frame that generates this — per the spike's verified
+    /// protocol, the server drops the TCP connection right after, and
+    /// we must not propagate that as an error.
+    Terminal(TranscriptEvent),
+}
+
+fn parse_speaker(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn parse_ws_text(text: &str) -> SttResult<ParsedFrame> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| SttError::BadResponse(format!("ws text not json: {e}")))?;
+    let kind = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| SttError::Protocol("frame missing `type` field".into()))?;
+
+    match kind {
+        // Session ack — no canonical event maps to it; the trace id on
+        // the upgrade response is enough correlation for support.
+        "transcript.created" => Ok(ParsedFrame::Skip),
+
+        "transcript.partial" => {
+            let text = v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_final = v
+                .get("is_final")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if is_final {
+                let start = v.get("start").and_then(|n| n.as_f64());
+                let end = match (start, v.get("duration").and_then(|n| n.as_f64())) {
+                    (Some(s), Some(d)) => Some(s + d),
+                    _ => None,
+                };
+                let speaker = v
+                    .get("words")
+                    .and_then(|w| w.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|w| w.get("speaker"))
+                    .and_then(|s| parse_speaker(s));
+                Ok(ParsedFrame::Emit(TranscriptEvent::Final {
+                    text,
+                    speaker,
+                    start_seconds: start,
+                    end_seconds: end,
+                }))
+            } else {
+                Ok(ParsedFrame::Emit(TranscriptEvent::Partial { text }))
+            }
+        }
+
+        "transcript.done" => {
+            let duration = v
+                .get("duration")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0);
+            Ok(ParsedFrame::Terminal(TranscriptEvent::Done {
+                duration_seconds: duration,
+            }))
+        }
+
+        // Unknown / not-yet-seen types are skipped rather than
+        // escalated — xAI may introduce new event kinds (e.g., a future
+        // `transcript.error`) and we'd rather keep the stream alive
+        // than crash on the first unknown frame. When one shows up in
+        // prod, parse_ws_text gains an explicit arm.
+        _ => Ok(ParsedFrame::Skip),
+    }
+}
+
+/// Open the xAI STT WebSocket and wire up the bidirectional plumbing.
+///
+/// Spawns two tasks:
+/// - **audio forwarder**: drains the caller's `audio_tx` into binary WS
+///   frames; on channel close, sends the text `audio.done` terminator.
+/// - **event reader**: parses inbound text frames into canonical
+///   [`TranscriptEvent`]s; on `transcript.done` it emits `Done` and
+///   terminates, which lets the WS drop cleanly and swallows the
+///   known-spurious `Connection reset without closing handshake` that
+///   xAI always produces post-terminator (see `docs/research/xai-ws-protocol.md`).
+async fn open_stream(
+    ws_url: &str,
+    api_key: &str,
+    config: SttStreamConfig,
+) -> SttResult<SttStreamHandle> {
+    let lang = config.language.as_deref().unwrap_or("en");
+    let url = format!("{ws_url}?model={XAI_STT_MODEL}&language={lang}");
+
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| SttError::Transport(format!("bad ws url: {e}")))?;
+    let bearer = format!("Bearer {api_key}")
+        .parse()
+        .map_err(|e| SttError::Other(format!("bearer header: {e}")))?;
+    request.headers_mut().insert("Authorization", bearer);
+
+    let (ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| SttError::Transport(e.to_string()))?;
+    let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // 64-slot channels are a compromise: enough to absorb ~1s of
+    // 4 KB PCM frames at realtime pacing, small enough that a
+    // misbehaving producer applies backpressure on the caller instead
+    // of growing unboundedly.
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (event_tx, event_rx) = mpsc::channel::<SttResult<TranscriptEvent>>(64);
+
+    // Audio forwarder: Vec<u8> frames in → binary WS frames out.
+    tokio::spawn(async move {
+        while let Some(chunk) = audio_rx.recv().await {
+            if ws_sink.send(Message::Binary(chunk.into())).await.is_err() {
+                return;
+            }
+        }
+        // Caller closed audio_tx → signal xAI we're done pushing audio.
+        let _ = ws_sink
+            .send(Message::Text(r#"{"type":"audio.done"}"#.into()))
+            .await;
+    });
+
+    // Event reader: WS text frames in → SttResult<TranscriptEvent> out.
+    tokio::spawn(async move {
+        while let Some(msg) = ws_stream.next().await {
+            match msg {
+                Ok(Message::Text(t)) => match parse_ws_text(&t) {
+                    Ok(ParsedFrame::Skip) => {}
+                    Ok(ParsedFrame::Emit(ev)) => {
+                        if event_tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(ParsedFrame::Terminal(ev)) => {
+                        let _ = event_tx.send(Ok(ev)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(Err(e)).await;
+                        return;
+                    }
+                },
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {}
+                Err(e) => {
+                    // Pre-terminator error — surface it. (Post-terminator
+                    // we've already returned from the task, so xAI's TCP
+                    // reset never reaches here.)
+                    let _ = event_tx
+                        .send(Err(SttError::Protocol(e.to_string())))
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(SttStreamHandle {
+        audio_tx,
+        events: Box::pin(ReceiverStream::new(event_rx)),
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -445,24 +625,76 @@ mod tests {
         assert!(received.is_empty());
     }
 
-    #[tokio::test]
-    async fn stream_returns_unsupported_in_rest_only_step() {
-        let p = XaiStt::new("k", reqwest::Client::new());
-        let result = p
-            .stream(SttStreamConfig {
-                format: SttAudioFormat::Pcm16Le {
-                    sample_rate_hz: 16000,
-                },
-                language: None,
-                diarize: true,
-            })
-            .await;
-        // `SttStreamHandle` isn't `Debug`, so match explicitly rather
-        // than going through `unwrap_err()`.
-        match result {
-            Err(SttError::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
+    #[test]
+    fn parse_transcript_created_is_skipped() {
+        let frame = r#"{"type":"transcript.created","id":"abc"}"#;
+        assert_eq!(parse_ws_text(frame).unwrap(), ParsedFrame::Skip);
+    }
+
+    #[test]
+    fn parse_partial_non_final_maps_to_partial_event() {
+        let frame = r#"{"type":"transcript.partial","text":"hello wor","is_final":false,"start":0.0,"duration":0.3}"#;
+        match parse_ws_text(frame).unwrap() {
+            ParsedFrame::Emit(TranscriptEvent::Partial { text }) => {
+                assert_eq!(text, "hello wor");
+            }
+            other => panic!("expected Emit(Partial), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_partial_final_maps_to_final_event_with_timing_and_speaker() {
+        let frame = r#"{"type":"transcript.partial","text":"hello world","words":[{"text":"hello","start":0.0,"end":0.5,"speaker":0},{"text":"world","start":0.6,"end":1.0,"speaker":0}],"is_final":true,"speech_final":false,"start":0.0,"duration":1.0}"#;
+        match parse_ws_text(frame).unwrap() {
+            ParsedFrame::Emit(TranscriptEvent::Final {
+                text,
+                speaker,
+                start_seconds,
+                end_seconds,
+            }) => {
+                assert_eq!(text, "hello world");
+                assert_eq!(speaker.as_deref(), Some("0"));
+                assert_eq!(start_seconds, Some(0.0));
+                assert_eq!(end_seconds, Some(1.0));
+            }
+            other => panic!("expected Emit(Final), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_done_is_terminal_with_duration() {
+        let frame = r#"{"type":"transcript.done","text":"","words":[],"duration":2.5}"#;
+        match parse_ws_text(frame).unwrap() {
+            ParsedFrame::Terminal(TranscriptEvent::Done { duration_seconds }) => {
+                assert!((duration_seconds - 2.5).abs() < 1e-9);
+            }
+            other => panic!("expected Terminal(Done), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_frame_is_skipped() {
+        // Defensive: a future `transcript.error` (or anything else)
+        // must not crash the parser — the reader keeps consuming.
+        let frame = r#"{"type":"transcript.future_thing","whatever":true}"#;
+        assert_eq!(parse_ws_text(frame).unwrap(), ParsedFrame::Skip);
+    }
+
+    #[test]
+    fn parse_missing_type_is_protocol_error() {
+        let frame = r#"{"id":"abc"}"#;
+        match parse_ws_text(frame) {
+            Err(SttError::Protocol(_)) => {}
+            other => panic!("expected Protocol err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_non_json_is_bad_response() {
+        let frame = "not json at all";
+        match parse_ws_text(frame) {
+            Err(SttError::BadResponse(_)) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
         }
     }
 
