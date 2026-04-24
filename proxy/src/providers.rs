@@ -73,6 +73,9 @@ pub enum ProviderId {
     /// ElevenLabs — used for streaming TTS in Conversation Mode.
     #[serde(rename = "elevenlabs")]
     ElevenLabs,
+    /// xAI — used for streaming STT (`grok-stt`) and TTS with a single
+    /// bearer token covering both surfaces. Spec: `docs/xai-speech-integration-spec.md`.
+    Xai,
 }
 
 impl ProviderId {
@@ -82,6 +85,7 @@ impl ProviderId {
             ProviderId::Anthropic,
             ProviderId::AssemblyAi,
             ProviderId::ElevenLabs,
+            ProviderId::Xai,
         ]
     }
 
@@ -90,9 +94,16 @@ impl ProviderId {
         self.descriptor().id
     }
 
-    /// Category this provider belongs to.
-    pub const fn category(self) -> ProviderCategory {
-        self.descriptor().category
+    /// Categories this provider belongs to. Most providers have exactly
+    /// one; xAI has two (STT + TTS) because a single bearer token serves
+    /// both surfaces. See `docs/xai-speech-integration-spec.md` §6.1.1.
+    pub const fn categories(self) -> &'static [ProviderCategory] {
+        self.descriptor().categories
+    }
+
+    /// `true` if this provider plays in the given category.
+    pub fn has_category(self, cat: ProviderCategory) -> bool {
+        self.categories().contains(&cat)
     }
 
     /// Human-readable display name (shown in the UI).
@@ -156,8 +167,10 @@ pub struct ProviderDescriptor {
     pub id: &'static str,
     /// Human-readable name.
     pub display_name: &'static str,
-    /// Category.
-    pub category: ProviderCategory,
+    /// Categories this provider plays in. Usually one; multi-category
+    /// providers (e.g. xAI: STT + TTS under one bearer token) list all
+    /// the categories they participate in.
+    pub categories: &'static [ProviderCategory],
     /// Env var that overrides the `default` credential.
     pub env_var: &'static str,
 }
@@ -171,20 +184,26 @@ pub static REGISTRY: &[ProviderDescriptor] = &[
     ProviderDescriptor {
         id: "anthropic",
         display_name: "Anthropic",
-        category: ProviderCategory::Llm,
+        categories: &[ProviderCategory::Llm],
         env_var: "PARLEY_ANTHROPIC_API_KEY",
     },
     ProviderDescriptor {
         id: "assemblyai",
         display_name: "AssemblyAI",
-        category: ProviderCategory::Stt,
+        categories: &[ProviderCategory::Stt],
         env_var: "PARLEY_ASSEMBLYAI_API_KEY",
     },
     ProviderDescriptor {
         id: "elevenlabs",
         display_name: "ElevenLabs",
-        category: ProviderCategory::Tts,
+        categories: &[ProviderCategory::Tts],
         env_var: "PARLEY_ELEVENLABS_API_KEY",
+    },
+    ProviderDescriptor {
+        id: "xai",
+        display_name: "xAI",
+        categories: &[ProviderCategory::Stt, ProviderCategory::Tts],
+        env_var: "PARLEY_XAI_API_KEY",
     },
 ];
 
@@ -226,6 +245,8 @@ mod tests {
         assert_eq!(json, "\"assemblyai\"");
         let json = serde_json::to_string(&ProviderId::ElevenLabs).unwrap();
         assert_eq!(json, "\"elevenlabs\"");
+        let json = serde_json::to_string(&ProviderId::Xai).unwrap();
+        assert_eq!(json, "\"xai\"");
     }
 
     #[test]
@@ -236,6 +257,8 @@ mod tests {
         assert_eq!(p, ProviderId::AssemblyAi);
         let p: ProviderId = serde_json::from_str("\"elevenlabs\"").unwrap();
         assert_eq!(p, ProviderId::ElevenLabs);
+        let p: ProviderId = serde_json::from_str("\"xai\"").unwrap();
+        assert_eq!(p, ProviderId::Xai);
     }
 
     #[test]
@@ -268,7 +291,14 @@ mod tests {
     fn every_provider_belongs_to_a_known_category() {
         let valid = ProviderCategory::all();
         for d in REGISTRY {
-            assert!(valid.contains(&d.category), "{} has unknown category", d.id);
+            assert!(
+                !d.categories.is_empty(),
+                "{} must declare at least one category",
+                d.id
+            );
+            for cat in d.categories {
+                assert!(valid.contains(cat), "{} has unknown category", d.id);
+            }
         }
     }
 
@@ -281,15 +311,50 @@ mod tests {
 
     #[test]
     fn descriptor_lookup_matches_explicit_metadata() {
-        // Sanity: ProviderId::Anthropic is the LLM, AssemblyAi is STT.
-        assert_eq!(ProviderId::Anthropic.category(), ProviderCategory::Llm);
-        assert_eq!(ProviderId::AssemblyAi.category(), ProviderCategory::Stt);
+        assert_eq!(
+            ProviderId::Anthropic.categories(),
+            &[ProviderCategory::Llm]
+        );
+        assert_eq!(
+            ProviderId::AssemblyAi.categories(),
+            &[ProviderCategory::Stt]
+        );
+        assert_eq!(
+            ProviderId::ElevenLabs.categories(),
+            &[ProviderCategory::Tts]
+        );
         assert_eq!(ProviderId::Anthropic.display_name(), "Anthropic");
         assert_eq!(ProviderId::AssemblyAi.display_name(), "AssemblyAI");
+        assert_eq!(ProviderId::Xai.display_name(), "xAI");
         assert_eq!(ProviderId::Anthropic.env_var(), "PARLEY_ANTHROPIC_API_KEY");
         assert_eq!(
             ProviderId::AssemblyAi.env_var(),
             "PARLEY_ASSEMBLYAI_API_KEY"
         );
+        assert_eq!(ProviderId::Xai.env_var(), "PARLEY_XAI_API_KEY");
+    }
+
+    #[test]
+    fn xai_is_multi_category_stt_and_tts() {
+        let cats = ProviderId::Xai.categories();
+        assert!(cats.contains(&ProviderCategory::Stt));
+        assert!(cats.contains(&ProviderCategory::Tts));
+        assert!(!cats.contains(&ProviderCategory::Llm));
+        assert!(ProviderId::Xai.has_category(ProviderCategory::Stt));
+        assert!(ProviderId::Xai.has_category(ProviderCategory::Tts));
+        assert!(!ProviderId::Xai.has_category(ProviderCategory::Llm));
+    }
+
+    #[test]
+    fn has_category_matches_categories_membership() {
+        for p in ProviderId::all() {
+            for cat in ProviderCategory::all() {
+                assert_eq!(
+                    p.has_category(*cat),
+                    p.categories().contains(cat),
+                    "{p}.has_category({cat}) must match categories().contains"
+                );
+            }
+        }
     }
 }
