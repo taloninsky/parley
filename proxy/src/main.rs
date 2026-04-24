@@ -15,7 +15,9 @@ mod secrets;
 mod secrets_api;
 mod session_store;
 mod stt;
+mod stt_api;
 mod tts;
+mod tts_api;
 
 use providers::ProviderId;
 use secrets::{DEFAULT_CREDENTIAL, SecretsManager};
@@ -558,9 +560,14 @@ async fn main() {
         client: client.clone(),
         secrets: secrets_manager.clone(),
     });
-    let conversation_state =
-        conversation_api::ConversationApiState::new(registries, client, secrets_manager.clone());
-    let secrets_state = secrets_api::SecretsApiState::new(secrets_manager);
+    let conversation_state = conversation_api::ConversationApiState::new(
+        registries,
+        client.clone(),
+        secrets_manager.clone(),
+    );
+    let secrets_state = secrets_api::SecretsApiState::new(secrets_manager.clone());
+    let stt_api_state = stt_api::SttApiState::new(client.clone(), secrets_manager.clone());
+    let tts_api_state = tts_api::TtsApiState::new(client, secrets_manager);
 
     let app = Router::new()
         .route("/token", post(fetch_token))
@@ -568,6 +575,8 @@ async fn main() {
         .with_state(state)
         .merge(conversation_api::router(conversation_state))
         .merge(secrets_api::router(secrets_state))
+        .merge(stt_api::router(stt_api_state))
+        .merge(tts_api::router(tts_api_state))
         .layer(cors);
 
     let addr = "127.0.0.1:3033";
