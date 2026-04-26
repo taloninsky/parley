@@ -10,17 +10,20 @@
 
 Parley's todo.md Phase 8 defines full-duplex mode: simultaneous capture + playback, with an AI as a conversation participant. This research covers the technology landscape for making that work, with a focus on Gradium as the leading candidate for the TTS/voice-agent path.
 
+Related Hume work: [hume-octave-2-tts.md](hume-octave-2-tts.md) and [../hume-octave-2-tts-integration-spec.md](../hume-octave-2-tts-integration-spec.md).
+
 ---
 
 ## 1. Cascaded vs Audio-Native Pipelines
 
 ### Cascaded (current industry standard)
 
-```
+```text
 User audio → STT → text → LLM → text → TTS → AI audio
 ```
 
 Latency stack:
+
 - STT: ~200–500ms
 - LLM first token: ~200–500ms
 - TTS first audio: ~200–400ms
@@ -29,19 +32,21 @@ Latency stack:
 Human conversational turn-taking gap is ~200ms. Cascaded pipelines can't match this.
 
 Additional limitations:
+
 - Non-linguistic information (tone, emotion, hesitation) is lost at the STT→text boundary
 - Turn-taking is rigid — can't model overlapping speech, interjections, or backchannels
 - Each component is independently optimized, not jointly
 
 ### Audio-native (emerging)
 
-```
+```text
 User audio tokens → Audio Language Model → AI audio tokens
 ```
 
 The model processes audio tokens directly, without an intermediate text representation. Text may be generated as an "inner monologue" alongside audio tokens (Moshi's approach) for linguistic grounding, but the primary modality is audio-to-audio.
 
 Advantages:
+
 - Full-duplex by design (model hears while speaking)
 - Preserves prosodic/emotional information
 - Latency: ~160–200ms theoretical (Moshi achieves 200ms in practice)
@@ -61,7 +66,7 @@ Advantages:
 ### Founders
 
 | Person | Role | Background | Notable work |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Neil Zeghidour | CEO | Google DeepMind / Meta | **SoundStream** (1432 citations) — invented neural audio codecs with RVQ. Co-authored AudioLM (1070 citations), SoundStorm, LEAF |
 | Alexandre Défossez | Chief Science Officer | Meta | **EnCodec** (1451 citations) — Meta's neural audio codec. Lead on **Moshi** (first real-time full-duplex spoken LLM) and **DSM** (Delayed Streams Modeling) |
 | Laurent Mazaré | Chief Coding Officer | Google DeepMind / Jane Street | Co-author on Moshi, DSM. Co-created the `candle` Rust ML framework. Maintains `gradium-rs` |
@@ -75,6 +80,7 @@ Advantages:
 Gradium's models are built on the DSM architecture (arXiv:2509.08753), which evolved from the Moshi/RQ-Transformer approach.
 
 **Key idea:** Model text and audio as time-aligned streams with configurable delays using a decoder-only language model.
+
 - TTS = text stream in, delayed audio stream out
 - STT = audio stream in, delayed text stream out
 - **Same architecture for both directions**
@@ -86,7 +92,7 @@ Audio tokenization uses Residual Vector Quantization (RVQ) with up to 32 codeboo
 TTFA (Time to First Audio) — the metric that matters for conversational feel:
 
 | Provider | p50 | p90 | p99 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Gradium** | **255ms** | **263ms** | **274ms** |
 | ElevenLabs Turbo v2.5 | 294ms | 311ms | 324ms |
 | ElevenLabs Flash v2.5 | 317ms | 333ms | 351ms |
@@ -96,7 +102,7 @@ TTFA (Time to First Audio) — the metric that matters for conversational feel:
 With persistent WebSocket (multiplexing, no connection overhead):
 
 | Provider | p50 | p90 |
-|---|---|---|
+| --- | --- | --- |
 | **Gradium** | **212ms** | **219ms** |
 | ElevenLabs Turbo v2.5 | 248ms | 263ms |
 
@@ -126,6 +132,7 @@ See docs/research/stt-providers.md for full STT comparison.
 ### Where Gradium fits
 
 **TTS for Phase 8 (Full-Duplex & TTS):**
+
 - Sub-250ms TTFA enables near-human turn-taking
 - Streaming: LLM tokens → Gradium TTS → audio output with minimal buffering
 - Voice cloning could give the AI a consistent, recognizable voice
@@ -139,7 +146,7 @@ See docs/research/stt-providers.md for full STT comparison.
 
 ### Cascaded approach (practical near-term)
 
-```
+```text
 User mic → Deepgram STT → word graph
                               ↓
                          LLM (text reasoning)
@@ -148,6 +155,7 @@ User mic → Deepgram STT → word graph
 ```
 
 This is the standard voice agent pipeline. Latency budget:
+
 - Deepgram STT + VAD: ~300ms
 - LLM first token: ~200–400ms
 - Gradium TTS first audio: ~250ms
@@ -159,7 +167,7 @@ Optimization: stream LLM tokens directly into Gradium TTS as they arrive, overla
 
 If Gradium ships a full audio-to-audio model (Moshi-derived):
 
-```
+```text
 User audio tokens → Gradium ALM → AI audio tokens + text inner monologue
 ```
 
@@ -168,6 +176,7 @@ This would give ~200ms latency and true full-duplex. Gradium's founding team bui
 ### AI as conversation participant
 
 When the AI speaks, it becomes another speaker in the word graph:
+
 - AI speech gets its own `speaker: u8` lane
 - AI-generated words have `origin: NodeOrigin::AiGenerated` (new variant, if needed)
 - AI words appear in the transcript alongside human speakers
@@ -176,6 +185,7 @@ When the AI speaks, it becomes another speaker in the word graph:
 ### Turn-taking / floor management
 
 In multi-party conversations with AI:
+
 - AI should respect semantic VAD — don't interrupt when humans are mid-sentence
 - AI should handle backchannels — "yeah", "mm-hmm" from humans shouldn't trigger a full response
 - AI should support barge-in — if a human starts speaking while AI is talking, AI stops
