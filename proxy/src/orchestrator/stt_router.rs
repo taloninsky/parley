@@ -46,13 +46,11 @@ pub enum ProviderSelection {
 
 /// Canonical STT fallback order per §14.1:
 ///   `xai` → `assemblyai`.
-pub const STT_FALLBACK_ORDER: &[ProviderId] =
-    &[ProviderId::Xai, ProviderId::AssemblyAi];
+pub const STT_FALLBACK_ORDER: &[ProviderId] = &[ProviderId::Xai, ProviderId::AssemblyAi];
 
 /// Canonical TTS fallback order per §14.1:
 ///   `xai` → `elevenlabs`.
-pub const TTS_FALLBACK_ORDER: &[ProviderId] =
-    &[ProviderId::Xai, ProviderId::ElevenLabs];
+pub const TTS_FALLBACK_ORDER: &[ProviderId] = &[ProviderId::Xai, ProviderId::ElevenLabs];
 
 /// Select the STT provider to drive for a turn.
 ///
@@ -70,7 +68,13 @@ pub fn select_stt_provider(
     credential: &str,
     secrets: &SecretsManager,
 ) -> ProviderSelection {
-    select(preferred, credential, secrets, ProviderCategory::Stt, STT_FALLBACK_ORDER)
+    select(
+        preferred,
+        credential,
+        secrets,
+        ProviderCategory::Stt,
+        STT_FALLBACK_ORDER,
+    )
 }
 
 /// Select the TTS provider to drive for a turn. See
@@ -81,7 +85,13 @@ pub fn select_tts_provider(
     credential: &str,
     secrets: &SecretsManager,
 ) -> ProviderSelection {
-    select(preferred, credential, secrets, ProviderCategory::Tts, TTS_FALLBACK_ORDER)
+    select(
+        preferred,
+        credential,
+        secrets,
+        ProviderCategory::Tts,
+        TTS_FALLBACK_ORDER,
+    )
 }
 
 fn select(

@@ -98,8 +98,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let api_key = std::env::var("PARLEY_XAI_API_KEY")
-        .context("PARLEY_XAI_API_KEY env var required")?;
+    let api_key =
+        std::env::var("PARLEY_XAI_API_KEY").context("PARLEY_XAI_API_KEY env var required")?;
 
     let captures_dir = Path::new("docs/research/xai-ws-protocol-captures");
     fs::create_dir_all(captures_dir).await.ok();
@@ -153,10 +153,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn connect(
-    url: &str,
-    api_key: &str,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+async fn connect(url: &str, api_key: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let mut req = url.into_client_request()?;
     req.headers_mut().insert(
         "Authorization",
@@ -205,7 +202,8 @@ async fn run_stt(
 
     let mut ws = connect(&url, api_key).await?;
     let mut log = fs::File::create(log_path).await?;
-    log.write_all(format!("URL: {url}\n---\n").as_bytes()).await?;
+    log.write_all(format!("URL: {url}\n---\n").as_bytes())
+        .await?;
 
     let audio = match audio_path {
         Some(p) => fs::read(p).await?,
@@ -241,10 +239,10 @@ async fn run_tts(
 
     let mut ws = connect(&url, api_key).await?;
     let mut log = fs::File::create(log_path).await?;
-    log.write_all(format!("URL: {url}\n---\n").as_bytes()).await?;
+    log.write_all(format!("URL: {url}\n---\n").as_bytes())
+        .await?;
 
-    let payload =
-        format!(r#"{{"type":"text.delta","delta":{}}}"#, json_string(text));
+    let payload = format!(r#"{{"type":"text.delta","delta":{}}}"#, json_string(text));
     ws.send(Message::Text(payload.into())).await?;
     ws.send(Message::Text(r#"{"type":"text.done"}"#.into()))
         .await?;
@@ -290,12 +288,8 @@ async fn drain(
                     let sample = &b[..b.len().min(32)];
                     tracing::info!(len = b.len(), head = ?sample, "<< binary");
                     log.write_all(
-                        format!(
-                            "<< BIN {} bytes b64_head={}\n",
-                            b.len(),
-                            b64.encode(sample)
-                        )
-                        .as_bytes(),
+                        format!("<< BIN {} bytes b64_head={}\n", b.len(), b64.encode(sample))
+                            .as_bytes(),
                     )
                     .await?;
                 }

@@ -311,10 +311,7 @@ mod tests {
 
     #[test]
     fn descriptor_lookup_matches_explicit_metadata() {
-        assert_eq!(
-            ProviderId::Anthropic.categories(),
-            &[ProviderCategory::Llm]
-        );
+        assert_eq!(ProviderId::Anthropic.categories(), &[ProviderCategory::Llm]);
         assert_eq!(
             ProviderId::AssemblyAi.categories(),
             &[ProviderCategory::Stt]

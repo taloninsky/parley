@@ -14,11 +14,7 @@ use crate::ui::secrets::{ProviderStatus, SecretsStatus, use_secrets_status};
 /// Returns the `stt` providers in the same order the proxy's secrets
 /// status emitted them. Empty when the status hasn't loaded yet.
 pub fn stt_providers(status: &SecretsStatus) -> Vec<ProviderStatus> {
-    status
-        .categories
-        .get("stt")
-        .cloned()
-        .unwrap_or_default()
+    status.categories.get("stt").cloned().unwrap_or_default()
 }
 
 /// `true` when the provider has a resolvable `default` credential
@@ -59,7 +55,11 @@ pub fn SttProviderPicker(
                     let current = selected_provider_id.read().clone();
                     rsx! {
                         select {
-                            class: "stt-picker__select",
+                            class: "settings-input stt-picker__select",
+                            // See voice_picker.rs: when options come from a
+                            // `for` loop, `value` on <select> is unreliable.
+                            // The per-option `selected` attr is what actually
+                            // shows the right entry on initial render.
                             value: "{current}",
                             onchange: move |evt| {
                                 selected_provider_id.set(evt.value());
@@ -68,6 +68,7 @@ pub fn SttProviderPicker(
                                 option {
                                     key: "{p.id}",
                                     value: "{p.id}",
+                                    selected: p.id == current,
                                     disabled: !provider_is_configured(&p),
                                     title: if provider_is_configured(&p) {
                                         String::new()

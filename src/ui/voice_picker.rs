@@ -84,6 +84,9 @@ pub fn VoicePicker(
     let voices = use_resource(move || async move {
         let p = provider_id();
         let c = credential();
+        web_sys::console::log_1(
+            &format!("[voice-picker] fetching voices: provider={p}, credential={c}").into(),
+        );
         fetch_voices(&p, &c).await
     });
 
@@ -91,12 +94,23 @@ pub fn VoicePicker(
         let mut sel = selected_voice_id;
         if let Some(Ok(list)) = voices.read().as_ref() {
             if list.is_empty() {
+                web_sys::console::log_1(&"[voice-picker] effect: empty list".into());
                 return;
             }
             let current = sel.peek().clone();
-            if !list.iter().any(|v| v.id == current) {
+            let in_list = list.iter().any(|v| v.id == current);
+            web_sys::console::log_1(
+                &format!(
+                    "[voice-picker] effect: current={current:?}, in_list={in_list}, list_ids={:?}",
+                    list.iter().map(|v| &v.id).collect::<Vec<_>>(),
+                )
+                .into(),
+            );
+            if !in_list {
                 sel.set(list[0].id.clone());
             }
+        } else {
+            web_sys::console::log_1(&"[voice-picker] effect: voices not ready".into());
         }
     });
 
@@ -114,15 +128,26 @@ pub fn VoicePicker(
                 let options: Vec<VoiceDescriptor> = list.clone();
                 rsx! {
                     select {
-                        class: "voice-picker__select",
+                        class: "settings-input voice-picker__select",
+                        // Note: the `selected` attr on each <option> is the
+                        // load-bearing thing here. Setting `value` on a
+                        // <select> alone is unreliable in Dioxus when options
+                        // come from a `for` loop — the value can be applied
+                        // before the matching <option> exists, so the select
+                        // silently falls back to the first option.
                         value: "{current}",
                         onchange: move |evt| {
-                            selected_voice_id.set(evt.value());
+                            let v = evt.value();
+                            web_sys::console::log_1(
+                                &format!("[voice-picker] onchange: {v}").into(),
+                            );
+                            selected_voice_id.set(v);
                         },
                         for v in options {
                             option {
                                 key: "{v.id}",
                                 value: "{v.id}",
+                                selected: v.id == current,
                                 title: if v.language_tags.is_empty() {
                                     String::new()
                                 } else {

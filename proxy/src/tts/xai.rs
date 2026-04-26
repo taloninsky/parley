@@ -59,6 +59,13 @@ pub const XAI_TTS_COST_PER_CHAR_USD: f64 = 4.20 / 1_000_000.0;
 /// Default voice. `eve` is the documented default in spec §5.4.
 pub const XAI_TTS_DEFAULT_VOICE: &str = "eve";
 
+/// Default BCP-47 language tag sent on every synth request. xAI's
+/// `/v1/tts` endpoint requires `language` in the body (it returned
+/// 422 "missing field `language`" without it). English is the only
+/// language Parley speaks today; surfacing this as a constant keeps
+/// the choice explicit.
+pub const XAI_TTS_DEFAULT_LANGUAGE: &str = "en";
+
 /// The five canonical xAI voice IDs shipped today (spec §5.4). The
 /// voices catalog endpoint (§5.6) can override this at runtime; this
 /// list is the known-good baseline used when the catalog hasn't been
@@ -146,6 +153,7 @@ impl TtsProvider for XaiTts {
         let body = json!({
             "text": request.text,
             "voice_id": voice,
+            "language": XAI_TTS_DEFAULT_LANGUAGE,
             "output_format": {
                 "codec": "mp3",
                 "sample_rate": XAI_TTS_SAMPLE_RATE,
@@ -226,10 +234,19 @@ impl TtsProvider for XaiTts {
             });
         }
 
-        let body: VoicesResponse = resp
-            .json()
+        // Read as text first so we can include a snippet of the raw
+        // body in the error when JSON parsing fails. xAI's voices
+        // catalog schema is not yet documented and has shifted; the
+        // snippet lets us iterate when shape mismatches surface in
+        // production.
+        let raw = resp
+            .text()
             .await
-            .map_err(|e| TtsError::Protocol(format!("voices parse: {e}")))?;
+            .map_err(|e| TtsError::Transport(e.to_string()))?;
+        let body: VoicesResponse = serde_json::from_str(&raw).map_err(|e| {
+            let snippet: String = raw.chars().take(300).collect();
+            TtsError::Protocol(format!("voices parse: {e}; body starts with: {snippet}"))
+        })?;
         let voices = body.into_descriptors();
         self.store_voices_cache(&voices);
         Ok(voices)
@@ -257,9 +274,16 @@ impl XaiTts {
     }
 }
 
-/// xAI's documented voices response is `{ "voices": [ { "id": "eve",
-/// ... }, ... ] }` (spec §5.6 — exact schema unstable; we only
-/// depend on `id` plus optional `display_name`/`language_tags`).
+/// xAI's voices response (observed live, schema not yet documented):
+/// ```json
+/// {"voices":[
+///   {"voice_id":"ara","name":"Ara","language":"multilingual"},
+///   ...
+/// ]}
+/// ```
+/// We project this onto [`VoiceDescriptor`] (which uses `id` /
+/// `display_name` / `language_tags`) so the frontend doesn't need to
+/// special-case provider shapes.
 #[derive(Debug, Deserialize)]
 struct VoicesResponse {
     #[serde(default)]
@@ -268,12 +292,24 @@ struct VoicesResponse {
 
 #[derive(Debug, Deserialize)]
 struct VoiceEntry {
-    id: String,
+    /// xAI uses `voice_id` (we accept the legacy `id` too in case the
+    /// schema unifies later).
+    #[serde(alias = "id")]
+    voice_id: String,
+    /// Human-readable label. xAI uses `name`; older / synthetic
+    /// fixtures used `display_name`.
+    #[serde(alias = "display_name")]
     #[serde(default)]
-    display_name: Option<String>,
+    name: Option<String>,
+    /// Single BCP-47-or-`multilingual` string from xAI; we lift it to
+    /// the descriptor's `language_tags` vec (one entry).
+    #[serde(default)]
+    language: Option<String>,
+    /// Forward-compat: accept the multi-tag form even though xAI
+    /// emits the singular today.
     #[serde(default)]
     language_tags: Vec<String>,
-    // Accepted for forward-compat even if we don't project them into
+    // Accepted for forward-compat even if we don't project it into
     // `VoiceDescriptor` today.
     #[serde(default)]
     #[allow(dead_code)]
@@ -284,12 +320,20 @@ impl VoicesResponse {
     fn into_descriptors(self) -> Vec<VoiceDescriptor> {
         self.voices
             .into_iter()
-            .map(|v| VoiceDescriptor {
-                display_name: v
-                    .display_name
-                    .unwrap_or_else(|| title_case(&v.id)),
-                id: v.id,
-                language_tags: v.language_tags,
+            .map(|v| {
+                let display_name = v.name.unwrap_or_else(|| title_case(&v.voice_id));
+                let language_tags = if !v.language_tags.is_empty() {
+                    v.language_tags
+                } else if let Some(lang) = v.language {
+                    vec![lang]
+                } else {
+                    Vec::new()
+                };
+                VoiceDescriptor {
+                    id: v.voice_id,
+                    display_name,
+                    language_tags,
+                }
             })
             .collect()
     }
@@ -390,6 +434,7 @@ mod tests {
         let body = std::str::from_utf8(&received[0].body).unwrap();
         assert!(body.contains("\"text\":\"ok\""));
         assert!(body.contains("\"voice_id\":\"rex\""));
+        assert!(body.contains("\"language\":\"en\""));
         assert!(body.contains("\"codec\":\"mp3\""));
         assert!(body.contains("\"sample_rate\":44100"));
         assert!(body.contains("\"bit_rate\":128000"));
@@ -546,9 +591,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/tts/voices"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"voices":[{"id":"eve"}]}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"voices":[{"id":"eve"}]}"#),
+            )
             .expect(1) // second .voices() must not hit the mock
             .mount(&server)
             .await;

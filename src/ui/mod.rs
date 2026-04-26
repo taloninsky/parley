@@ -2,6 +2,7 @@
 pub mod app;
 pub mod conversation;
 pub mod media_player;
+pub mod pipeline;
 pub mod root;
 pub mod secrets;
 pub mod stt_provider_picker;

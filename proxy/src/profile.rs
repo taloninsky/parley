@@ -55,12 +55,12 @@ fn resolve_in_category(
     expected: ProviderCategory,
     block: &'static str,
 ) -> Result<ProviderId, ProfileError> {
-    let id: ProviderId = raw.parse().map_err(|UnknownProvider(v)| {
-        ProfileError::UnknownProvider {
-            category: block,
-            value: v,
-        }
-    })?;
+    let id: ProviderId =
+        raw.parse()
+            .map_err(|UnknownProvider(v)| ProfileError::UnknownProvider {
+                category: block,
+                value: v,
+            })?;
     if !id.has_category(expected) {
         return Err(ProfileError::UnknownProvider {
             category: block,

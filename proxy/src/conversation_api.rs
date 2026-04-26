@@ -66,7 +66,7 @@ use crate::orchestrator::{
 use crate::providers::ProviderId;
 use crate::secrets::{DEFAULT_CREDENTIAL, SecretsManager};
 use crate::session_store::{FsSessionStore, SessionStore, SessionStoreError};
-use crate::tts::{ElevenLabsTts, FsTtsCache, TtsBroadcastFrame, TtsHub};
+use crate::tts::{ElevenLabsTts, FsTtsCache, TtsBroadcastFrame, TtsHub, XaiTts};
 
 /// Default ElevenLabs voice id ("Jarnathan") used when an init or
 /// load request omits the `voice_id` field. Spec §6.
@@ -252,17 +252,27 @@ pub struct InitRequest {
     /// wire.
     #[serde(default)]
     pub credential: Option<String>,
-    /// ElevenLabs voice id for in-turn TTS synthesis. Defaults to
-    /// [`DEFAULT_TTS_VOICE_ID`] when omitted.
+    /// Voice id for in-turn TTS synthesis. Provider-specific (e.g. an
+    /// ElevenLabs voice id, or one of `eve`/`ara`/`rex`/`sal`/`leo`
+    /// for xAI). Defaults to [`DEFAULT_TTS_VOICE_ID`] (ElevenLabs) for
+    /// back-compat when omitted; `resolve_tts` swaps to the xAI default
+    /// when `tts_provider` is `xai` and `voice_id` is empty.
     #[serde(default)]
     pub voice_id: Option<String>,
-    /// Named credential for the ElevenLabs API key. Defaults to
+    /// Named credential for the TTS provider's API key. Defaults to
     /// `default`. When the named credential is missing, the session
     /// runs in text-only mode (no TTS dispatch); the session still
     /// initializes successfully so the user can configure a key
-    /// and retry via `/conversation/switch`.
+    /// and retry via `/conversation/switch`. Field name retained for
+    /// wire compatibility — applies to whichever provider is selected
+    /// via `tts_provider`.
     #[serde(default)]
     pub elevenlabs_credential: Option<String>,
+    /// TTS provider id: `elevenlabs` (default), `xai`, or `off` to
+    /// disable spoken replies. Unknown values fall back to no-TTS, the
+    /// same path taken when a key is missing.
+    #[serde(default)]
+    pub tts_provider: Option<String>,
 }
 
 /// Body for `POST /conversation/turn`.
@@ -303,16 +313,20 @@ pub struct LoadRequest {
     /// the loaded session's active model. Defaults to `default`.
     #[serde(default)]
     pub credential: Option<String>,
-    /// ElevenLabs voice id to use for synthesis after load. Defaults
-    /// to [`DEFAULT_TTS_VOICE_ID`].
+    /// Voice id to use for synthesis after load. Provider-specific.
+    /// Defaults to [`DEFAULT_TTS_VOICE_ID`] (ElevenLabs's "Jarnathan").
     #[serde(default)]
     pub voice_id: Option<String>,
-    /// Named credential for the ElevenLabs API key. Defaults to
+    /// Named credential for the TTS provider's API key. Defaults to
     /// `default`. Missing-credential behavior matches `/init`:
     /// load succeeds, TTS is disabled until a credential is
     /// configured.
     #[serde(default)]
     pub elevenlabs_credential: Option<String>,
+    /// TTS provider id for the loaded session: `elevenlabs` (default),
+    /// `xai`, or `off`. See [`InitRequest::tts_provider`].
+    #[serde(default)]
+    pub tts_provider: Option<String>,
 }
 
 /// Compact summary of a saved session, returned by `GET
@@ -454,6 +468,7 @@ async fn init_session(
     let snapshot = session.clone();
     let (tts, tts_voice_id) = resolve_tts(
         &state,
+        req.tts_provider.as_deref(),
         req.voice_id.as_deref(),
         req.elevenlabs_credential.as_deref(),
     );
@@ -577,7 +592,7 @@ async fn switch_persona(
     // `switch` doesn't carry voice/elevenlabs fields today — reuse
     // the default credential resolution (and the default voice).
     // The browser can re-init with explicit values to change voice.
-    let (tts, tts_voice_id) = resolve_tts(&state, None, None);
+    let (tts, tts_voice_id) = resolve_tts(&state, None, None, None);
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
         models: state.registries.models.clone(),
@@ -674,6 +689,7 @@ async fn load_session(
     let snapshot = session.clone();
     let (tts, tts_voice_id) = resolve_tts(
         &state,
+        req.tts_provider.as_deref(),
         req.voice_id.as_deref(),
         req.elevenlabs_credential.as_deref(),
     );
@@ -877,26 +893,63 @@ fn session_store_error_to_response(err: SessionStoreError) -> (StatusCode, Json<
 
 /// Resolve TTS provider + voice for a session-construction request.
 ///
-/// Returns `(provider, voice_id)` when an ElevenLabs key is
-/// configured for `credential` (defaulting to `default`); both are
-/// `None` when no key is configured. The session still constructs
-/// successfully on a missing key — TTS dispatch simply no-ops and
-/// the session runs in text-only mode (spec §6 "graceful
-/// degradation").
+/// Dispatches on `tts_provider` (defaulting to `elevenlabs` for
+/// back-compat with pre-pipeline-settings clients):
+///
+/// - `elevenlabs` — builds [`ElevenLabsTts`] with the resolved key.
+///   Voice id defaults to [`DEFAULT_TTS_VOICE_ID`] ("Jarnathan").
+/// - `xai` — builds [`XaiTts`] with the resolved key. Voice id
+///   defaults to xAI's `eve` when the caller passes empty / `None`.
+/// - `off` — explicitly disables TTS. Returns `(None, None)`.
+/// - Anything else — treated as `off` (graceful degradation rather
+///   than a hard 4xx; the session still initializes).
+///
+/// Returns `(None, None)` when the selected provider's key isn't
+/// configured. The session still constructs successfully on a missing
+/// key — TTS dispatch simply no-ops and the session runs in text-only
+/// mode (spec §6 "graceful degradation").
 fn resolve_tts(
     state: &ConversationApiState,
+    tts_provider: Option<&str>,
     voice_id: Option<&str>,
     credential: Option<&str>,
 ) -> (Option<Arc<dyn crate::tts::TtsProvider>>, Option<String>) {
+    let provider_id = tts_provider.unwrap_or("elevenlabs");
     let credential = credential.unwrap_or(DEFAULT_CREDENTIAL);
-    let key = match state.secrets.resolve(ProviderId::ElevenLabs, credential) {
-        Some(k) => k,
-        None => return (None, None),
-    };
-    let voice = voice_id.unwrap_or(DEFAULT_TTS_VOICE_ID).to_string();
-    let provider: Arc<dyn crate::tts::TtsProvider> =
-        Arc::new(ElevenLabsTts::new(key, state.http.clone()));
-    (Some(provider), Some(voice))
+    match provider_id {
+        "off" => (None, None),
+        "xai" => {
+            let key = match state.secrets.resolve(ProviderId::Xai, credential) {
+                Some(k) => k,
+                None => return (None, None),
+            };
+            // xAI's "no voice = use default" path lives inside `XaiTts`,
+            // but we hand the orchestrator a non-empty id so cache keys
+            // stay stable across runs.
+            let voice = voice_id
+                .filter(|v| !v.is_empty())
+                .unwrap_or(crate::tts::xai::XAI_TTS_DEFAULT_VOICE)
+                .to_string();
+            let provider: Arc<dyn crate::tts::TtsProvider> =
+                Arc::new(XaiTts::new(key, state.http.clone()));
+            (Some(provider), Some(voice))
+        }
+        // Default + unknown both fall through to ElevenLabs, the
+        // pre-settings behavior.
+        _ => {
+            let key = match state.secrets.resolve(ProviderId::ElevenLabs, credential) {
+                Some(k) => k,
+                None => return (None, None),
+            };
+            let voice = voice_id
+                .filter(|v| !v.is_empty())
+                .unwrap_or(DEFAULT_TTS_VOICE_ID)
+                .to_string();
+            let provider: Arc<dyn crate::tts::TtsProvider> =
+                Arc::new(ElevenLabsTts::new(key, state.http.clone()));
+            (Some(provider), Some(voice))
+        }
+    }
 }
 
 /// `GET /conversation/tts/{turn_id}` — SSE stream of MP3 audio for

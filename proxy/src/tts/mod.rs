@@ -32,6 +32,8 @@ pub use cache::{FsTtsCache, TtsCacheReader, TtsCacheWriter};
 #[allow(unused_imports)]
 pub use elevenlabs::ElevenLabsTts;
 pub use hub::{TtsBroadcastFrame, TtsBroadcaster, TtsHub};
+#[allow(unused_imports)]
+pub use xai::XaiTts;
 
 /// One synthesis request handed to a [`TtsProvider`]. The
 /// orchestrator builds these from [`parley_core::tts::SentenceChunk`]
@@ -199,6 +201,8 @@ pub trait TtsProvider: Send + Sync {
     /// picker doesn't re-hit the upstream on every render. The cache
     /// is an implementation detail, not part of the trait.
     async fn voices(&self) -> Result<Vec<VoiceDescriptor>, TtsError> {
-        Err(TtsError::Unsupported("voices catalog not implemented".into()))
+        Err(TtsError::Unsupported(
+            "voices catalog not implemented".into(),
+        ))
     }
 }

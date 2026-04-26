@@ -20,10 +20,10 @@ use serde_json::{Value, json};
 
 use crate::providers::{ProviderId, UnknownProvider};
 use crate::secrets::SecretsManager;
+use crate::tts::xai::XaiTts;
 use crate::tts::{
     AudioFormat, ElevenLabsTts, SynthesisContext, TtsChunk, TtsError, TtsProvider, TtsRequest,
 };
-use crate::tts::xai::XaiTts;
 
 /// Shared state for the TTS API router.
 #[derive(Clone)]
@@ -81,7 +81,10 @@ async fn synthesize(
     let provider_id: ProviderId = match body.provider.parse() {
         Ok(p) => p,
         Err(UnknownProvider(raw)) => {
-            return bad_request("unknown_provider", &format!("{raw} is not a known provider"));
+            return bad_request(
+                "unknown_provider",
+                &format!("{raw} is not a known provider"),
+            );
         }
     };
 
@@ -154,7 +157,10 @@ async fn voices(
     let provider_id: ProviderId = match q.provider.parse() {
         Ok(p) => p,
         Err(UnknownProvider(raw)) => {
-            return bad_request("unknown_provider", &format!("{raw} is not a known provider"));
+            return bad_request(
+                "unknown_provider",
+                &format!("{raw} is not a known provider"),
+            );
         }
     };
 
@@ -194,10 +200,7 @@ fn audio_format_str(f: AudioFormat) -> &'static str {
 
 // ── response helpers ──────────────────────────────────────────────────
 
-fn provider_not_configured(
-    provider: ProviderId,
-    credential: &str,
-) -> (StatusCode, Json<Value>) {
+fn provider_not_configured(provider: ProviderId, credential: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::PRECONDITION_FAILED,
         Json(json!({
@@ -394,7 +397,11 @@ mod tests {
             index_path,
         ));
         secrets
-            .set(ProviderId::Anthropic, crate::secrets::DEFAULT_CREDENTIAL, "k")
+            .set(
+                ProviderId::Anthropic,
+                crate::secrets::DEFAULT_CREDENTIAL,
+                "k",
+            )
             .expect("seed anthropic credential");
 
         let app = app_with(secrets);
@@ -454,7 +461,10 @@ mod tests {
 
     #[test]
     fn audio_format_str_stable() {
-        assert_eq!(audio_format_str(AudioFormat::Mp3_44100_128), "mp3_44100_128");
+        assert_eq!(
+            audio_format_str(AudioFormat::Mp3_44100_128),
+            "mp3_44100_128"
+        );
     }
 
     #[test]

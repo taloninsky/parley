@@ -291,11 +291,15 @@ enum ParsedFrame {
     Skip,
     /// Emit this event to the consumer.
     Emit(TranscriptEvent),
-    /// Emit this event and then close the stream. `transcript.done` is
-    /// the only frame that generates this — per the spike's verified
-    /// protocol, the server drops the TCP connection right after, and
-    /// we must not propagate that as an error.
-    Terminal(TranscriptEvent),
+    /// Close the stream. `transcript.done` is the only frame that
+    /// generates this — per the spike's verified protocol, the server
+    /// drops the TCP connection right after, and we must not propagate
+    /// that as an error. Some short utterances may only carry final text
+    /// on this frame, so keep the optional terminal transcript around.
+    Terminal {
+        text: Option<String>,
+        duration_seconds: f64,
+    },
 }
 
 fn parse_speaker(v: &serde_json::Value) -> Option<String> {
@@ -326,10 +330,7 @@ fn parse_ws_text(text: &str) -> SttResult<ParsedFrame> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .to_string();
-            let is_final = v
-                .get("is_final")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
+            let is_final = v.get("is_final").and_then(|b| b.as_bool()).unwrap_or(false);
             if is_final {
                 let start = v.get("start").and_then(|n| n.as_f64());
                 let end = match (start, v.get("duration").and_then(|n| n.as_f64())) {
@@ -341,7 +342,7 @@ fn parse_ws_text(text: &str) -> SttResult<ParsedFrame> {
                     .and_then(|w| w.as_array())
                     .and_then(|arr| arr.first())
                     .and_then(|w| w.get("speaker"))
-                    .and_then(|s| parse_speaker(s));
+                    .and_then(parse_speaker);
                 Ok(ParsedFrame::Emit(TranscriptEvent::Final {
                     text,
                     speaker,
@@ -354,13 +355,17 @@ fn parse_ws_text(text: &str) -> SttResult<ParsedFrame> {
         }
 
         "transcript.done" => {
-            let duration = v
-                .get("duration")
-                .and_then(|n| n.as_f64())
-                .unwrap_or(0.0);
-            Ok(ParsedFrame::Terminal(TranscriptEvent::Done {
+            let duration = v.get("duration").and_then(|n| n.as_f64()).unwrap_or(0.0);
+            let text = v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            Ok(ParsedFrame::Terminal {
+                text,
                 duration_seconds: duration,
-            }))
+            })
         }
 
         // Unknown / not-yet-seen types are skipped rather than
@@ -387,8 +392,16 @@ async fn open_stream(
     api_key: &str,
     config: SttStreamConfig,
 ) -> SttResult<SttStreamHandle> {
-    let lang = config.language.as_deref().unwrap_or("en");
-    let url = format!("{ws_url}?model={XAI_STT_MODEL}&language={lang}");
+    // Only pin a language when the caller asked for one. Hard-coding `en`
+    // hurts accuracy on accented or multilingual input — xAI's WS auto-
+    // detects when the param is absent (mirrors how the AssemblyAI path
+    // never sends a language hint either).
+    let url = match config.language.as_deref() {
+        Some(lang) if !lang.is_empty() => {
+            format!("{ws_url}?model={XAI_STT_MODEL}&language={lang}")
+        }
+        _ => format!("{ws_url}?model={XAI_STT_MODEL}"),
+    };
 
     let mut request = url
         .into_client_request()
@@ -413,7 +426,7 @@ async fn open_stream(
     // Audio forwarder: Vec<u8> frames in → binary WS frames out.
     tokio::spawn(async move {
         while let Some(chunk) = audio_rx.recv().await {
-            if ws_sink.send(Message::Binary(chunk.into())).await.is_err() {
+            if ws_sink.send(Message::Binary(chunk)).await.is_err() {
                 return;
             }
         }
@@ -425,17 +438,37 @@ async fn open_stream(
 
     // Event reader: WS text frames in → SttResult<TranscriptEvent> out.
     tokio::spawn(async move {
+        let mut saw_final = false;
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(Message::Text(t)) => match parse_ws_text(&t) {
                     Ok(ParsedFrame::Skip) => {}
                     Ok(ParsedFrame::Emit(ev)) => {
+                        if matches!(ev, TranscriptEvent::Final { .. }) {
+                            saw_final = true;
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             return;
                         }
                     }
-                    Ok(ParsedFrame::Terminal(ev)) => {
-                        let _ = event_tx.send(Ok(ev)).await;
+                    Ok(ParsedFrame::Terminal {
+                        text,
+                        duration_seconds,
+                    }) => {
+                        if !saw_final && let Some(text) = text {
+                            let final_event = TranscriptEvent::Final {
+                                text,
+                                speaker: None,
+                                start_seconds: None,
+                                end_seconds: None,
+                            };
+                            if event_tx.send(Ok(final_event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        let _ = event_tx
+                            .send(Ok(TranscriptEvent::Done { duration_seconds }))
+                            .await;
                         return;
                     }
                     Err(e) => {
@@ -449,9 +482,7 @@ async fn open_stream(
                     // Pre-terminator error — surface it. (Post-terminator
                     // we've already returned from the task, so xAI's TCP
                     // reset never reaches here.)
-                    let _ = event_tx
-                        .send(Err(SttError::Protocol(e.to_string())))
-                        .await;
+                    let _ = event_tx.send(Err(SttError::Protocol(e.to_string()))).await;
                     return;
                 }
             }
@@ -577,7 +608,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, SttError::Auth(ref b) if b == "bad key"), "got {err:?}");
+        assert!(
+            matches!(err, SttError::Auth(ref b) if b == "bad key"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -665,10 +699,29 @@ mod tests {
     fn parse_done_is_terminal_with_duration() {
         let frame = r#"{"type":"transcript.done","text":"","words":[],"duration":2.5}"#;
         match parse_ws_text(frame).unwrap() {
-            ParsedFrame::Terminal(TranscriptEvent::Done { duration_seconds }) => {
+            ParsedFrame::Terminal {
+                text,
+                duration_seconds,
+            } => {
+                assert_eq!(text, None);
                 assert!((duration_seconds - 2.5).abs() < 1e-9);
             }
             other => panic!("expected Terminal(Done), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_done_keeps_terminal_text_for_short_utterances() {
+        let frame = r#"{"type":"transcript.done","text":"REPL","words":[],"duration":0.7}"#;
+        match parse_ws_text(frame).unwrap() {
+            ParsedFrame::Terminal {
+                text,
+                duration_seconds,
+            } => {
+                assert_eq!(text.as_deref(), Some("REPL"));
+                assert!((duration_seconds - 0.7).abs() < 1e-9);
+            }
+            other => panic!("expected Terminal with text, got {other:?}"),
         }
     }
 

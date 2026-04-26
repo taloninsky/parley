@@ -37,10 +37,48 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::audio::capture::BrowserCapture;
-use crate::stt::assemblyai::{AssemblyAiSession, fetch_temp_token};
+use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
+use crate::stt::xai_proxy::XaiProxySession;
+
+/// Provider-neutral handle the hook owns. `LiveCapture` keeps one of
+/// these alongside the mic capture; the wrapper exists so `start()`
+/// and `stop()` don't need to branch on provider id every time they
+/// touch the session.
+enum SttSession {
+    AssemblyAi(Rc<AssemblyAiSession>),
+    Xai(Rc<XaiProxySession>),
+}
+
+impl SttSession {
+    fn send_audio(&self, samples: &[f32]) -> Result<(), JsValue> {
+        match self {
+            SttSession::AssemblyAi(s) => s.send_audio(samples),
+            SttSession::Xai(s) => s.send_audio(samples),
+        }
+    }
+
+    fn force_endpoint(&self) -> Result<(), JsValue> {
+        match self {
+            SttSession::AssemblyAi(s) => s.force_endpoint(),
+            SttSession::Xai(s) => s.force_endpoint(),
+        }
+    }
+
+    fn terminate(&self) -> Result<(), JsValue> {
+        match self {
+            SttSession::AssemblyAi(s) => s.terminate(),
+            SttSession::Xai(s) => s.terminate(),
+        }
+    }
+
+    fn is_xai(&self) -> bool {
+        matches!(self, SttSession::Xai(_))
+    }
+}
 
 /// Coarse lifecycle state for the voice input loop.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,12 +121,11 @@ pub struct VoiceInputHandle {
 /// being a `Signal` (web-sys handles aren't `Send` and we
 /// don't want them flowing through reactivity).
 ///
-/// The session is wrapped in `Rc` because the `BrowserCapture`
-/// audio callback needs its own clone to forward PCM frames; the
-/// holder's clone is what `stop()` uses to call
-/// `force_endpoint` / `terminate`.
+/// The session is held in [`SttSession`] (not the concrete provider
+/// type) so the start/stop callbacks don't have to branch on which
+/// provider is active.
 struct LiveCapture {
-    session: Rc<AssemblyAiSession>,
+    session: SttSession,
     capture: BrowserCapture,
 }
 
@@ -125,23 +162,18 @@ pub fn use_voice_input() -> VoiceInputHandle {
 
         let holder = holder_for_start.clone();
         spawn_local(async move {
-            let token = match fetch_temp_token().await {
-                Ok(t) => t,
-                Err(e) => {
-                    state.set(VoiceState::Error(format!("token: {e}")));
-                    return;
-                }
-            };
+            // Provider selection lives in cookies so it survives across
+            // sessions; both the conversation view (here) and the
+            // settings drawer read/write the same key. Defaults match
+            // the proxy's fallback chain (AssemblyAI for STT today).
+            let provider = crate::ui::pipeline::stt_provider();
 
-            // The on_turn closure runs on every AssemblyAI Turn
-            // event. We re-capture `interim_text` / `final_text`
-            // (Copy signals) so the closure is `'static`.
-            let on_turn = move |evt: crate::stt::assemblyai::TurnEvent| {
+            // Both providers share the same on_turn / on_close
+            // closures: the wire format normalizes to `TurnEvent` at
+            // the session boundary, so this layer doesn't care which
+            // one produced the event.
+            let on_turn = move |evt: TurnEvent| {
                 if evt.end_of_turn {
-                    // Append to the running final string with a
-                    // space separator. The interim line clears
-                    // because AssemblyAI is about to start a fresh
-                    // turn.
                     final_text.with_mut(|s| {
                         if !s.is_empty() {
                             s.push(' ');
@@ -154,21 +186,50 @@ pub fn use_voice_input() -> VoiceInputHandle {
                 }
             };
             let on_close = move |_code: u16, _reason: String| {
-                // Connection closed (either clean termination or
-                // network error). The hook's lifecycle is driven
-                // by the explicit `stop()` flow; this callback is
-                // informational only.
+                // Informational; lifecycle is driven by stop().
             };
 
-            let session = match AssemblyAiSession::connect(&token, on_turn, on_close) {
-                Ok(s) => s,
-                Err(e) => {
-                    state.set(VoiceState::Error(format!("ws: {e:?}")));
-                    return;
+            let session: SttSession = match provider.as_str() {
+                "xai" => {
+                    // xAI streams through the proxy's `/api/stt/stream`
+                    // bridge — no token fetch needed, the proxy holds
+                    // the API key. Sample rate must match
+                    // `BrowserCapture` (16 kHz today).
+                    match XaiProxySession::connect("xai", "default", 16_000, on_turn, on_close) {
+                        Ok(s) => SttSession::Xai(Rc::new(s)),
+                        Err(e) => {
+                            state.set(VoiceState::Error(format!("xai ws: {e:?}")));
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    // AssemblyAI: browser opens the WS directly with a
+                    // short-lived token from the proxy.
+                    let token = match fetch_temp_token().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            state.set(VoiceState::Error(format!("token: {e}")));
+                            return;
+                        }
+                    };
+                    match AssemblyAiSession::connect(&token, on_turn, on_close) {
+                        Ok(s) => SttSession::AssemblyAi(Rc::new(s)),
+                        Err(e) => {
+                            state.set(VoiceState::Error(format!("ws: {e:?}")));
+                            return;
+                        }
+                    }
                 }
             };
-            let session = Rc::new(session);
-            let session_for_audio = session.clone();
+
+            // Clone the session handle for the audio callback so its
+            // lifetime is independent of the holder's clone (which
+            // stop() consumes to issue force_endpoint/terminate).
+            let session_for_audio = match &session {
+                SttSession::AssemblyAi(s) => SttSession::AssemblyAi(s.clone()),
+                SttSession::Xai(s) => SttSession::Xai(s.clone()),
+            };
 
             let capture = match BrowserCapture::start(move |samples: Vec<f32>| {
                 let _ = session_for_audio.send_audio(&samples);
@@ -177,9 +238,6 @@ pub fn use_voice_input() -> VoiceInputHandle {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    // Tear down the WS we already opened so the
-                    // mic-permission failure doesn't leave a
-                    // zombie session.
                     let _ = session.terminate();
                     state.set(VoiceState::Error(format!("mic: {e:?}")));
                     return;
@@ -205,13 +263,30 @@ pub fn use_voice_input() -> VoiceInputHandle {
             state.set(VoiceState::Idle);
             return;
         };
+        if live.session.is_xai() {
+            // xAI has no separate ForceEndpoint command. Its flush
+            // signal is `audio.done`, which must come after the last
+            // audio frame. Stop the mic first so the browser cannot
+            // enqueue more PCM after the proxy has closed the upstream
+            // audio sink.
+            let LiveCapture { session, capture } = live;
+            capture.stop();
+            let _ = session.force_endpoint();
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(2000).await;
+                let _ = session.terminate();
+                drop(session);
+                state.set(VoiceState::Idle);
+            });
+            return;
+        }
+
         let _ = live.session.force_endpoint();
 
-        // Give AssemblyAI a brief window to flush the trailing
-        // final turn (its endpoint is async; the WS round-trip
-        // back through the on_turn callback still has to happen).
-        // 400ms matches what the parent transcription view uses
-        // for the same purpose.
+        // Give AssemblyAI a brief window to flush the trailing final
+        // turn (its endpoint is async; the WS round-trip back through
+        // the on_turn callback still has to happen). 400ms matches
+        // what the parent transcription view uses for the same purpose.
         spawn_local(async move {
             gloo_timers::future::TimeoutFuture::new(400).await;
             let _ = live.session.terminate();

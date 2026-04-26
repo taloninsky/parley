@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -151,7 +151,10 @@ async fn transcribe(
     let provider_id: ProviderId = match body.provider.parse() {
         Ok(p) => p,
         Err(UnknownProvider(raw)) => {
-            return bad_request("unknown_provider", &format!("{raw} is not a known provider"));
+            return bad_request(
+                "unknown_provider",
+                &format!("{raw} is not a known provider"),
+            );
         }
     };
 
@@ -200,10 +203,7 @@ fn transcript_to_json(t: &Transcript) -> Value {
     serde_json::to_value(t).unwrap_or_else(|_| json!({}))
 }
 
-fn provider_not_configured(
-    provider: ProviderId,
-    credential: &str,
-) -> (StatusCode, Json<Value>) {
+fn provider_not_configured(provider: ProviderId, credential: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::PRECONDITION_FAILED,
         Json(json!({
@@ -322,8 +322,11 @@ async fn stream_ws(
     let provider_id: ProviderId = match q.provider.parse() {
         Ok(p) => p,
         Err(UnknownProvider(raw)) => {
-            return bad_request("unknown_provider", &format!("{raw} is not a known provider"))
-                .into_response();
+            return bad_request(
+                "unknown_provider",
+                &format!("{raw} is not a known provider"),
+            )
+            .into_response();
         }
     };
 
@@ -451,7 +454,11 @@ async fn pump_provider_to_client<K>(
 }
 
 fn error_frame(message: &str) -> Message {
-    Message::Text(json!({ "type": "error", "message": message }).to_string().into())
+    Message::Text(
+        json!({ "type": "error", "message": message })
+            .to_string()
+            .into(),
+    )
 }
 
 #[cfg(test)]
@@ -584,8 +591,7 @@ mod tests {
 
     #[test]
     fn map_stt_error_unsupported_returns_501() {
-        let (status, _body) =
-            map_stt_error(ProviderId::Xai, SttError::Unsupported("no ws".into()));
+        let (status, _body) = map_stt_error(ProviderId::Xai, SttError::Unsupported("no ws".into()));
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -609,8 +615,6 @@ mod tests {
 
     use futures::SinkExt;
     use futures::channel::mpsc as fmpsc;
-    use futures::stream::StreamExt as _;
-
     #[tokio::test]
     async fn client_pump_forwards_binary_and_stops_on_audio_done() {
         let (mut ws_in, ws_out) = fmpsc::unbounded::<Result<Message, axum::Error>>();
@@ -643,9 +647,7 @@ mod tests {
     #[tokio::test]
     async fn provider_pump_forwards_events_and_closes_on_done() {
         let events = futures::stream::iter(vec![
-            Ok(TranscriptEvent::Partial {
-                text: "hel".into(),
-            }),
+            Ok(TranscriptEvent::Partial { text: "hel".into() }),
             Ok(TranscriptEvent::Final {
                 text: "hello".into(),
                 speaker: None,
@@ -659,8 +661,8 @@ mod tests {
         .boxed();
 
         let (ws_sink, mut ws_sink_out) = fmpsc::unbounded::<Message>();
-        let sink_adapter = ws_sink
-            .sink_map_err(|_| axum::Error::new(std::io::Error::other("unreachable")));
+        let sink_adapter =
+            ws_sink.sink_map_err(|_| axum::Error::new(std::io::Error::other("unreachable")));
 
         pump_provider_to_client(events, sink_adapter).await;
 
@@ -692,8 +694,8 @@ mod tests {
         let events = futures::stream::iter(vec![Err(SttError::Protocol("boom".into()))]).boxed();
 
         let (ws_sink, mut ws_sink_out) = fmpsc::unbounded::<Message>();
-        let sink_adapter = ws_sink
-            .sink_map_err(|_| axum::Error::new(std::io::Error::other("unreachable")));
+        let sink_adapter =
+            ws_sink.sink_map_err(|_| axum::Error::new(std::io::Error::other("unreachable")));
 
         pump_provider_to_client(events, sink_adapter).await;
 
@@ -704,7 +706,10 @@ mod tests {
         };
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("boom"));
-        assert!(ws_sink_out.next().await.is_none(), "sink closed after error");
+        assert!(
+            ws_sink_out.next().await.is_none(),
+            "sink closed after error"
+        );
     }
 
     // HTTP-layer unit tests for the WS upgrade extractor are skipped:
