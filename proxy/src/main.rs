@@ -20,6 +20,7 @@ use providers::ProviderId;
 use secrets::{DEFAULT_CREDENTIAL, SecretsManager};
 
 const ASSEMBLYAI_TOKEN_URL: &str = "https://streaming.assemblyai.com/v3/token";
+const SONIOX_TEMPORARY_API_KEY_URL: &str = "https://api.soniox.com/v1/auth/temporary-api-key";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Max retries for transient failures on the token endpoint.
@@ -34,6 +35,7 @@ const TOKEN_RETRY_DELAY: Duration = Duration::from_millis(500);
 struct AppState {
     client: reqwest::Client,
     secrets: Arc<SecretsManager>,
+    soniox_temporary_api_key_url: String,
 }
 
 /// JSON body returned when an upstream provider has no `default`
@@ -114,6 +116,88 @@ async fn fetch_token(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 
     // All retries exhausted
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(
+            serde_json::json!({"error": format!("upstream request failed after {TOKEN_MAX_RETRIES} attempts: {last_err}")}),
+        ),
+    )
+}
+
+async fn fetch_soniox_token(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let api_key = match state
+        .secrets
+        .resolve(ProviderId::Soniox, DEFAULT_CREDENTIAL)
+    {
+        Some(key) => key,
+        None => return provider_not_configured(ProviderId::Soniox),
+    };
+    let client = &state.client;
+
+    let mut last_err = String::new();
+    for attempt in 0..TOKEN_MAX_RETRIES {
+        if attempt > 0 {
+            eprintln!("[proxy] Soniox token fetch retry {attempt}/{TOKEN_MAX_RETRIES}");
+            tokio::time::sleep(TOKEN_RETRY_DELAY).await;
+        }
+
+        let resp = match client
+            .post(&state.soniox_temporary_api_key_url)
+            .bearer_auth(&api_key)
+            .json(&serde_json::json!({
+                "usage_type": "transcribe_websocket",
+                "expires_in_seconds": 480,
+            }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("{e:#}");
+                eprintln!(
+                    "[proxy] Soniox token fetch attempt {attempt} transport error: {last_err}"
+                );
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 429 || status.is_server_error() {
+            last_err = format!("Soniox HTTP {status}: {text}");
+            eprintln!("[proxy] Soniox token fetch attempt {attempt} retryable: {last_err}");
+            continue;
+        }
+
+        if !status.is_success() {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Soniox HTTP {status}: {text}")})),
+            );
+        }
+
+        return match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(json) => match json.get("api_key").and_then(|t| t.as_str()) {
+                Some(api_key) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "api_key": api_key,
+                        "expires_at": json.get("expires_at").cloned().unwrap_or(serde_json::Value::Null),
+                    })),
+                ),
+                None => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": "no api_key in Soniox response"})),
+                ),
+            },
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("parse error: {e}")})),
+            ),
+        };
+    }
+
     (
         StatusCode::BAD_GATEWAY,
         Json(
@@ -556,6 +640,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: client.clone(),
         secrets: secrets_manager.clone(),
+        soniox_temporary_api_key_url: SONIOX_TEMPORARY_API_KEY_URL.to_string(),
     });
     let conversation_state =
         conversation_api::ConversationApiState::new(registries, client, secrets_manager.clone());
@@ -563,6 +648,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/token", post(fetch_token))
+        .route("/api/stt/soniox/token", post(fetch_soniox_token))
         .route("/format", post(format_text))
         .with_state(state)
         .merge(conversation_api::router(conversation_state))
@@ -591,6 +677,132 @@ fn parley_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use secrets::{InMemoryKeyStore, StaticEnv};
+    use tower::ServiceExt;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_secrets(soniox_key: Option<&str>) -> Arc<SecretsManager> {
+        let mut env = StaticEnv::new();
+        if let Some(key) = soniox_key {
+            env.set("PARLEY_SONIOX_API_KEY", key);
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        Arc::new(SecretsManager::new(
+            Box::new(InMemoryKeyStore::new()),
+            Box::new(env),
+            temp.path().join("credentials.json"),
+        ))
+    }
+
+    fn soniox_token_test_app(upstream_url: String, secrets: Arc<SecretsManager>) -> Router {
+        let state = Arc::new(AppState {
+            client: reqwest::Client::new(),
+            secrets,
+            soniox_temporary_api_key_url: upstream_url,
+        });
+        Router::new()
+            .route("/api/stt/soniox/token", post(fetch_soniox_token))
+            .with_state(state)
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    // ── Soniox token route ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn soniox_token_missing_credential_returns_412() {
+        let app = soniox_token_test_app("http://127.0.0.1/unused".to_string(), test_secrets(None));
+
+        let response = app
+            .oneshot(
+                Request::post("/api/stt/soniox/token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], "provider_not_configured");
+        assert_eq!(body["provider"], "soniox");
+        assert_eq!(body["credential"], "default");
+    }
+
+    #[tokio::test]
+    async fn soniox_token_success_returns_temporary_key_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/temporary-api-key"))
+            .and(header("authorization", "Bearer root-soniox-key"))
+            .and(body_json(serde_json::json!({
+                "usage_type": "transcribe_websocket",
+                "expires_in_seconds": 480,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "api_key": "temporary-soniox-key",
+                "expires_at": "2026-01-01T00:00:00Z",
+                "ignored": "not forwarded",
+            })))
+            .mount(&server)
+            .await;
+        let app = soniox_token_test_app(
+            format!("{}/v1/auth/temporary-api-key", server.uri()),
+            test_secrets(Some("root-soniox-key")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/api/stt/soniox/token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["api_key"], "temporary-soniox-key");
+        assert_eq!(body["expires_at"], "2026-01-01T00:00:00Z");
+        assert!(body.get("ignored").is_none());
+    }
+
+    #[tokio::test]
+    async fn soniox_token_upstream_error_does_not_leak_secret() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/temporary-api-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid root key"))
+            .mount(&server)
+            .await;
+        let app = soniox_token_test_app(
+            format!("{}/v1/auth/temporary-api-key", server.uri()),
+            test_secrets(Some("root-soniox-key")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/api/stt/soniox/token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_json(response).await;
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("Soniox HTTP 401 Unauthorized"));
+        assert!(!error.contains("root-soniox-key"));
+    }
 
     // ── extract_words ──────────────────────────────────────────────
 

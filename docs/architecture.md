@@ -136,9 +136,9 @@ User-maintained word list for domain-specific terms, names, and acronyms. Feeds 
 
 The abstract annotation model above describes *what* Parley stores. The **word graph** describes *how* it is stored and manipulated at runtime. It is the concrete realization of the annotated stream during a live session.
 
-> Full specification: `docs/word-graph-spec.md`
+> Full specification: [word-graph-spec.md](word-graph-spec.md)
 >
-> Implementation: `src/word_graph/` — currently the **minimal slice** (nodes, edges with `Next` only, arena+adjacency, `ingest_turn`, `walk_spine`, `edges_from`/`to`) per the Conversation Mode prerequisite (`docs/conversation-mode-spec.md` §1.5). The remaining graph features (`Alt`/`Correction`/`Temporal` edges, non-destructive editing, projection filters) will be added as the features that need them ship.
+> Implementation: `parley-core::word_graph` — currently the **minimal slice** (nodes, edges with `Next` only, arena+adjacency, `ingest_turn`, `walk_spine`, `edges_from`/`to`) plus the provider-neutral token-stream adapter in `parley-core::stt` for Soniox-style STT. The remaining graph features (`Alt`/`Correction`/`Temporal` edges, non-destructive editing, projection filters) will be added as the features that need them ship. See [conversation-mode-spec.md §1.5](conversation-mode-spec.md#15-dependencies--word-graph-slice-must-land-first) and [soniox-stt-integration-spec.md §7](soniox-stt-integration-spec.md#7-minimal-word-graph--event-prerequisite).
 
 **Key insight from implementation:** The original architecture modeled annotations as separate entities layered over a timeline — a `LowConfidence` annotation points at a `Word` annotation; a `UserCorrection` annotation wraps another annotation. Building the real-time system revealed that **the word IS the annotation**. Separating the word from its metadata (confidence, origin, filler status) creates indirection that makes real-time ingest, editing, and projection harder. The word graph flattens this: metadata lives directly on each node.
 
@@ -611,6 +611,7 @@ WASM-clean. No `tokio`, no I/O, no audio. Holds the data model the frontend, pro
 - `persona` — `Persona`, `PersonaId`, `SystemPrompt::{Inline, File}`, tier/voice/TTS settings
 - `speaker` — `Speaker`, `SpeakerId`, kind enum (human / ai_agent / unknown)
 - `word_graph` — node/edge types for the annotated stream
+- `stt` — provider-neutral token events, Soniox token normalization, stable diarization-label-to-lane mapping, and `SttGraphUpdate` adapters into `word_graph`
 - **`conversation`** *(new)* — `ConversationSession`, `Turn`, `TurnProvenance`, `PersonaActivation`, `TurnId`. The persistable state of one Conversation Mode session: ordered turns, registered speakers, and the history of (persona, model) activations so we can answer "who said what with which model" from the file alone.
 
 ### `proxy`
@@ -619,6 +620,7 @@ Native, async, owns I/O and credentials. Will eventually expose an HTTP endpoint
 
 - `llm` — `LlmProvider` trait + `AnthropicLlm` streaming implementation, plus an SSE decoder hardened for chunk-boundary cases (Phase 4a)
 - `registry` — loads `ModelConfig` and `Persona` files from `~/.parley/{models,personas}/` with per-file diagnostics; shared validation enforces persona → model / system-prompt-file references (Phase 3)
+- `providers` — closed provider registry for credentials and UI status. STT providers currently include AssemblyAI and Soniox; Soniox resolves `PARLEY_SONIOX_API_KEY`.
 - **`orchestrator`** *(Phase 4b)* — `ConversationOrchestrator`, `OrchestratorState`, `OrchestratorEvent`, `OrchestratorContext`. Drives the per-turn state machine and dispatches user input to the active persona's `LlmProvider`.
 - **`conversation_api`** *(new)* — HTTP routes that expose a single in-process `ConversationOrchestrator` to any client (the WASM frontend, integration tests, `curl`).
 
@@ -682,7 +684,7 @@ The default implementation, `FsSessionStore`, applies a strict ASCII allowlist t
 
 ### Secrets storage (Phase 5)
 
-API keys for upstream providers (Anthropic, AssemblyAI, eventually TTS) live exclusively in the proxy. The browser never sees a key, never sets one in a cookie, and never sends one over the wire. Spec: [`docs/secrets-storage-spec.md`](secrets-storage-spec.md).
+API keys for upstream providers (Anthropic, AssemblyAI, Soniox, ElevenLabs) live exclusively in the proxy. The browser never sees a long-lived key, never sets one in a cookie, and never sends one over the wire. Spec: [secrets-storage-spec.md](secrets-storage-spec.md).
 
 **Components:**
 
@@ -695,13 +697,11 @@ API keys for upstream providers (Anthropic, AssemblyAI, eventually TTS) live exc
   - `DELETE /api/secrets/{provider}/{credential}` removes a key (idempotent — 404 collapses to success).
   - `POST /api/secrets/{provider}/{credential}/rename` renames a *named* credential (`default` is reserved on both ends).
 
-**Provider integration:** The transcription path (`POST /token` for AssemblyAI, `POST /format` for Anthropic) and the conversation path (`/init`, `/load`, `/switch`) all resolve their key by calling `SecretsManager::resolve(provider, credential)` server-side. When the resolution returns `None`, the route returns `412 Precondition Failed` with `{error:"provider_not_configured", provider, credential}` — the frontend treats this as "show the Settings panel."
+**Provider integration:** The transcription path (`POST /token` for AssemblyAI, `POST /api/stt/soniox/token` for Soniox, `POST /format` for Anthropic) and the conversation path (`/init`, `/load`, `/switch`) all resolve their key by calling `SecretsManager::resolve(provider, credential)` server-side. Soniox returns only a temporary WebSocket key (`api_key`, `expires_at`) to the browser; the long-lived Soniox key never leaves the proxy. When credential resolution returns `None`, the route returns `412 Precondition Failed` with `{error:"provider_not_configured", provider, credential}` — the frontend treats this as "show the Settings panel."
 
-**Frontend integration:** `src/ui/secrets.rs` provides a typed client (`SecretsStatus`, `ProviderStatus`, `CredentialStatus`) plus a `use_secrets_status()` hook that returns a `Resource<Result<SecretsStatus, String>>` and a `refresh()` handle. The Settings drawer (`src/ui/app.rs`) renders one `SecretsKeyRow` per provider for the `default` credential. The conversation view (`src/ui/conversation.rs`) renders a credential dropdown sourced from `SecretsStatus::credential_names("anthropic")`.
+**Frontend integration:** `src/ui/secrets.rs` provides a typed client (`SecretsStatus`, `ProviderStatus`, `CredentialStatus`) plus a `use_secrets_status()` hook that returns a `Resource<Result<SecretsStatus, String>>` and a `refresh()` handle. The Settings drawer (`src/ui/app.rs`) renders one `SecretsKeyRow` per provider for the `default` credential and persists the selected STT provider (`assemblyai` or `soniox`). The conversation voice hook (`src/ui/use_voice_input.rs`) reads that STT provider setting: AssemblyAI uses `/token`; Soniox uses `/api/stt/soniox/token`, opens the Soniox WebSocket, normalizes token batches via `parley-core::stt`, and submits finalized text to Conversation Mode.
 
 **What's deferred (v2):** richer per-category panels in the UI for managing named credentials, channel-binding hardening of the `/api/secrets` surface (currently relies on the proxy listening on `127.0.0.1` only), and rotation/expiry tracking.
-
-
 
 - Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
 - Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)

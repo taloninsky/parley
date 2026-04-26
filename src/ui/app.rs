@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
@@ -6,7 +7,13 @@ use wasm_bindgen::JsCast;
 
 use crate::audio::capture::BrowserCapture;
 use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
+use crate::stt::soniox::{
+    SONIOX_CONTEXT_TEXT_STORAGE_KEY, SONIOX_LATENCY_MODE_COOKIE, SonioxConfig, SonioxLatencyMode,
+    SonioxSession, fetch_temp_api_key,
+};
 use crate::ui::secrets;
+use parley_core::stt::{SttMarker, SttStreamEvent, TokenStreamNormalizer};
+use parley_core::word_graph::SttWord;
 use parley_core::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
@@ -92,6 +99,23 @@ fn save(key: &str, value: &str) {
             key, value
         );
         let _ = js_sys::Reflect::set(&doc, &"cookie".into(), &cookie.into());
+    }
+}
+
+fn load_local(key: &str) -> Option<String> {
+    web_sys::window()?
+        .local_storage()
+        .ok()??
+        .get_item(key)
+        .ok()?
+}
+
+fn save_local(key: &str, value: &str) {
+    if let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+    {
+        let _ = storage.set_item(key, value);
     }
 }
 
@@ -457,6 +481,45 @@ fn format_duration(elapsed_ms: f64) -> String {
     }
 }
 
+fn render_stt_words(words: &[SttWord]) -> String {
+    let mut text = String::new();
+    for word in words {
+        let is_punctuation = matches!(word.text.as_str(), "." | "," | "?" | "!" | ";" | ":" | "\"");
+        if !text.is_empty() && !is_punctuation {
+            text.push(' ');
+        }
+        text.push_str(&word.text);
+    }
+    text
+}
+
+fn soniox_lane_name(lane: u8, speaker1_name: &str, speaker2_name: &str) -> String {
+    match lane {
+        0 => speaker1_name.to_string(),
+        1 => speaker2_name.to_string(),
+        lane => format!("Speaker {}", lane + 1),
+    }
+}
+
+fn soniox_latency_mode_from_value(value: &str) -> SonioxLatencyMode {
+    SonioxLatencyMode::from_storage_value(value).unwrap_or_default()
+}
+
+fn finalize_soniox_session_after_settle(
+    session: Rc<RefCell<Option<SonioxSession>>>,
+    mode: SonioxLatencyMode,
+) {
+    spawn(async move {
+        let settle_ms = mode.finalize_settle_ms();
+        if settle_ms > 0 {
+            gloo_timers::future::TimeoutFuture::new(settle_ms).await;
+        }
+        if let Some(ref session) = *session.borrow() {
+            let _ = session.finalize();
+        }
+    });
+}
+
 fn trigger_download(filename: &str, content: &str, mime_type: &str) {
     let window = match web_sys::window() {
         Some(w) => w,
@@ -719,6 +782,16 @@ pub fn App() -> Element {
                 .unwrap_or(false),
         )
     });
+    let soniox_configured = use_memo(move || {
+        matches!(
+            &*secrets_status.read_unchecked(),
+            Some(Ok(s)) if s
+                .provider("soniox")
+                .and_then(|p| p.credential("default"))
+                .map(|c| c.configured)
+                .unwrap_or(false),
+        )
+    });
     // ElevenLabs powers Conversation Mode TTS. The credential is
     // optional — without it, conversation runs text-only and the
     // Voice/Type toggle defaults to Type. Surfaced in Settings so
@@ -740,6 +813,18 @@ pub fn App() -> Element {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(5)
     });
+    let mut stt_provider =
+        use_signal(|| load("parley_stt_provider").unwrap_or_else(|| "assemblyai".to_string()));
+    let mut soniox_latency_mode = use_signal(|| {
+        load(SONIOX_LATENCY_MODE_COOKIE)
+            .and_then(|value| {
+                SonioxLatencyMode::from_storage_value(&value)
+                    .map(|mode| mode.storage_value().to_string())
+            })
+            .unwrap_or_else(|| SonioxLatencyMode::default().storage_value().to_string())
+    });
+    let mut soniox_context_text =
+        use_signal(|| load_local(SONIOX_CONTEXT_TEXT_STORAGE_KEY).unwrap_or_default());
     let mut countdown_secs: Signal<Option<u32>> = use_signal(|| None);
     let mut auto_scroll = use_signal(|| true);
 
@@ -826,8 +911,11 @@ pub fn App() -> Element {
     let mut llm_cost = use_signal(|| 0.0_f64);
 
     // ── Speaker 1 handles ───────────────────────────────────────────
-    let capture_handle: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> = use_signal(|| None);
+    let mut capture_handle: Signal<Option<Rc<RefCell<Option<BrowserCapture>>>>> =
+        use_signal(|| None);
     let session_handle: Signal<Option<Rc<RefCell<Option<AssemblyAiSession>>>>> =
+        use_signal(|| None);
+    let mut soniox_session_handle: Signal<Option<Rc<RefCell<Option<SonioxSession>>>>> =
         use_signal(|| None);
     let mut current_turn_shared: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
@@ -883,6 +971,174 @@ pub fn App() -> Element {
         error_msg.set(None);
         status_msg.set("Connecting…".into());
         rec_state.set(RecState::Recording);
+
+        if (stt_provider)() == "soniox" {
+            let s1_source = (speaker1_source)();
+            let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
+            let context_text = (soniox_context_text)();
+            spawn(async move {
+                status_msg.set("Fetching Soniox token…".into());
+                let token = match fetch_temp_api_key().await {
+                    Ok(token) => token,
+                    Err(err) => {
+                        error_msg.set(Some(format!("Soniox token fetch failed: {err}")));
+                        rec_state.set(RecState::Idle);
+                        status_msg.set("Ready".into());
+                        return;
+                    }
+                };
+
+                status_msg.set("Connecting to Soniox…".into());
+                let start_time = js_sys::Date::now();
+                session_start_time.set(Some(start_time));
+                last_committed_speaker.set(Some(Rc::new(RefCell::new(String::new()))));
+                let graph_rc: Rc<RefCell<WordGraph>> = Rc::new(RefCell::new(WordGraph::new()));
+                word_graph_shared.set(Some(graph_rc.clone()));
+
+                let normalizer = Rc::new(RefCell::new(TokenStreamNormalizer::new()));
+                let provisional_by_lane: Rc<RefCell<BTreeMap<u8, String>>> =
+                    Rc::new(RefCell::new(BTreeMap::new()));
+                let last_lane: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
+
+                let session = match SonioxSession::connect(
+                    &token,
+                    SonioxConfig::for_latency_mode_and_context(latency_mode, Some(context_text)),
+                    {
+                        let normalizer = normalizer.clone();
+                        let provisional_by_lane = provisional_by_lane.clone();
+                        let graph_rc = graph_rc.clone();
+                        let last_lane = last_lane.clone();
+                        move |event: SttStreamEvent| {
+                            if let SttStreamEvent::Error { message, .. } = &event {
+                                error_msg.set(Some(format!("Soniox error: {message}")));
+                                rec_state.set(RecState::Idle);
+                                status_msg.set("Ready".into());
+                                return;
+                            }
+
+                            let batch = match normalizer.borrow_mut().accept_event(event) {
+                                Ok(batch) => batch,
+                                Err(err) => {
+                                    error_msg
+                                        .set(Some(format!("Soniox normalization failed: {err}")));
+                                    rec_state.set(RecState::Idle);
+                                    status_msg.set("Ready".into());
+                                    return;
+                                }
+                            };
+
+                            batch.apply_to_graph(&mut graph_rc.borrow_mut());
+
+                            for update in &batch.updates {
+                                let finalized_text = render_stt_words(&update.finalized);
+                                if !finalized_text.is_empty() {
+                                    let lane_name = soniox_lane_name(
+                                        update.lane,
+                                        &(speaker1_name)(),
+                                        &(speaker2_name)(),
+                                    );
+                                    let start_ms = update
+                                        .finalized
+                                        .first()
+                                        .map(|word| word.start_ms)
+                                        .unwrap_or_else(|| js_sys::Date::now() - start_time);
+                                    transcript.with_mut(|body| {
+                                        if !body.is_empty() {
+                                            body.push(' ');
+                                        }
+                                        let speaker_changed = last_lane
+                                            .borrow()
+                                            .map(|lane| lane != update.lane)
+                                            .unwrap_or(true);
+                                        if (show_timestamps)() && speaker_changed {
+                                            body.push_str(&format_timestamp(start_ms));
+                                            body.push(' ');
+                                        }
+                                        if (show_labels)() && speaker_changed {
+                                            body.push('[');
+                                            body.push_str(&lane_name);
+                                            body.push_str("] ");
+                                        }
+                                        body.push_str(finalized_text.trim());
+                                    });
+                                    *last_lane.borrow_mut() = Some(update.lane);
+                                }
+
+                                let provisional_text = render_stt_words(&update.provisional);
+                                if provisional_text.is_empty() {
+                                    provisional_by_lane.borrow_mut().remove(&update.lane);
+                                } else {
+                                    provisional_by_lane
+                                        .borrow_mut()
+                                        .insert(update.lane, provisional_text);
+                                }
+                            }
+
+                            let provisional = provisional_by_lane
+                                .borrow()
+                                .iter()
+                                .map(|(lane, text)| {
+                                    let lane_name = soniox_lane_name(
+                                        *lane,
+                                        &(speaker1_name)(),
+                                        &(speaker2_name)(),
+                                    );
+                                    if (show_labels)() {
+                                        format!("[{lane_name}] {text}")
+                                    } else {
+                                        text.clone()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            partial.set(provisional);
+                            partial2.set(String::new());
+
+                            if batch.markers.contains(&SttMarker::FinalizeComplete) {
+                                provisional_by_lane.borrow_mut().clear();
+                                partial.set(String::new());
+                            }
+                        }
+                    },
+                    move |_code, _reason| {},
+                ) {
+                    Ok(session) => session,
+                    Err(err) => {
+                        error_msg.set(Some(format!("Soniox WebSocket failed: {err:?}")));
+                        rec_state.set(RecState::Idle);
+                        status_msg.set("Ready".into());
+                        return;
+                    }
+                };
+
+                let session_rc: Rc<RefCell<Option<SonioxSession>>> =
+                    Rc::new(RefCell::new(Some(session)));
+                soniox_session_handle.set(Some(session_rc.clone()));
+                let session_for_audio = session_rc.clone();
+
+                match start_capture_for_source(&s1_source, move |samples: Vec<f32>| {
+                    if let Some(ref session) = *session_for_audio.borrow() {
+                        let _ = session.send_audio(&samples);
+                    }
+                })
+                .await
+                {
+                    Ok(capture) => {
+                        capture_handle.set(Some(Rc::new(RefCell::new(Some(capture)))));
+                        status_msg.set("Recording with Soniox…".into());
+                    }
+                    Err(err) => {
+                        error_msg.set(Some(format!("Mic access denied: {err:?}")));
+                        if let Some(session) = session_rc.borrow_mut().take() {
+                            let _ = session.finish();
+                        }
+                        rec_state.set(RecState::Idle);
+                        status_msg.set("Ready".into());
+                    }
+                }
+            });
+            return;
+        }
 
         let multi = (speaker2_enabled)();
         let s1_source = (speaker1_source)();
@@ -1531,6 +1787,14 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 1) ────────────────────────────────────────
     let on_end_turn1 = move |_| {
+        if (stt_provider)() == "soniox" {
+            if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
+                let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
+                finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
+            }
+            return;
+        }
+
         if let Some(sess_rc) = (session_handle)().as_ref()
             && let Some(ref sess) = *sess_rc.borrow()
         {
@@ -1585,6 +1849,14 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 2) ────────────────────────────────────────
     let on_end_turn2 = move |_| {
+        if (stt_provider)() == "soniox" {
+            if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
+                let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
+                finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
+            }
+            return;
+        }
+
         if let Some(sess_rc) = (session_handle2)().as_ref()
             && let Some(ref sess) = *sess_rc.borrow()
         {
@@ -1620,6 +1892,30 @@ pub fn App() -> Element {
         // Immediately enter Stopping state — disables all buttons
         rec_state.set(RecState::Stopping);
         status_msg.set("Waiting for final transcript\u{2026}".into());
+
+        if (stt_provider)() == "soniox" {
+            spawn(async move {
+                if let Some(cap_rc) = (capture_handle)().as_ref()
+                    && let Some(capture) = cap_rc.borrow_mut().take()
+                {
+                    capture.stop();
+                }
+
+                if let Some(sess_rc) = (soniox_session_handle)().as_ref()
+                    && let Some(session) = sess_rc.borrow_mut().take()
+                {
+                    let _ = session.finish();
+                }
+
+                gloo_timers::future::TimeoutFuture::new(800).await;
+
+                partial.set(String::new());
+                partial2.set(String::new());
+                rec_state.set(RecState::Stopped);
+                status_msg.set("Stopped".into());
+            });
+            return;
+        }
 
         spawn(async move {
             let multi = (speaker2_enabled)();
@@ -2468,6 +2764,13 @@ pub fn App() -> Element {
                         on_changed: move |_| secrets_refresh.refresh(),
                     }
                     SecretsKeyRow {
+                        provider: "soniox",
+                        label: "Soniox API Key",
+                        hint: "Used for diarized live transcription.",
+                        configured: soniox_configured(),
+                        on_changed: move |_| secrets_refresh.refresh(),
+                    }
+                    SecretsKeyRow {
                         provider: "anthropic",
                         label: "Anthropic API Key",
                         hint: "Used for paragraph detection and conversation mode.",
@@ -2480,6 +2783,61 @@ pub fn App() -> Element {
                         hint: "Used for spoken AI replies in Conversation Mode. Optional.",
                         configured: elevenlabs_configured(),
                         on_changed: move |_| secrets_refresh.refresh(),
+                    }
+
+                    label { r#for: "stt-provider", "Speech-to-text provider" }
+                    select {
+                        id: "stt-provider",
+                        class: "settings-input",
+                        value: "{stt_provider}",
+                        onchange: move |evt: Event<FormData>| {
+                            let val = evt.value();
+                            stt_provider.set(val.clone());
+                            save("parley_stt_provider", &val);
+                        },
+                        option { value: "assemblyai", "AssemblyAI" }
+                        option { value: "soniox", "Soniox" }
+                    }
+                    p { class: "settings-hint",
+                        "Used by Capture Mode and Conversation Mode voice input."
+                    }
+
+                    if (stt_provider)() == "soniox" {
+                        label { r#for: "soniox-latency-mode", "Soniox latency" }
+                        select {
+                            id: "soniox-latency-mode",
+                            class: "settings-input",
+                            value: "{soniox_latency_mode}",
+                            onchange: move |evt: Event<FormData>| {
+                                let value = evt.value();
+                                let mode = soniox_latency_mode_from_value(&value);
+                                let stored = mode.storage_value().to_string();
+                                soniox_latency_mode.set(stored.clone());
+                                save(SONIOX_LATENCY_MODE_COOKIE, &stored);
+                            },
+                            option { value: "fast", "Fast" }
+                            option { value: "balanced", "Balanced" }
+                            option { value: "careful", "Careful" }
+                        }
+                        p { class: "settings-hint",
+                            "Soniox-only endpoint and finalization timing."
+                        }
+
+                        label { r#for: "soniox-context-text", "Soniox context" }
+                        textarea {
+                            id: "soniox-context-text",
+                            class: "settings-input soniox-context-input",
+                            rows: "4",
+                            value: "{soniox_context_text}",
+                            oninput: move |evt: Event<FormData>| {
+                                let value = evt.value();
+                                soniox_context_text.set(value.clone());
+                                save_local(SONIOX_CONTEXT_TEXT_STORAGE_KEY, &value);
+                            },
+                        }
+                        p { class: "settings-hint",
+                            "Soniox-only recognition context. Use domain, topic, names, vocabulary, or a sample sentence; it biases recognition and punctuation, but does not revise already-final text using future speech."
+                        }
                     }
 
                     label { r#for: "idle-timeout", "Idle timeout (minutes)" }
@@ -3256,6 +3614,11 @@ body {
 select.settings-input {
     cursor: pointer;
     appearance: auto;
+}
+.soniox-context-input {
+    min-height: 6rem;
+    resize: vertical;
+    line-height: 1.4;
 }
 .settings-hint {
     font-size: 0.8rem;

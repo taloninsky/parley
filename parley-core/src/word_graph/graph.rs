@@ -22,7 +22,7 @@ use super::node::{FLAG_TURN_LOCKED, Node, NodeFlags, NodeId, NodeKind, NodeOrigi
 /// Input from an STT provider.
 ///
 /// Spec §3.3. Maps directly to the AssemblyAI v3 `words` entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SttWord {
     /// Word text, possibly with trailing punctuation attached
     /// (e.g., `"Hi,"`). `ingest_turn` splits trailing punctuation into

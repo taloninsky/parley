@@ -361,7 +361,50 @@ The full Turn event contains these top-level fields (11 properties):
 
 The `ingest_turn` method converts `SttWord` entries into `Node` entries with `origin: Stt`, detects fillers, splits trailing punctuation into separate nodes, and wires `Next` edges.
 
-### 3.4 ProjectionOpts — filters for display
+### 3.4 Token-stream STT ingest
+
+Soniox `stt-rt-v4` streams token batches rather than AssemblyAI-style turn objects. The graph does not ingest provider WebSocket JSON directly. Provider messages normalize into a provider-neutral event layer in `parley-core::stt`, then into `SttGraphUpdate` values that apply to the graph.
+
+```rust
+struct SttToken {
+    text: String,
+    start_ms: Option<f64>,
+    end_ms: Option<f64>,
+    confidence: f32,
+    is_final: bool,
+    speaker_label: Option<String>,
+}
+
+enum SttMarker {
+    Endpoint,          // Soniox <end>
+    FinalizeComplete,  // Soniox <fin>
+    Finished,
+}
+
+struct SttGraphUpdate {
+    lane: u8,
+    finalized: Vec<SttWord>,
+    provisional: Vec<SttWord>,
+}
+```
+
+`TokenStreamNormalizer` owns provider-label-to-lane mapping and finalized-token deduplication. It emits:
+
+- `finalized` as append-only deltas. These are immediately safe to commit to the graph.
+- `provisional` as the current non-final tail for that lane. Applying a newer provisional tail replaces the previous turn-locked nodes for that lane rather than appending duplicates.
+- `markers` separately from graph updates. Marker tokens are control events, not transcript words, and must never become graph nodes.
+
+Lane mapping is stable for the life of a normalizer. Missing provider speaker labels map to lane `0`; new labels allocate lanes in first-seen order up to the current implementation cap (`15`). Soniox language tags are intentionally dropped in this slice; multilingual projection can add language metadata later without changing the graph node shape.
+
+`SttGraphUpdate::apply_to_graph` currently reuses `WordGraph::ingest_turn(lane, words, end_of_turn)`:
+
+1. Apply `finalized` with `end_of_turn = true`.
+2. Apply `provisional` with `end_of_turn = false`.
+3. Ignore `SttMarker` values for graph mutation.
+
+This keeps the minimal graph implementation small while allowing token-native providers to land now. A later graph-native ingest API can replace the adapter without changing provider parsers or UI event handling.
+
+### 3.5 ProjectionOpts — filters for display
 
 ```rust
 struct ProjectionOpts {

@@ -70,6 +70,8 @@ pub enum ProviderId {
     /// AssemblyAI — used for streaming STT and temporary token issuance.
     #[serde(rename = "assemblyai")]
     AssemblyAi,
+    /// Soniox — used for token-native streaming STT and diarization.
+    Soniox,
     /// ElevenLabs — used for streaming TTS in Conversation Mode.
     #[serde(rename = "elevenlabs")]
     ElevenLabs,
@@ -81,6 +83,7 @@ impl ProviderId {
         &[
             ProviderId::Anthropic,
             ProviderId::AssemblyAi,
+            ProviderId::Soniox,
             ProviderId::ElevenLabs,
         ]
     }
@@ -181,6 +184,12 @@ pub static REGISTRY: &[ProviderDescriptor] = &[
         env_var: "PARLEY_ASSEMBLYAI_API_KEY",
     },
     ProviderDescriptor {
+        id: "soniox",
+        display_name: "Soniox",
+        category: ProviderCategory::Stt,
+        env_var: "PARLEY_SONIOX_API_KEY",
+    },
+    ProviderDescriptor {
         id: "elevenlabs",
         display_name: "ElevenLabs",
         category: ProviderCategory::Tts,
@@ -224,6 +233,8 @@ mod tests {
         assert_eq!(json, "\"anthropic\"");
         let json = serde_json::to_string(&ProviderId::AssemblyAi).unwrap();
         assert_eq!(json, "\"assemblyai\"");
+        let json = serde_json::to_string(&ProviderId::Soniox).unwrap();
+        assert_eq!(json, "\"soniox\"");
         let json = serde_json::to_string(&ProviderId::ElevenLabs).unwrap();
         assert_eq!(json, "\"elevenlabs\"");
     }
@@ -234,6 +245,8 @@ mod tests {
         assert_eq!(p, ProviderId::Anthropic);
         let p: ProviderId = serde_json::from_str("\"assemblyai\"").unwrap();
         assert_eq!(p, ProviderId::AssemblyAi);
+        let p: ProviderId = serde_json::from_str("\"soniox\"").unwrap();
+        assert_eq!(p, ProviderId::Soniox);
         let p: ProviderId = serde_json::from_str("\"elevenlabs\"").unwrap();
         assert_eq!(p, ProviderId::ElevenLabs);
     }
@@ -284,12 +297,15 @@ mod tests {
         // Sanity: ProviderId::Anthropic is the LLM, AssemblyAi is STT.
         assert_eq!(ProviderId::Anthropic.category(), ProviderCategory::Llm);
         assert_eq!(ProviderId::AssemblyAi.category(), ProviderCategory::Stt);
+        assert_eq!(ProviderId::Soniox.category(), ProviderCategory::Stt);
         assert_eq!(ProviderId::Anthropic.display_name(), "Anthropic");
         assert_eq!(ProviderId::AssemblyAi.display_name(), "AssemblyAI");
+        assert_eq!(ProviderId::Soniox.display_name(), "Soniox");
         assert_eq!(ProviderId::Anthropic.env_var(), "PARLEY_ANTHROPIC_API_KEY");
         assert_eq!(
             ProviderId::AssemblyAi.env_var(),
             "PARLEY_ASSEMBLYAI_API_KEY"
         );
+        assert_eq!(ProviderId::Soniox.env_var(), "PARLEY_SONIOX_API_KEY");
     }
 }
