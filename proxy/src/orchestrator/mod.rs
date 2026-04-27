@@ -1,36 +1,39 @@
-//! Conversation orchestrator skeleton.
+//! Conversation orchestrator.
 //!
 //! The orchestrator is the runtime "harness" that owns conversation
 //! state, drives the per-turn state machine, and dispatches user
-//! input to the active persona's [`LlmProvider`]. It is **not** part
-//! of the audio pipeline — it consumes the pipeline's outputs (and,
-//! in a later slice, drives a TTS provider with its outputs).
+//! input to the active persona's [`LlmProvider`]. It also drives the
+//! TTS provider that synthesizes each AI turn — the audio sibling
+//! stream pulls bytes from the cache the orchestrator writes.
 //!
-//! ## Scope of this slice
+//! ## What's wired today
 //!
-//! - Single-agent, text-only turns (typed input → LLM → streamed text)
-//! - State machine subset: `Idle → Routing → Streaming → Idle` plus
+//! - Single-agent text-and-voice turns (typed or spoken input → LLM →
+//!   streamed text → TTS sentence chunks → cached audio + live SSE)
+//! - State machine: `Idle → Routing → Streaming → Idle` plus
 //!   `Failed → Idle`
 //! - Persona / model / system-prompt resolution from the registries
 //!   built in Phase 3 (`proxy::registry`)
-//! - Mid-session persona switching API (no UI yet — spec §6.3)
-//! - Per-turn cost computed from the active model's rates
+//! - Mid-session persona switching API
+//! - Per-turn cost (`llm_cost`, `tts_cost`, `stt_cost`) recorded in
+//!   `TurnProvenance`
+//! - Multi-provider STT/TTS with the §14.1 fallback chain
+//!   (`xai → assemblyai`, `xai → elevenlabs`)
 //!
-//! ## Deliberately out of scope (later slices)
+//! ## Out of scope
 //!
-//! - Audio capture / STT / TTS integration (so the `Capturing`,
-//!   `Speaking`, `Paused` states are absent here)
 //! - Multi-party / WordGraph AI lane writes
 //! - Pause / Stop / Play / barge-in
 //! - Context compaction
-//! - Persistence (session file format)
 //! - Expression-annotation auto-prepend
-//! - Retry-on-failure logic
+//! - Retry-on-failure logic (manual retry exists; auto-retry does not)
 //!
 //! Spec references: §3.2, §4 (orchestrator), §5 (state machine),
 //! §6.3 (active persona), §10.1 (failure surfacing), §11 (cost).
 
 #![allow(dead_code)] // Skeleton: no production callsite yet. Tests cover the surface.
+
+pub mod stt_router;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -670,6 +673,10 @@ impl ConversationOrchestrator {
                 llm_cost: cost,
                 tts_characters,
                 tts_cost,
+                // STT runs outside the orchestrator today (browser-direct
+                // capture). Reserve the slot; populated when the proxy
+                // captures STT itself. Spec §7.
+                stt_cost: parley_core::chat::Cost::default(),
             };
 
             let appended_turn_id = {

@@ -703,7 +703,7 @@ API keys for upstream providers (Anthropic, AssemblyAI, Soniox, ElevenLabs) live
 
 **What's deferred (v2):** richer per-category panels in the UI for managing named credentials, channel-binding hardening of the `/api/secrets` surface (currently relies on the proxy listening on `127.0.0.1` only), and rotation/expiry tracking.
 
-- Audio capture / STT / TTS integration (and the `Capturing`, `Speaking`, `Paused` states that come with them)
+- Audio capture / STT / TTS integration: conversation voice capture now supports AssemblyAI, Soniox, and xAI STT paths, with Soniox token batches normalized through `parley-core::stt` and xAI bridged through the proxy. TTS supports ElevenLabs and xAI through the proxy with sentence chunking and the per-turn audio cache. Voice / STT-provider pickers and the `(stt|tts).provider` profile schema use registry-backed validation. The `Capturing`, `Speaking`, and `Paused` states from the original spec are still partial — pause/stop/barge-in remain deferred (see below).
 - Multi-party / WordGraph AI lane writes (`NodeOrigin::AiGenerated`)
 - Pause / Stop / Play / barge-in
 - Context compaction

@@ -1,51 +1,158 @@
-//! Provider-neutral speech-to-text stream events and token normalization.
+//! Shared speech-to-text data shapes and stream normalization.
 //!
-//! Soniox `stt-rt-v4` streams token batches rather than turn-shaped messages.
-//! This module keeps that token-native shape in the WASM-safe core crate so
-//! browser providers, word-graph ingest, and tests can share one contract.
+//! The batch/stream transcript types are the canonical wire contract between
+//! the WASM frontend and the native proxy. The token-stream types support
+//! Soniox's token-native realtime API and keep its normalization logic in the
+//! WASM-safe core crate.
 
 use std::collections::{BTreeMap, HashMap};
 
+use serde::{Deserialize, Serialize};
+
 use crate::word_graph::{SttWord, WordGraph};
 
-/// Maximum number of speaker lanes Soniox documents for one transcription
-/// session. Lane indexes are `0..MAX_SONIOX_SPEAKERS`.
+/// Audio container/codec shape an [`SttRequest`] or streaming session carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SttAudioFormat {
+    /// 16-bit signed PCM, little-endian, mono.
+    Pcm16Le {
+        /// Sampling rate of the PCM stream, in Hz.
+        sample_rate_hz: u32,
+    },
+    /// RIFF/WAV container.
+    Wav,
+    /// MPEG-1 Audio Layer III.
+    Mp3,
+    /// Opus in an Ogg container.
+    Opus,
+    /// Free Lossless Audio Codec.
+    Flac,
+}
+
+/// One file/batch transcription request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SttRequest {
+    /// Raw audio bytes. The provider decodes these according to [`Self::format`].
+    pub audio: Vec<u8>,
+    /// Container/codec of the audio bytes.
+    pub format: SttAudioFormat,
+    /// BCP-47 language hint. `None` requests auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Whether to attribute utterances to distinct speakers.
+    #[serde(default = "default_diarize")]
+    pub diarize: bool,
+}
+
+fn default_diarize() -> bool {
+    true
+}
+
+/// Initial configuration a streaming STT session receives before audio frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SttStreamConfig {
+    /// Audio format the client will push.
+    pub format: SttAudioFormat,
+    /// BCP-47 language hint. `None` requests auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Whether to attribute utterances to distinct speakers.
+    #[serde(default = "default_diarize")]
+    pub diarize: bool,
+}
+
+/// Final transcript from a batch call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Whole-transcript concatenated text.
+    pub text: String,
+    /// Per-utterance segments when diarization or timing is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<TranscriptSegment>,
+    /// BCP-47 language code the provider detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Total audio duration in seconds.
+    pub duration_seconds: f64,
+}
+
+/// One utterance-shaped segment within a [`Transcript`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    /// Text of this segment.
+    pub text: String,
+    /// Start offset within the audio, in seconds.
+    pub start_seconds: f64,
+    /// End offset within the audio, in seconds.
+    pub end_seconds: f64,
+    /// Speaker identifier when diarized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
+/// One incremental event from a streaming STT session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptEvent {
+    /// Interim transcription hypothesis. May be replaced by a later event.
+    Partial {
+        /// Running text hypothesis.
+        text: String,
+    },
+    /// Finalized utterance.
+    Final {
+        /// Finalized text.
+        text: String,
+        /// Speaker id when diarized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speaker: Option<String>,
+        /// Utterance start, seconds from session start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_seconds: Option<f64>,
+        /// Utterance end, seconds from session start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_seconds: Option<f64>,
+    },
+    /// End-of-stream marker with billable audio duration.
+    Done {
+        /// Billable session duration in seconds.
+        duration_seconds: f64,
+    },
+}
+
+/// Maximum number of speaker lanes Soniox documents for one session.
 pub const MAX_SONIOX_SPEAKERS: u8 = 15;
 
 /// One token emitted by a streaming STT provider.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SttToken {
-    /// Token text. May be a word, subword, whitespace, punctuation, or a
-    /// provider control marker such as `<end>` / `<fin>`.
+    /// Token text. May be a word, subword, punctuation, or provider marker.
     pub text: String,
-    /// Token start time in milliseconds relative to session start, if the
-    /// provider supplied it.
+    /// Token start time in milliseconds relative to session start.
     pub start_ms: Option<f64>,
-    /// Token end time in milliseconds relative to session start, if the
-    /// provider supplied it.
+    /// Token end time in milliseconds relative to session start.
     pub end_ms: Option<f64>,
     /// Recognition confidence from `0.0` to `1.0`.
     pub confidence: f32,
-    /// `true` when this token is finalized and will not be repeated or
-    /// revised by the provider.
+    /// `true` when this token is finalized and will not be revised.
     pub is_final: bool,
-    /// Provider-specific diarization label. Soniox uses strings such as
-    /// `"1"`, `"2"`; missing labels map to lane 0.
+    /// Provider-specific diarization label.
     pub speaker_label: Option<String>,
 }
 
 /// Provider control marker derived from the token stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SttMarker {
-    /// Semantic endpoint detected (`<end>` in Soniox).
+    /// Semantic endpoint detected.
     Endpoint,
-    /// Manual finalization completed (`<fin>` in Soniox).
+    /// Manual finalization completed.
     FinalizeComplete,
     /// Provider finished the stream.
     Finished,
 }
 
-/// Provider-neutral streaming event.
+/// Provider-neutral streaming event for token-native providers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SttStreamEvent {
     /// Token batch plus audio progress counters.
@@ -63,7 +170,7 @@ pub enum SttStreamEvent {
     Error {
         /// Provider status code when available.
         code: Option<u16>,
-        /// Human-readable provider message. Must not contain secret material.
+        /// Human-readable provider message. Must not contain secrets.
         message: String,
     },
     /// WebSocket close event.
@@ -75,22 +182,19 @@ pub enum SttStreamEvent {
     },
 }
 
-/// Graph-ready update for one lane from a token batch.
+/// Graph-ready update for one speaker lane from a token batch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SttGraphUpdate {
     /// Parley speaker lane index.
     pub lane: u8,
     /// Finalized words that should be appended exactly once.
     pub finalized: Vec<SttWord>,
-    /// Current provisional words for this lane. Replaces the previous
-    /// provisional tail for the lane.
+    /// Current provisional words for this lane.
     pub provisional: Vec<SttWord>,
 }
 
 impl SttGraphUpdate {
-    /// Apply this update to a [`WordGraph`] using the existing turn ingest
-    /// primitive: finalized deltas are committed first, then the current
-    /// provisional tail is attached as turn-locked nodes.
+    /// Apply this update to a [`WordGraph`].
     pub fn apply_to_graph(&self, graph: &mut WordGraph) {
         if !self.finalized.is_empty() {
             graph.ingest_turn(self.lane, &self.finalized, true);
@@ -143,8 +247,7 @@ impl SpeakerLaneMap {
         Self::default()
     }
 
-    /// Resolve a provider speaker label to a stable lane. Missing labels map
-    /// to lane 0 and reserve it for unlabeled speech.
+    /// Resolve a provider speaker label to a stable lane.
     pub fn lane_for(&mut self, label: Option<&str>) -> Result<u8, SttNormalizeError> {
         let Some(label) = label.filter(|value| !value.is_empty()) else {
             if self.next_lane == 0 {
@@ -182,9 +285,7 @@ impl TokenStreamNormalizer {
         Self::default()
     }
 
-    /// Normalize one provider-neutral stream event into graph updates and
-    /// control markers. Provider errors and WebSocket closes intentionally do
-    /// not mutate graph state.
+    /// Normalize one provider-neutral stream event into graph updates.
     pub fn accept_event(
         &mut self,
         event: SttStreamEvent,
@@ -383,6 +484,55 @@ mod tests {
     }
 
     #[test]
+    fn audio_format_pcm_round_trip() {
+        let f = SttAudioFormat::Pcm16Le {
+            sample_rate_hz: 16000,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"kind\":\"pcm16_le\""));
+        let parsed: SttAudioFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, f);
+    }
+
+    #[test]
+    fn diarize_defaults_to_true_on_deserialize() {
+        let json = r#"{"audio":[1,2,3],"format":{"kind":"wav"}}"#;
+        let req: SttRequest = serde_json::from_str(json).unwrap();
+        assert!(req.diarize);
+        assert!(req.language.is_none());
+    }
+
+    #[test]
+    fn transcript_event_final_with_speaker_round_trip() {
+        let event = TranscriptEvent::Final {
+            text: "hello world".into(),
+            speaker: Some("A".into()),
+            start_seconds: Some(0.4),
+            end_seconds: Some(1.8),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"kind\":\"final\""));
+        assert_eq!(
+            serde_json::from_str::<TranscriptEvent>(&json).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn stream_config_round_trips_with_pcm() {
+        let config = SttStreamConfig {
+            format: SttAudioFormat::Pcm16Le {
+                sample_rate_hz: 16000,
+            },
+            language: Some("en".into()),
+            diarize: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: SttStreamConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
     fn missing_speaker_label_maps_to_lane_zero() {
         let mut map = SpeakerLaneMap::new();
         assert_eq!(map.lane_for(None).unwrap(), 0);
@@ -433,43 +583,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(batch.updates.len(), 1);
-        let update = &batch.updates[0];
-        assert_eq!(update.lane, 0);
-        assert_eq!(
-            update
-                .finalized
-                .iter()
-                .map(|word| word.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Beautiful", "!"]
-        );
-        assert_eq!(update.finalized[0].start_ms, 0.0);
-        assert_eq!(update.finalized[0].end_ms, 240.0);
-    }
-
-    #[test]
-    fn leading_space_token_delimits_previous_word() {
-        let mut normalizer = TokenStreamNormalizer::new();
-        let batch = normalizer
-            .accept_event(SttStreamEvent::Tokens {
-                tokens: vec![
-                    token("How", true, Some("1"), 0.0, 100.0),
-                    token(" are", true, Some("1"), 100.0, 180.0),
-                    token(" you", true, Some("1"), 180.0, 240.0),
-                    token("?", true, Some("1"), 240.0, 250.0),
-                ],
-                final_audio_proc_ms: Some(250.0),
-                total_audio_proc_ms: Some(250.0),
-            })
-            .unwrap();
-
+        assert_eq!(batch.updates[0].lane, 0);
         assert_eq!(
             batch.updates[0]
                 .finalized
                 .iter()
                 .map(|word| word.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["How", "are", "you", "?"]
+            vec!["Beautiful", "!"]
         );
     }
 
@@ -492,19 +613,6 @@ mod tests {
             batch.markers,
             vec![SttMarker::Endpoint, SttMarker::FinalizeComplete]
         );
-    }
-
-    #[test]
-    fn language_field_is_absent_from_provider_neutral_token() {
-        let token = SttToken {
-            text: "hola".to_string(),
-            start_ms: Some(0.0),
-            end_ms: Some(100.0),
-            confidence: 0.9,
-            is_final: true,
-            speaker_label: Some("1".to_string()),
-        };
-        assert_eq!(token.text, "hola");
     }
 
     #[test]

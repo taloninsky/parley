@@ -167,14 +167,23 @@ Response body (`application/json`):
 ### 5.3 STT — WebSocket (streaming)
 
 ```
-wss://api.x.ai/v1/stt
+wss://api.x.ai/v1/stt?model=grok-stt&language=en
 ```
 
-**Protocol** (verified at docs level; precise event-type strings must be confirmed during impl — see [§10.1](#101-spike-verify-websocket-protocol)):
+Verified 2026-04-24 against the live service — see [`research/xai-ws-protocol.md`](research/xai-ws-protocol.md) and the captures under `research/xai-ws-protocol-captures/` for the source-of-truth evidence.
 
-- Client → Server: raw binary audio frames (format negotiated at handshake via query params).
-- Client → Server (close): text frame `{"type":"audio.done"}`.
-- Server → Client: interim and final transcript events. Event type names (`transcript.delta`, `transcript.final`, or similar) are not explicitly enumerated in the public docs; treat them as **unverified** and add an integration spike ([§10.1](#101-spike-verify-websocket-protocol)) as the first implementation task.
+**Handshake:** `Authorization: Bearer <XAI_API_KEY>` header; `model` and `language` as query params. No `audio_format` or `sample_rate` query param is required — xAI accepts raw PCM16 LE at 16 kHz without a format hint. `x-trace-id` arrives on the upgrade response and should be logged for support correlation.
+
+**Client → Server:**
+- Binary frames carrying raw PCM16 LE bytes (any chunk size; we send 4 KB).
+- Single text frame `{"type":"audio.done"}` to signal end of input.
+
+**Server → Client:**
+- `{"type":"transcript.created","id":"<uuid>"}` — session ack, emitted once immediately after the upgrade.
+- `{"type":"transcript.partial","text":"…","words":[…],"is_final":bool,"speech_final":bool,"start":f,"duration":f}` — interim *and* locked-segment events share this type. Treat `is_final:false` as `TranscriptEvent::Partial`, `is_final:true` as `TranscriptEvent::Final`. `speech_final` is advisory only and is ignored in v1. `words` has the same shape as the REST response (`{text,start,end,confidence,speaker}`), and is empty for empty segments.
+- `{"type":"transcript.done","text":"…","words":[],"duration":f}` — terminal event; `duration` is billable seconds.
+
+**Close behavior:** xAI **does not send a WS Close frame**. After `transcript.done` the server drops the TCP connection; `tokio-tungstenite` surfaces this as `Connection reset without closing handshake`. The WS client must treat `transcript.done` as the stream terminator and swallow the subsequent reset without propagating it as an error.
 
 **Limits:** 600 RPM, 10 RPS, 100 concurrent streams per team.
 
@@ -216,8 +225,12 @@ Response: raw audio bytes with the codec's MIME type.
 wss://api.x.ai/v1/tts?language=en&voice=eve&codec=mp3&sample_rate=24000&bit_rate=128000
 ```
 
+Verified 2026-04-24 against the live service — see [`research/xai-ws-protocol.md`](research/xai-ws-protocol.md).
+
 - Client → Server: `{"type":"text.delta","delta":"…"}` (repeated), then `{"type":"text.done"}`.
 - Server → Client: `{"type":"audio.delta","delta":"<base64>"}` (repeated), then `{"type":"audio.done","trace_id":"<uuid>"}`.
+- `audio.delta.delta` is **standard RFC 4648 base64, padded with `=`** — decode as-is with `base64::engine::general_purpose::STANDARD` (no URL-safe alphabet, no padding fixup).
+- `audio.done` is terminal; the client closes the WS after receiving it (unlike STT, TTS does not drop the TCP connection itself).
 
 **Limits:** 50 concurrent WS sessions per team, 15 min session timeout.
 

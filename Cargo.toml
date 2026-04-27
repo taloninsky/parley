@@ -1,5 +1,5 @@
 [workspace]
-members = ["parley-core", "proxy"]
+members = ["parley-core", "proxy", "xai-spike"]
 
 [package]
 name = "parley"

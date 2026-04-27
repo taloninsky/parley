@@ -12,6 +12,7 @@ pub mod chat;
 pub mod conversation;
 pub mod model_config;
 pub mod persona;
+pub mod profile;
 pub mod speaker;
 pub mod stt;
 pub mod tts;

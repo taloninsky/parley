@@ -536,15 +536,22 @@ impl SecretsManager {
                 .map(|n| self.credential_status(provider, n))
                 .collect();
 
-            categories
-                .entry(descriptor.category.as_str())
-                .or_default()
-                .push(ProviderStatus {
-                    id: descriptor.id.to_string(),
-                    display_name: descriptor.display_name.to_string(),
-                    env_var: descriptor.env_var.to_string(),
-                    credentials,
-                });
+            // Multi-category providers (e.g. xAI: STT + TTS under one
+            // bearer token) appear under each of their declared categories
+            // with the same credential list. The UI surfaces one card per
+            // (provider, category) pair; editing either view mutates the
+            // same underlying credential.
+            for cat in descriptor.categories {
+                categories
+                    .entry(cat.as_str())
+                    .or_default()
+                    .push(ProviderStatus {
+                        id: descriptor.id.to_string(),
+                        display_name: descriptor.display_name.to_string(),
+                        env_var: descriptor.env_var.to_string(),
+                        credentials: credentials.clone(),
+                    });
+            }
         }
 
         StatusReport {

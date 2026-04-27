@@ -1,0 +1,22 @@
+[package]
+name = "xai-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+# Throwaway binary for verifying xAI WebSocket protocol event strings.
+# Deliverable: docs/research/xai-ws-protocol.md + updates to
+# docs/xai-speech-integration-spec.md §5.3/§5.5. This crate is NOT part
+# of the production build — not referenced from parley or parley-proxy.
+#
+# Spec: docs/xai-speech-integration-spec.md §10.1 (spike merge gate).
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

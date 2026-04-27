@@ -214,6 +214,16 @@ struct InitRequest<'a> {
     /// from the browser: the proxy resolves it from the keystore.
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<&'a str>,
+    /// TTS provider id from Settings → Pipeline (`elevenlabs`, `xai`,
+    /// or `off`). Omitted when the user has never touched Pipeline
+    /// settings, which lets the proxy fall back to its default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tts_provider: Option<&'a str>,
+    /// Voice id picked in Settings → Pipeline. Provider-specific.
+    /// Omitted when empty so the proxy applies its provider-specific
+    /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_id: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1642,12 +1652,23 @@ fn submit_turn(h: SendHandles) {
     spawn_local(async move {
         // Lazily init on first send.
         if !already_init {
+            // Pull the user's pipeline picks from cookies (Settings →
+            // Pipeline). Both are optional on the wire; absent values
+            // let the proxy fall back to its provider defaults.
+            let tts_provider_pick = crate::ui::pipeline::tts_provider();
+            let voice_pick = crate::ui::pipeline::tts_voice_id();
             let init_body = match serde_json::to_string(&InitRequest {
                 session_id: &sid,
                 persona_id: &persona,
                 ai_speaker_id: format!("ai-{persona}"),
                 ai_speaker_label: &persona,
                 credential: Some(credential.as_str()),
+                tts_provider: Some(tts_provider_pick.as_str()),
+                voice_id: if voice_pick.is_empty() {
+                    None
+                } else {
+                    Some(voice_pick.as_str())
+                },
             }) {
                 Ok(s) => s,
                 Err(e) => {

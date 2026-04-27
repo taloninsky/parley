@@ -73,7 +73,7 @@ fn format_countdown(total_secs: u32) -> String {
     }
 }
 
-fn load(key: &str) -> Option<String> {
+pub(crate) fn load(key: &str) -> Option<String> {
     // Read from cookies (shared across all localhost ports).
     let doc = web_sys::window()?.document()?;
     let cookies = js_sys::Reflect::get(&doc, &"cookie".into())
@@ -90,7 +90,7 @@ fn load(key: &str) -> Option<String> {
     None
 }
 
-fn save(key: &str, value: &str) {
+pub(crate) fn save(key: &str, value: &str) {
     // Store as cookie — max-age 10 years, SameSite=Strict, path=/.
     // Cookies ignore port, so these persist across localhost:8080, :8081, etc.
     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
@@ -807,6 +807,65 @@ pub fn App() -> Element {
                 .unwrap_or(false),
         )
     });
+    // xAI covers both STT (`grok-stt`) and TTS (`grok-tts`) under one
+    // bearer token. Spec: docs/xai-speech-integration-spec.md.
+    let xai_configured = use_memo(move || {
+        matches!(
+            &*secrets_status.read_unchecked(),
+            Some(Ok(s)) if s
+                .provider("xai")
+                .and_then(|p| p.credential("default"))
+                .map(|c| c.configured)
+                .unwrap_or(false),
+        )
+    });
+
+    // ── Pipeline picks ──────────────────────────────────────────────
+    // Single source of truth for STT/TTS provider + voice. Both this
+    // view and the conversation view read these via
+    // `crate::ui::pipeline`. Default values mirror what the proxy
+    // selects when no client preference is sent (AssemblyAI for STT,
+    // ElevenLabs for TTS).
+    let pipeline_stt_provider = use_signal(crate::ui::pipeline::stt_provider);
+    let mut pipeline_tts_provider = use_signal(|| {
+        load(crate::ui::pipeline::TTS_PROVIDER_KEY).unwrap_or_else(|| "elevenlabs".to_string())
+    });
+    let mut pipeline_tts_voice = use_signal(|| {
+        let v = load(crate::ui::pipeline::TTS_VOICE_KEY).unwrap_or_default();
+        web_sys::console::log_1(&format!("[app] init voice from cookie: {v:?}").into());
+        v
+    });
+    // Persist changes to cookies. `use_effect(use_reactive!(...))`
+    // fires whenever the signal changes; cheap-enough to write on
+    // every change since the user only edits these from a dropdown.
+    use_effect(use_reactive!(|pipeline_stt_provider| {
+        save(
+            crate::ui::pipeline::STT_PROVIDER_KEY,
+            &pipeline_stt_provider(),
+        );
+    }));
+    use_effect(use_reactive!(|pipeline_tts_provider| {
+        save(
+            crate::ui::pipeline::TTS_PROVIDER_KEY,
+            &pipeline_tts_provider(),
+        );
+    }));
+    // Note: invalidating `pipeline_tts_voice` when the provider
+    // changes is handled by the `<select>` onchange handler, not
+    // here. `use_effect(use_reactive!)` also fires on initial mount,
+    // and clearing the voice on first render would discard the saved
+    // pick from cookies before the VoicePicker could honor it.
+    use_effect(use_reactive!(|pipeline_tts_voice| {
+        let v = pipeline_tts_voice();
+        web_sys::console::log_1(&format!("[app] save voice cookie: {v:?}").into());
+        save(crate::ui::pipeline::TTS_VOICE_KEY, &v);
+    }));
+    // Credential the VoicePicker queries the proxy with. Today every
+    // pick uses `default`; named-credential support could replace this
+    // with a per-provider dropdown later. Defined unconditionally so
+    // the hook order is stable across renders even when the Voice row
+    // is hidden (TTS = Off).
+    let voice_credential = use_signal(|| "default".to_string());
 
     let mut idle_minutes = use_signal(|| {
         load("parley_idle_minutes")
@@ -2783,6 +2842,85 @@ pub fn App() -> Element {
                         hint: "Used for spoken AI replies in Conversation Mode. Optional.",
                         configured: elevenlabs_configured(),
                         on_changed: move |_| secrets_refresh.refresh(),
+                    }
+                    SecretsKeyRow {
+                        provider: "xai",
+                        label: "xAI API Key",
+                        hint: "Used for grok-stt transcription and grok-tts spoken replies. Optional.",
+                        configured: xai_configured(),
+                        on_changed: move |_| secrets_refresh.refresh(),
+                    }
+
+                    // ── Pipeline section ─────────────────────────────
+                    h3 { class: "settings-section-heading", "Pipeline" }
+                    p { class: "settings-hint",
+                        "Choose which providers handle speech-to-text and text-to-speech. \
+                         Both transcription mode and conversation mode read the same selection."
+                    }
+
+                    label { r#for: "pipeline-stt", "Speech-to-text" }
+                    div { class: "settings-row",
+                        crate::ui::stt_provider_picker::SttProviderPicker {
+                            selected_provider_id: pipeline_stt_provider,
+                        }
+                    }
+                    p { class: "settings-hint",
+                        "Used for Conversation Mode capture. The standalone \
+                         Transcription view is still AssemblyAI-only."
+                    }
+
+                    label { r#for: "pipeline-tts", "Text-to-speech" }
+                    div { class: "settings-row",
+                        select {
+                            id: "pipeline-tts",
+                            class: "settings-input",
+                            value: "{pipeline_tts_provider}",
+                            onchange: move |evt: Event<FormData>| {
+                                let new_provider = evt.value();
+                                // Voice ids are provider-specific; an
+                                // ElevenLabs id passed to xAI is invalid,
+                                // and vice versa. Clear the saved voice
+                                // so the VoicePicker auto-picks the new
+                                // provider's first voice once its catalog
+                                // loads. Doing this in the change handler
+                                // (instead of a use_effect) means a fresh
+                                // page load doesn't wipe the saved pick.
+                                if new_provider != *pipeline_tts_provider.peek() {
+                                    pipeline_tts_voice.set(String::new());
+                                }
+                                pipeline_tts_provider.set(new_provider);
+                            },
+                            option { value: "elevenlabs", "ElevenLabs" }
+                            option { value: "xai", "xAI (grok-tts)" }
+                            option { value: "off", "Off (text only)" }
+                        }
+                    }
+                    p { class: "settings-hint",
+                        "Used in Conversation Mode for spoken replies. \
+                         Requires the matching API key above (or set Off for text-only)."
+                    }
+
+                    if pipeline_tts_provider() != "off" {
+                        label { r#for: "pipeline-voice", "Voice" }
+                        div { class: "settings-row",
+                            crate::ui::voice_picker::VoicePicker {
+                                provider_id: ReadOnlySignal::from(pipeline_tts_provider),
+                                credential: ReadOnlySignal::from(voice_credential),
+                                selected_voice_id: pipeline_tts_voice,
+                            }
+                        }
+                        p { class: "settings-hint",
+                            "Voices come from the selected TTS provider's catalog."
+                        }
+                    }
+
+                    // ── Language models (read-only info) ─────────────
+                    h3 { class: "settings-section-heading", "Language models" }
+                    p { class: "settings-hint",
+                        "Formatting (paragraph detection) and conversation replies both use \
+                         Anthropic today. Per-purpose model + provider selection is configured \
+                         in your persona and model files under ~/.parley; the conversation \
+                         view's Model dropdown lets you swap the active heavy model per session."
                     }
 
                     label { r#for: "stt-provider", "Speech-to-text provider" }
