@@ -274,9 +274,28 @@ impl SpeakerLaneMap {
 }
 
 /// Stateful token normalizer for Soniox-compatible token streams.
+///
+/// Holds a per-lane "open partial word" for the *finalized* token stream so
+/// that subword fragments split across consecutive WebSocket messages
+/// (Soniox occasionally emits one word as `["speci", "es"]` across two
+/// batches with no leading-space boundary on the continuation) get glued
+/// back into a single word. The pending partial flushes when:
+///
+/// - The next batch's leading character for the same lane is whitespace
+///   (Soniox signaled a real word boundary), **or**
+/// - A control marker arrives ([`SttMarker::Endpoint`],
+///   [`SttMarker::FinalizeComplete`], or [`SttMarker::Finished`]) — these
+///   are turn / utterance boundaries and any held fragment is forced out.
+///
+/// Provisional tokens are re-rendered fresh each batch (Soniox re-sends the
+/// full provisional state on every update), so they're not held across
+/// batches.
 #[derive(Clone, Debug, Default)]
 pub struct TokenStreamNormalizer {
     lane_map: SpeakerLaneMap,
+    /// Per-lane trailing partial finalized word. Carries forward across
+    /// `accept_event` calls. See type-level docs for the flush rules.
+    finalized_pending: BTreeMap<u8, PartialWord>,
 }
 
 impl TokenStreamNormalizer {
@@ -296,10 +315,16 @@ impl TokenStreamNormalizer {
                 final_audio_proc_ms,
                 total_audio_proc_ms,
             } => self.accept_tokens(tokens, final_audio_proc_ms, total_audio_proc_ms),
-            SttStreamEvent::Marker(marker) => Ok(NormalizedSttBatch {
-                updates: Vec::new(),
-                markers: vec![marker],
-            }),
+            SttStreamEvent::Marker(marker) => {
+                // A marker is a turn boundary: flush every lane's held
+                // finalized partial as a complete word. This is what
+                // prevents the last word of a turn from being silently
+                // dropped if the user stops talking before Soniox sends a
+                // trailing-space token.
+                let mut batch = self.flush_pending_finalized();
+                batch.markers.push(marker);
+                Ok(batch)
+            }
             SttStreamEvent::Error { .. } | SttStreamEvent::Closed { .. } => {
                 Ok(NormalizedSttBatch::default())
             }
@@ -352,6 +377,11 @@ impl TokenStreamNormalizer {
             }
         }
 
+        // Lanes that need an emit decision: any with new tokens this
+        // batch, OR any that are still carrying a pending partial from a
+        // previous batch (so the marker-flush path covers them too — but
+        // here we only emit on actual token arrival; markers are handled
+        // separately above).
         let mut lanes: Vec<u8> = finalized_by_lane
             .keys()
             .chain(provisional_by_lane.keys())
@@ -362,31 +392,89 @@ impl TokenStreamNormalizer {
 
         let updates = lanes
             .into_iter()
-            .map(|lane| SttGraphUpdate {
-                lane,
-                finalized: assemble_tokens(
-                    finalized_by_lane
-                        .get(&lane)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                ),
-                provisional: assemble_tokens(
-                    provisional_by_lane
-                        .get(&lane)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                ),
+            .map(|lane| {
+                let finalized_tokens = finalized_by_lane
+                    .get(&lane)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let provisional_tokens = provisional_by_lane
+                    .get(&lane)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                // Continue the previous batch's pending partial word for
+                // this lane (if any). After processing, store the new
+                // trailing partial — it may continue into the *next*
+                // batch.
+                let prev_pending = self.finalized_pending.remove(&lane).unwrap_or_default();
+                let (finalized, trailing) =
+                    assemble_tokens_with_state(prev_pending, finalized_tokens, false);
+                if !trailing.text.is_empty() {
+                    self.finalized_pending.insert(lane, trailing);
+                }
+
+                // Provisional is always re-rendered fully each batch —
+                // Soniox re-sends the entire provisional buffer with
+                // every update.
+                let (provisional, _) =
+                    assemble_tokens_with_state(PartialWord::default(), provisional_tokens, true);
+
+                SttGraphUpdate {
+                    lane,
+                    finalized,
+                    provisional,
+                }
             })
             .filter(|update| !update.finalized.is_empty() || !update.provisional.is_empty())
             .collect();
 
         Ok(NormalizedSttBatch { updates, markers })
     }
+
+    /// Drain every lane's held finalized partial as a complete word,
+    /// returning a batch with one [`SttGraphUpdate`] per non-empty lane.
+    fn flush_pending_finalized(&mut self) -> NormalizedSttBatch {
+        let mut updates = Vec::new();
+        let pending = std::mem::take(&mut self.finalized_pending);
+        let mut entries: Vec<_> = pending.into_iter().collect();
+        // BTreeMap already iterates in lane order, but `into_iter` on the
+        // moved map gives an arbitrary order in some std versions — sort
+        // explicitly so the output is deterministic.
+        entries.sort_by_key(|(lane, _)| *lane);
+        for (lane, mut partial) in entries {
+            if partial.text.is_empty() {
+                continue;
+            }
+            let mut words = Vec::new();
+            partial.flush(&mut words);
+            updates.push(SttGraphUpdate {
+                lane,
+                finalized: words,
+                provisional: Vec::new(),
+            });
+        }
+        NormalizedSttBatch {
+            updates,
+            markers: Vec::new(),
+        }
+    }
 }
 
-fn assemble_tokens(tokens: &[SttToken]) -> Vec<SttWord> {
+/// Assemble a sequence of [`SttToken`]s into [`SttWord`]s, optionally
+/// continuing from a previous batch's trailing partial word.
+///
+/// `flush_trailing = true` always emits the final partial as a complete
+/// word (used for provisional rendering, which re-builds from scratch each
+/// batch). `flush_trailing = false` returns the trailing partial so the
+/// caller can carry it into the next batch (used for finalized tokens, see
+/// [`TokenStreamNormalizer`]).
+fn assemble_tokens_with_state(
+    initial: PartialWord,
+    tokens: &[SttToken],
+    flush_trailing: bool,
+) -> (Vec<SttWord>, PartialWord) {
     let mut words = Vec::new();
-    let mut current = PartialWord::default();
+    let mut current = initial;
 
     for token in tokens {
         let start_ms = token.start_ms.unwrap_or(0.0);
@@ -409,15 +497,18 @@ fn assemble_tokens(tokens: &[SttToken]) -> Vec<SttWord> {
         }
     }
 
-    current.flush(&mut words);
-    words
+    if flush_trailing {
+        current.flush(&mut words);
+    }
+
+    (words, current)
 }
 
 fn is_punctuation_token(c: char) -> bool {
     matches!(c, '.' | ',' | '?' | '!' | ';' | ':' | '"')
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct PartialWord {
     text: String,
     start_ms: Option<f64>,
@@ -644,6 +735,10 @@ mod tests {
         second.apply_to_graph(&mut graph);
         assert_eq!(graph_texts(&graph, 0), vec!["hello", "wor"]);
 
+        // The finalized "world" token has no leading whitespace, so the
+        // normalizer holds it as a partial pending the next word boundary
+        // or marker. This is the cross-batch fix: without an explicit
+        // boundary, we must not emit it yet (it could continue).
         let third = normalizer
             .accept_event(SttStreamEvent::Tokens {
                 tokens: vec![token("world", true, Some("1"), 180.0, 320.0)],
@@ -652,13 +747,237 @@ mod tests {
             })
             .unwrap();
         third.apply_to_graph(&mut graph);
+        // "wor" provisional remains; "world" is still pending.
+        assert_eq!(graph_texts(&graph, 0), vec!["hello", "wor"]);
+
+        // A marker (turn endpoint) flushes the pending "world" as a
+        // complete finalized word.
+        let fourth = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::Endpoint))
+            .unwrap();
+        fourth.apply_to_graph(&mut graph);
         assert_eq!(graph_texts(&graph, 0), vec!["hello", "world"]);
+    }
+
+    // ── Cross-batch subword continuation (Soniox space-insertion fix) ──
+
+    #[test]
+    fn cross_batch_finalized_subwords_merge_into_one_word() {
+        // Soniox sometimes finalizes a single word as two subword tokens
+        // delivered in separate WS messages, with no leading-space
+        // boundary on the continuation. The normalizer must hold the
+        // first fragment until the next batch's first character signals
+        // a real word boundary (or a marker arrives).
+        let mut normalizer = TokenStreamNormalizer::new();
+
+        let b1 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token("speci", true, Some("1"), 0.0, 200.0)],
+                final_audio_proc_ms: Some(200.0),
+                total_audio_proc_ms: Some(200.0),
+            })
+            .unwrap();
+        // Pending — no completed word yet.
+        assert!(b1.updates.is_empty());
+
+        let b2 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token("es", true, Some("1"), 200.0, 260.0)],
+                final_audio_proc_ms: Some(260.0),
+                total_audio_proc_ms: Some(260.0),
+            })
+            .unwrap();
+        // Still pending — "speci" + "es" continue accumulating.
+        assert!(b2.updates.is_empty());
+
+        let b3 = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::Endpoint))
+            .unwrap();
+        assert_eq!(b3.updates.len(), 1);
+        assert_eq!(
+            b3.updates[0]
+                .finalized
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["species"]
+        );
+        assert_eq!(b3.markers, vec![SttMarker::Endpoint]);
+    }
+
+    #[test]
+    fn cross_batch_leading_space_flushes_previous_pending() {
+        // First batch finalizes "speci" with no trailing boundary.
+        // Second batch's first token has a leading space, signalling a
+        // real word boundary — the pending "speci" must flush, and the
+        // new word "es" starts.
+        let mut normalizer = TokenStreamNormalizer::new();
+
+        let b1 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token("speci", true, Some("1"), 0.0, 200.0)],
+                final_audio_proc_ms: Some(200.0),
+                total_audio_proc_ms: Some(200.0),
+            })
+            .unwrap();
+        assert!(b1.updates.is_empty());
+
+        let b2 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token(" es", true, Some("1"), 200.0, 260.0)],
+                final_audio_proc_ms: Some(260.0),
+                total_audio_proc_ms: Some(260.0),
+            })
+            .unwrap();
+        // The leading space flushes the previous pending "speci"; "es"
+        // is the new pending word.
+        assert_eq!(b2.updates.len(), 1);
+        assert_eq!(
+            b2.updates[0]
+                .finalized
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["speci"]
+        );
+
+        let b3 = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::FinalizeComplete))
+            .unwrap();
+        assert_eq!(
+            b3.updates[0]
+                .finalized
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["es"]
+        );
+    }
+
+    #[test]
+    fn cross_batch_pending_is_per_lane() {
+        // Two speakers each have their own pending partial; they must
+        // not bleed into one another.
+        let mut normalizer = TokenStreamNormalizer::new();
+
+        let _b1 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![
+                    token("hel", true, Some("1"), 0.0, 100.0),
+                    token("wo", true, Some("2"), 50.0, 120.0),
+                ],
+                final_audio_proc_ms: Some(120.0),
+                total_audio_proc_ms: Some(120.0),
+            })
+            .unwrap();
+
+        let _b2 = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![
+                    token("lo", true, Some("1"), 100.0, 180.0),
+                    token("rld", true, Some("2"), 120.0, 220.0),
+                ],
+                final_audio_proc_ms: Some(220.0),
+                total_audio_proc_ms: Some(220.0),
+            })
+            .unwrap();
+
+        let b3 = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::Endpoint))
+            .unwrap();
+        assert_eq!(b3.updates.len(), 2);
+        let texts: Vec<(u8, Vec<&str>)> = b3
+            .updates
+            .iter()
+            .map(|u| {
+                (
+                    u.lane,
+                    u.finalized.iter().map(|w| w.text.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert!(texts.contains(&(0, vec!["hello"])));
+        assert!(texts.contains(&(1, vec!["world"])));
+    }
+
+    #[test]
+    fn cross_batch_punctuation_in_continuation_flushes_pending() {
+        // "speci" pending → "es," in next batch: the comma is
+        // punctuation, which (per the assembler) flushes the current
+        // word before being emitted as a stand-alone punctuation token.
+        let mut normalizer = TokenStreamNormalizer::new();
+        let _ = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token("speci", true, Some("1"), 0.0, 200.0)],
+                final_audio_proc_ms: Some(200.0),
+                total_audio_proc_ms: Some(200.0),
+            })
+            .unwrap();
+        let b = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![token("es,", true, Some("1"), 200.0, 260.0)],
+                final_audio_proc_ms: Some(260.0),
+                total_audio_proc_ms: Some(260.0),
+            })
+            .unwrap();
+        assert_eq!(
+            b.updates[0]
+                .finalized
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["species", ","]
+        );
+    }
+
+    #[test]
+    fn cross_batch_finalize_complete_flushes_all_pending_lanes() {
+        let mut normalizer = TokenStreamNormalizer::new();
+        let _ = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![
+                    token("Encyclop", true, Some("1"), 0.0, 200.0),
+                    token("Sub", true, Some("2"), 0.0, 200.0),
+                ],
+                final_audio_proc_ms: Some(200.0),
+                total_audio_proc_ms: Some(200.0),
+            })
+            .unwrap();
+        let _ = normalizer
+            .accept_event(SttStreamEvent::Tokens {
+                tokens: vec![
+                    token("edia", true, Some("1"), 200.0, 260.0),
+                    token("marines", true, Some("2"), 200.0, 280.0),
+                ],
+                final_audio_proc_ms: Some(280.0),
+                total_audio_proc_ms: Some(280.0),
+            })
+            .unwrap();
+        let flush = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::FinalizeComplete))
+            .unwrap();
+        let texts: Vec<(u8, Vec<&str>)> = flush
+            .updates
+            .iter()
+            .map(|u| {
+                (
+                    u.lane,
+                    u.finalized.iter().map(|w| w.text.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert!(texts.contains(&(0, vec!["Encyclopedia"])));
+        assert!(texts.contains(&(1, vec!["Submarines"])));
+        assert_eq!(flush.markers, vec![SttMarker::FinalizeComplete]);
     }
 
     #[test]
     fn one_response_updates_multiple_lanes() {
         let mut normalizer = TokenStreamNormalizer::new();
-        let batch = normalizer
+        // Tokens with no trailing whitespace are now held pending across
+        // batches (cross-batch subword fix). Use a marker to force the
+        // flush so the test still exercises the multi-lane path.
+        let _ = normalizer
             .accept_event(SttStreamEvent::Tokens {
                 tokens: vec![
                     token("Hi", true, Some("1"), 0.0, 100.0),
@@ -667,6 +986,9 @@ mod tests {
                 final_audio_proc_ms: Some(130.0),
                 total_audio_proc_ms: Some(130.0),
             })
+            .unwrap();
+        let batch = normalizer
+            .accept_event(SttStreamEvent::Marker(SttMarker::Endpoint))
             .unwrap();
 
         assert_eq!(batch.updates.len(), 2);

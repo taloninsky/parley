@@ -7,10 +7,7 @@ use wasm_bindgen::JsCast;
 
 use crate::audio::capture::BrowserCapture;
 use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
-use crate::stt::soniox::{
-    SONIOX_CONTEXT_TEXT_STORAGE_KEY, SONIOX_LATENCY_MODE_COOKIE, SonioxConfig, SonioxLatencyMode,
-    SonioxSession, fetch_temp_api_key,
-};
+use crate::stt::soniox::{SonioxConfig, SonioxLatencyMode, SonioxSession, fetch_temp_api_key};
 use crate::ui::secrets;
 use parley_core::stt::{SttMarker, SttStreamEvent, TokenStreamNormalizer};
 use parley_core::word_graph::SttWord;
@@ -102,7 +99,7 @@ pub(crate) fn save(key: &str, value: &str) {
     }
 }
 
-fn load_local(key: &str) -> Option<String> {
+pub(crate) fn load_local(key: &str) -> Option<String> {
     web_sys::window()?
         .local_storage()
         .ok()??
@@ -110,7 +107,7 @@ fn load_local(key: &str) -> Option<String> {
         .ok()?
 }
 
-fn save_local(key: &str, value: &str) {
+pub(crate) fn save_local(key: &str, value: &str) {
     if let Some(storage) = web_sys::window()
         .and_then(|window| window.local_storage().ok())
         .flatten()
@@ -163,12 +160,19 @@ struct FormatResult {
 async fn check_formatting(
     full_transcript: &str,
     multi_speaker: bool,
-    model: &str,
+    model_config_id: &str,
+    credential: &str,
     depth: usize,
     context_depth: usize,
 ) -> Option<FormatResult> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
+
+    // No reformat model picked yet: nothing to do. The drawer
+    // populates this once /models loads.
+    if model_config_id.is_empty() {
+        return None;
+    }
 
     // ── Full-transcript mode (depth == 0) ───────────────────────────
     if depth == 0 {
@@ -178,9 +182,9 @@ async fn check_formatting(
 
         web_sys::console::log_1(
             &format!(
-                "[parley] format check (full): {} chars, model={}",
+                "[parley] format check (full): {} chars, model_config_id={}",
                 full_transcript.len(),
-                model,
+                model_config_id,
             )
             .into(),
         );
@@ -189,7 +193,8 @@ async fn check_formatting(
             "context": "",
             "text": full_transcript,
             "multi_speaker": multi_speaker,
-            "model": model,
+            "model_config_id": model_config_id,
+            "credential": credential,
         });
 
         let opts = web_sys::RequestInit::new();
@@ -301,11 +306,11 @@ async fn check_formatting(
 
     web_sys::console::log_1(
         &format!(
-            "[parley] format check: {} chunks total, {} context chars, {} editable chars, model={}",
+            "[parley] format check: {} chunks total, {} context chars, {} editable chars, model_config_id={}",
             total,
             context_text.len(),
             editable_text.len(),
-            model,
+            model_config_id,
         )
         .into(),
     );
@@ -314,7 +319,8 @@ async fn check_formatting(
         "context": context_text,
         "text": editable_text,
         "multi_speaker": multi_speaker,
-        "model": model,
+        "model_config_id": model_config_id,
+        "credential": credential,
     });
 
     let opts = web_sys::RequestInit::new();
@@ -380,6 +386,68 @@ async fn check_formatting(
         input_tokens,
         output_tokens,
     })
+}
+
+/// Bump the per-session "turns since last format" counter and, if it
+/// hits the configured `Nth` interval, kick off a `/format` round-trip
+/// in the background.
+///
+/// Called by every STT ingest path on a turn-commit (`AssemblyAI`
+/// already has its own equivalent through the periodic ticker; this
+/// helper exists so the Soniox + xAI completion sites have feature
+/// parity per spec `docs/global-reformat-spec.md` §7).
+///
+/// All inputs are `Copy` (signals + `Rc`), so the helper is cheap to
+/// call from inside an STT callback. The actual format request runs
+/// on a spawned task and never blocks the audio pipeline.
+#[allow(clippy::too_many_arguments)]
+fn bump_format_counter_and_maybe_run(
+    counter: &Rc<Cell<u32>>,
+    anthropic_configured: Memo<bool>,
+    auto_format_enabled: Signal<bool>,
+    format_nth: Signal<u32>,
+    reformat_model_config_id: Signal<String>,
+    reformat_credential: Signal<String>,
+    format_depth: Signal<usize>,
+    format_context_depth: Signal<usize>,
+    mut transcript: Signal<String>,
+    mut llm_cost: Signal<f64>,
+    multi_speaker: bool,
+) {
+    if !anthropic_configured() || !(auto_format_enabled)() {
+        return;
+    }
+    let nth = (format_nth)().max(1);
+    counter.set(counter.get() + 1);
+    if !counter.get().is_multiple_of(nth) {
+        return;
+    }
+    let model = (reformat_model_config_id)();
+    let cred = (reformat_credential)();
+    let depth = (format_depth)();
+    let ctx_depth = (format_context_depth)();
+    spawn(async move {
+        let text = (transcript)();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(result) =
+            check_formatting(&text, multi_speaker, &model, &cred, depth, ctx_depth).await
+        {
+            let (in_rate, out_rate) = llm_rates(&model);
+            llm_cost.set(
+                llm_cost()
+                    + token_cost(result.input_tokens, result.output_tokens, in_rate, out_rate),
+            );
+            if let Some(formatted) = result.formatted {
+                let cursor = get_cursor();
+                transcript.set(formatted);
+                if let Some((s, e)) = cursor {
+                    restore_cursor(s, e);
+                }
+            }
+        }
+    });
 }
 
 // ── Cost helpers ────────────────────────────────────────────────────
@@ -501,7 +569,7 @@ fn soniox_lane_name(lane: u8, speaker1_name: &str, speaker2_name: &str) -> Strin
     }
 }
 
-fn soniox_latency_mode_from_value(value: &str) -> SonioxLatencyMode {
+pub(crate) fn soniox_latency_mode_from_value(value: &str) -> SonioxLatencyMode {
     SonioxLatencyMode::from_storage_value(value).unwrap_or_default()
 }
 
@@ -753,164 +821,36 @@ pub fn App() -> Element {
     let mut partial2 = use_signal(String::new);
     let mut status_msg = use_signal(|| "Ready".to_string());
     let mut error_msg: Signal<Option<String>> = use_signal(|| None);
-    let mut show_settings = use_signal(|| false);
-
-    // Secrets-status hook: source of truth for whether Anthropic and
-    // AssemblyAI have a `default` credential configured. Replaces
-    // the old cookie-backed `api_key` / `anthropic_key` signals;
-    // values themselves never reach the browser, only configuration
-    // status. Mutations (set/delete from Settings) call
-    // `secrets_refresh.refresh()` so the gates below re-derive.
-    let (secrets_status, mut secrets_refresh) = secrets::use_secrets_status();
-    let anthropic_configured = use_memo(move || {
-        matches!(
-            &*secrets_status.read_unchecked(),
-            Some(Ok(s)) if s
-                .provider("anthropic")
-                .and_then(|p| p.credential("default"))
-                .map(|c| c.configured)
-                .unwrap_or(false),
-        )
-    });
-    let assemblyai_configured = use_memo(move || {
-        matches!(
-            &*secrets_status.read_unchecked(),
-            Some(Ok(s)) if s
-                .provider("assemblyai")
-                .and_then(|p| p.credential("default"))
-                .map(|c| c.configured)
-                .unwrap_or(false),
-        )
-    });
-    let soniox_configured = use_memo(move || {
-        matches!(
-            &*secrets_status.read_unchecked(),
-            Some(Ok(s)) if s
-                .provider("soniox")
-                .and_then(|p| p.credential("default"))
-                .map(|c| c.configured)
-                .unwrap_or(false),
-        )
-    });
-    // ElevenLabs powers Conversation Mode TTS. The credential is
-    // optional — without it, conversation runs text-only and the
-    // Voice/Type toggle defaults to Type. Surfaced in Settings so
-    // the user can configure or remove the key alongside the
-    // other providers.
-    let elevenlabs_configured = use_memo(move || {
-        matches!(
-            &*secrets_status.read_unchecked(),
-            Some(Ok(s)) if s
-                .provider("elevenlabs")
-                .and_then(|p| p.credential("default"))
-                .map(|c| c.configured)
-                .unwrap_or(false),
-        )
-    });
-    // xAI covers both STT (`grok-stt`) and TTS (`grok-tts`) under one
-    // bearer token. Spec: docs/xai-speech-integration-spec.md.
-    let xai_configured = use_memo(move || {
-        matches!(
-            &*secrets_status.read_unchecked(),
-            Some(Ok(s)) if s
-                .provider("xai")
-                .and_then(|p| p.credential("default"))
-                .map(|c| c.configured)
-                .unwrap_or(false),
-        )
-    });
-
-    // ── Pipeline picks ──────────────────────────────────────────────
-    // Single source of truth for STT/TTS provider + voice. Both this
-    // view and the conversation view read these via
-    // `crate::ui::pipeline`. Default values mirror what the proxy
-    // selects when no client preference is sent (AssemblyAI for STT,
-    // ElevenLabs for TTS).
-    let pipeline_stt_provider = use_signal(crate::ui::pipeline::stt_provider);
-    let mut pipeline_tts_provider = use_signal(|| {
-        load(crate::ui::pipeline::TTS_PROVIDER_KEY).unwrap_or_else(|| "elevenlabs".to_string())
-    });
-    let mut pipeline_tts_voice = use_signal(|| {
-        let v = load(crate::ui::pipeline::TTS_VOICE_KEY).unwrap_or_default();
-        web_sys::console::log_1(&format!("[app] init voice from cookie: {v:?}").into());
-        v
-    });
-    // Persist changes to cookies. `use_effect(use_reactive!(...))`
-    // fires whenever the signal changes; cheap-enough to write on
-    // every change since the user only edits these from a dropdown.
-    use_effect(use_reactive!(|pipeline_stt_provider| {
-        save(
-            crate::ui::pipeline::STT_PROVIDER_KEY,
-            &pipeline_stt_provider(),
-        );
-    }));
-    use_effect(use_reactive!(|pipeline_tts_provider| {
-        save(
-            crate::ui::pipeline::TTS_PROVIDER_KEY,
-            &pipeline_tts_provider(),
-        );
-    }));
-    // Note: invalidating `pipeline_tts_voice` when the provider
-    // changes is handled by the `<select>` onchange handler, not
-    // here. `use_effect(use_reactive!)` also fires on initial mount,
-    // and clearing the voice on first render would discard the saved
-    // pick from cookies before the VoicePicker could honor it.
-    use_effect(use_reactive!(|pipeline_tts_voice| {
-        let v = pipeline_tts_voice();
-        web_sys::console::log_1(&format!("[app] save voice cookie: {v:?}").into());
-        save(crate::ui::pipeline::TTS_VOICE_KEY, &v);
-    }));
-    // Credential the VoicePicker queries the proxy with. Today every
-    // pick uses `default`; named-credential support could replace this
-    // with a per-provider dropdown later. Defined unconditionally so
-    // the hook order is stable across renders even when the Voice row
-    // is hidden (TTS = Off).
-    let voice_credential = use_signal(|| "default".to_string());
-
-    let mut idle_minutes = use_signal(|| {
-        load("parley_idle_minutes")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(5)
-    });
-    let mut stt_provider =
-        use_signal(|| load("parley_stt_provider").unwrap_or_else(|| "assemblyai".to_string()));
-    let mut soniox_latency_mode = use_signal(|| {
-        load(SONIOX_LATENCY_MODE_COOKIE)
-            .and_then(|value| {
-                SonioxLatencyMode::from_storage_value(&value)
-                    .map(|mode| mode.storage_value().to_string())
-            })
-            .unwrap_or_else(|| SonioxLatencyMode::default().storage_value().to_string())
-    });
-    let mut soniox_context_text =
-        use_signal(|| load_local(SONIOX_CONTEXT_TEXT_STORAGE_KEY).unwrap_or_default());
+    // Settings-related signals were lifted to `Root` so the gear
+    // button + drawer render at the shell level. We pull the same
+    // `Copy` handles out of context so the rest of `App` can keep
+    // referring to them by name. Spec: §6.4 mid-session voice change.
+    let settings: crate::ui::app_state::AppSettings = use_context();
+    let anthropic_configured = settings.anthropic_configured;
+    let pipeline_stt_provider = settings.pipeline_stt_provider;
+    let pipeline_tts_provider = settings.pipeline_tts_provider;
+    let pipeline_tts_voice = settings.pipeline_tts_voice;
+    let voice_credential = settings.voice_credential;
+    let idle_minutes = settings.idle_minutes;
+    let soniox_latency_mode = settings.soniox_latency_mode;
+    let soniox_context_text = settings.soniox_context_text;
+    let _ = (
+        pipeline_tts_provider,
+        pipeline_tts_voice,
+        voice_credential,
+        idle_minutes,
+    );
     let mut countdown_secs: Signal<Option<u32>> = use_signal(|| None);
     let mut auto_scroll = use_signal(|| true);
 
-    // ── Speaker settings ────────────────────────────────────────────
-    let mut speaker1_name =
-        use_signal(|| load("parley_speaker1_name").unwrap_or_else(|| "Me".to_string()));
-    let mut speaker2_name =
-        use_signal(|| load("parley_speaker2_name").unwrap_or_else(|| "Remote".to_string()));
-    let mut speaker1_source =
-        use_signal(|| load("parley_speaker1_source").unwrap_or_else(|| "mic".to_string()));
-    let mut speaker2_source =
-        use_signal(|| load("parley_speaker2_source").unwrap_or_else(|| "system".to_string()));
-    let mut speaker2_enabled = use_signal(|| {
-        load("parley_speaker2_enabled")
-            .map(|v| v == "true")
-            .unwrap_or(false)
-    });
-    let mut show_labels = use_signal(|| {
-        load("parley_show_labels")
-            .map(|v| v == "true")
-            .unwrap_or(true)
-    });
-    let mut show_timestamps = use_signal(|| {
-        load("parley_show_timestamps")
-            .map(|v| v == "true")
-            .unwrap_or(false)
-    });
+    // ── Speaker settings (lifted to AppSettings/Root) ───────────────
+    let speaker1_name = settings.speaker1_name;
+    let speaker2_name = settings.speaker2_name;
+    let speaker1_source = settings.speaker1_source;
+    let speaker2_source = settings.speaker2_source;
+    let speaker2_enabled = settings.speaker2_enabled;
+    let show_labels = settings.show_labels;
+    let show_timestamps = settings.show_timestamps;
 
     // ── Transfer / export ───────────────────────────────────────────
     let mut transfer_mode = use_signal(|| {
@@ -919,7 +859,6 @@ pub fn App() -> Element {
             .unwrap_or(TransferMode::Copy)
     });
     let mut show_transfer_menu = use_signal(|| false);
-    let mut show_format_menu = use_signal(|| false);
     let mut prompt_filename = use_signal(|| {
         load("parley_prompt_filename")
             .map(|v| v == "true")
@@ -927,43 +866,21 @@ pub fn App() -> Element {
     });
     let mut transfer_feedback: Signal<Option<String>> = use_signal(|| None);
 
-    // ── Formatting settings ─────────────────────────────────────────
-    let mut format_model = use_signal(|| {
-        load("parley_format_model").unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string())
-    });
-    let mut auto_format_enabled = use_signal(|| {
-        load("parley_auto_format")
-            .map(|s| s != "false")
-            .unwrap_or(true)
-    });
-    let mut format_nth = use_signal(|| {
-        load("parley_format_nth")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(3)
-    });
-    let mut format_depth = use_signal(|| {
-        load("parley_format_depth")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(2)
-    });
-    let mut format_context_depth = use_signal(|| {
-        load("parley_format_context_depth")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
-    });
-    let mut format_on_stop = use_signal(|| {
-        load("parley_format_on_stop")
-            .map(|s| s == "true")
-            .unwrap_or(true)
-    });
+    // ── Formatting settings (lifted to AppSettings/Root) ────────────
+    // Spec `docs/global-reformat-spec.md` §3. The settings drawer is
+    // the single source of truth for these now; the inline `▾`
+    // format-combo dropdown was removed in favor of one global home.
+    let reformat_model_config_id = settings.reformat_model_config_id;
+    let reformat_credential = settings.reformat_credential;
+    let auto_format_enabled = settings.auto_format_enabled;
+    let format_nth = settings.format_nth;
+    let format_depth = settings.format_depth;
+    let format_context_depth = settings.format_context_depth;
+    let format_on_stop = settings.format_on_stop;
     let reformatting = use_signal(|| false);
 
-    // ── Cost tracking ───────────────────────────────────────────────
-    let mut show_cost_meter = use_signal(|| {
-        load("parley_show_cost_meter")
-            .map(|v| v != "false")
-            .unwrap_or(true) // on by default
-    });
+    // ── Cost tracking (show_cost_meter lifted to AppSettings/Root) ──
+    let show_cost_meter = settings.show_cost_meter;
     // Accumulated STT cost in dollars (updated by ticker based on elapsed time)
     let mut stt_cost = use_signal(|| 0.0_f64);
     // Accumulated LLM cost in dollars (updated after each formatting call)
@@ -1031,7 +948,17 @@ pub fn App() -> Element {
         status_msg.set("Connecting…".into());
         rec_state.set(RecState::Recording);
 
-        if (stt_provider)() == "soniox" {
+        let selected_stt_provider = pipeline_stt_provider.peek().clone();
+        if selected_stt_provider == "xai" {
+            error_msg.set(Some(
+                "xAI STT is available in Conversation Mode only. Choose AssemblyAI or Soniox for Capture Mode.".into(),
+            ));
+            rec_state.set(RecState::Idle);
+            status_msg.set("Ready".into());
+            return;
+        }
+
+        if selected_stt_provider == "soniox" {
             let s1_source = (speaker1_source)();
             let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
             let context_text = (soniox_context_text)();
@@ -1058,6 +985,15 @@ pub fn App() -> Element {
                 let provisional_by_lane: Rc<RefCell<BTreeMap<u8, String>>> =
                     Rc::new(RefCell::new(BTreeMap::new()));
                 let last_lane: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
+                // Auto-format trigger for the Soniox ingest path. The
+                // AssemblyAI path uses a periodic ticker driven by
+                // `needs_para_check`; Soniox has no equivalent ticker
+                // wired up today, so we drive the format pass inline:
+                // every Nth `FinalizeComplete` marker, kick off a
+                // formatting round-trip directly. Spec
+                // `docs/global-reformat-spec.md` §7 (cross-mode bug
+                // fix).
+                let soniox_turn_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
                 let session = match SonioxSession::connect(
                     &token,
@@ -1067,6 +1003,7 @@ pub fn App() -> Element {
                         let provisional_by_lane = provisional_by_lane.clone();
                         let graph_rc = graph_rc.clone();
                         let last_lane = last_lane.clone();
+                        let stc = soniox_turn_counter.clone();
                         move |event: SttStreamEvent| {
                             if let SttStreamEvent::Error { message, .. } = &event {
                                 error_msg.set(Some(format!("Soniox error: {message}")));
@@ -1156,6 +1093,22 @@ pub fn App() -> Element {
                             if batch.markers.contains(&SttMarker::FinalizeComplete) {
                                 provisional_by_lane.borrow_mut().clear();
                                 partial.set(String::new());
+                                // Bump the cross-mode format counter and
+                                // fire `/format` when the Nth turn lands.
+                                // See spec §7.
+                                bump_format_counter_and_maybe_run(
+                                    &stc,
+                                    anthropic_configured,
+                                    auto_format_enabled,
+                                    format_nth,
+                                    reformat_model_config_id,
+                                    reformat_credential,
+                                    format_depth,
+                                    format_context_depth,
+                                    transcript,
+                                    llm_cost,
+                                    false, // soniox is single-lane today
+                                );
                             }
                         }
                     },
@@ -1662,7 +1615,8 @@ pub fn App() -> Element {
                             // Paragraph detection
                             if ticker_needs_para.get() {
                                 ticker_needs_para.set(false);
-                                let model = (format_model)();
+                                let model = (reformat_model_config_id)();
+                                let cred = (reformat_credential)();
                                 let depth = (format_depth)();
                                 let ctx_depth = (format_context_depth)();
                                 let mut t = transcript_t;
@@ -1670,13 +1624,16 @@ pub fn App() -> Element {
                                 spawn(async move {
                                     let text = (t)();
                                     if !text.is_empty()
-                                        && let Some(result) =
-                                            check_formatting(&text, multi, &model, depth, ctx_depth)
-                                                .await
+                                        && let Some(result) = check_formatting(
+                                            &text, multi, &model, &cred, depth, ctx_depth,
+                                        )
+                                        .await
                                     {
-                                        // Accumulate LLM cost
-                                        let model_val = (format_model)();
-                                        let (in_rate, out_rate) = llm_rates(&model_val);
+                                        // Accumulate LLM cost — `model` is the
+                                        // registry config id; `llm_rates` keys
+                                        // on substring of "haiku"/"sonnet" so
+                                        // typical config ids still resolve.
+                                        let (in_rate, out_rate) = llm_rates(&model);
                                         llm.set(
                                             llm()
                                                 + token_cost(
@@ -1846,7 +1803,7 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 1) ────────────────────────────────────────
     let on_end_turn1 = move |_| {
-        if (stt_provider)() == "soniox" {
+        if pipeline_stt_provider.peek().as_str() == "soniox" {
             if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
                 let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
                 finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
@@ -1908,7 +1865,7 @@ pub fn App() -> Element {
 
     // ── End Turn (speaker 2) ────────────────────────────────────────
     let on_end_turn2 = move |_| {
-        if (stt_provider)() == "soniox" {
+        if pipeline_stt_provider.peek().as_str() == "soniox" {
             if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
                 let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
                 finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
@@ -1952,7 +1909,7 @@ pub fn App() -> Element {
         rec_state.set(RecState::Stopping);
         status_msg.set("Waiting for final transcript\u{2026}".into());
 
-        if (stt_provider)() == "soniox" {
+        if pipeline_stt_provider.peek().as_str() == "soniox" {
             spawn(async move {
                 if let Some(cap_rc) = (capture_handle)().as_ref()
                     && let Some(capture) = cap_rc.borrow_mut().take()
@@ -2120,10 +2077,20 @@ pub fn App() -> Element {
             // Run paragraph detection (gated by trigger strategy).
             // Authentication lives in the proxy; we always fire the
             // request and let it 412 if no key is configured.
+            //
+            // The full-transcript stop pass now uses the same picked
+            // reformat model as the incremental pass — since
+            // `docs/global-reformat-spec.md` §4 unified the picker
+            // into one drawer entry. Users who want a higher-quality
+            // stop pass simply pick Sonnet (or the equivalent
+            // registry id) themselves.
             let do_auto_format = (auto_format_enabled)();
             let do_format_on_stop = (format_on_stop)();
+            let model_for_stop = (reformat_model_config_id)();
+            let cred_for_stop = (reformat_credential)();
             if do_auto_format {
-                let model = (format_model)();
+                let model = model_for_stop.clone();
+                let cred = cred_for_stop.clone();
                 let depth = (format_depth)();
                 let ctx_depth = (format_context_depth)();
                 let mut t = transcript;
@@ -2132,7 +2099,7 @@ pub fn App() -> Element {
                     let text = (t)();
                     if !text.is_empty()
                         && let Some(result) =
-                            check_formatting(&text, multi, &model, depth, ctx_depth).await
+                            check_formatting(&text, multi, &model, &cred, depth, ctx_depth).await
                     {
                         let (in_rate, out_rate) = llm_rates(&model);
                         llm.set(
@@ -2152,14 +2119,14 @@ pub fn App() -> Element {
                             }
                         }
                     }
-                    // Full-transcript Sonnet pass on stop
+                    // Full-transcript pass on stop using the same picked model.
                     if do_format_on_stop {
-                        let sonnet = "claude-sonnet-4-6";
                         let text = (t)();
                         if !text.is_empty()
-                            && let Some(result) = check_formatting(&text, multi, sonnet, 0, 0).await
+                            && let Some(result) =
+                                check_formatting(&text, multi, &model, &cred, 0, 0).await
                         {
-                            let (in_rate, out_rate) = llm_rates(sonnet);
+                            let (in_rate, out_rate) = llm_rates(&model);
                             llm.set(
                                 llm()
                                     + token_cost(
@@ -2180,16 +2147,18 @@ pub fn App() -> Element {
                     }
                 });
             } else if do_format_on_stop {
-                // Auto-format disabled — skip incremental but still do the full Sonnet pass
+                // Auto-format disabled — skip incremental but still do the full pass
+                let model = model_for_stop;
+                let cred = cred_for_stop;
                 let mut t = transcript;
                 let mut llm = llm_cost;
                 spawn(async move {
-                    let sonnet = "claude-sonnet-4-6";
                     let text = (t)();
                     if !text.is_empty()
-                        && let Some(result) = check_formatting(&text, multi, sonnet, 0, 0).await
+                        && let Some(result) =
+                            check_formatting(&text, multi, &model, &cred, 0, 0).await
                     {
-                        let (in_rate, out_rate) = llm_rates(sonnet);
+                        let (in_rate, out_rate) = llm_rates(&model);
                         llm.set(
                             llm()
                                 + token_cost(
@@ -2356,7 +2325,12 @@ pub fn App() -> Element {
 
     // ── Reformat (on-demand, full transcript) ───────────────────────
     let on_reformat = move |_: Event<MouseData>| {
-        let model = "claude-sonnet-4-6".to_string();
+        // Use the user's configured reformat model (Settings →
+        // Reformatting). The legacy "always Sonnet 4.6" hardcode was
+        // removed when the picker moved to a single global home
+        // (`docs/global-reformat-spec.md` §4).
+        let model = (reformat_model_config_id)();
+        let cred = (reformat_credential)();
         let multi = (speaker2_enabled)();
         let mut t = transcript;
         let mut r = reformatting;
@@ -2365,7 +2339,7 @@ pub fn App() -> Element {
             r.set(true);
             let text = (t)();
             if !text.is_empty()
-                && let Some(result) = check_formatting(&text, multi, &model, 0, 0).await
+                && let Some(result) = check_formatting(&text, multi, &model, &cred, 0, 0).await
             {
                 let (in_rate, out_rate) = llm_rates(&model);
                 llm.set(
@@ -2422,12 +2396,9 @@ pub fn App() -> Element {
                         "{format_countdown(secs)}"
                     }
                 }
-                button {
-                    class: "gear-btn",
-                    title: "Settings",
-                    onclick: move |_| show_settings.set(!show_settings()),
-                    "\u{2699}\u{fe0f}"
-                }
+                // Gear button moved to Root so it sits next to the
+                // Transcribe / Conversation tab buttons; the drawer is
+                // rendered at the shell level via SettingsDrawer.
             }
 
             // ── Error banner ────────────────────────────────────────
@@ -2656,128 +2627,23 @@ pub fn App() -> Element {
                         "Clear"
                     }
                 }
+                // The combo `▾` dropdown was removed when the picker
+                // moved into Settings → Reformatting (single global
+                // home, applies to both Transcribe and Conversation
+                // modes). Spec `docs/global-reformat-spec.md` §4.
                 if anthropic_configured() {
-                    div { class: "format-combo",
-                        button {
-                            class: "btn btn-reformat-main",
-                            onclick: on_reformat,
-                            disabled: !has_text || reformatting() || state == RecState::Stopping,
-                            if reformatting() {
-                                "Reformatting\u{2026}"
-                            } else {
-                                "\u{00b6} Reformat"
-                            }
-                        }
-                        button {
-                            class: "btn btn-reformat-arrow",
-                            onclick: move |_| show_format_menu.set(!(show_format_menu)()),
-                            "\u{25be}"
-                        }
-                        if (show_format_menu)() {
-                            div {
-                                class: "format-overlay",
-                                onclick: move |_| show_format_menu.set(false),
-                            }
-                            div { class: "format-menu",
-                                div { class: "format-menu-title", "Formatting Settings" }
-
-                                label { r#for: "fmt-model", "Incremental auto-format model" }
-                                select {
-                                    id: "fmt-model",
-                                    class: "settings-input",
-                                    value: "{format_model}",
-                                    onchange: move |evt: Event<FormData>| {
-                                        let val = evt.value();
-                                        format_model.set(val.clone());
-                                        save("parley_format_model", &val);
-                                    },
-                                    option { value: "claude-haiku-4-5-20251001", "Haiku 4.5 (fast, cheap)" }
-                                    option { value: "claude-sonnet-4-6", "Sonnet 4.6 (better)" }
-                                }
-
-                                label { class: "checkbox-label",
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: auto_format_enabled(),
-                                        onchange: move |evt: Event<FormData>| {
-                                            let val = evt.value() == "true";
-                                            auto_format_enabled.set(val);
-                                            save("parley_auto_format", if val { "true" } else { "false" });
-                                        },
-                                    }
-                                    " Auto-format every N turns"
-                                }
-
-                                if auto_format_enabled() {
-                                    label { r#for: "fmt-nth", "N (every Nth turn)" }
-                                    input {
-                                        id: "fmt-nth",
-                                        r#type: "number",
-                                        class: "settings-input",
-                                        min: "1",
-                                        max: "20",
-                                        value: "{format_nth}",
-                                        oninput: move |evt: Event<FormData>| {
-                                            if let Ok(v) = evt.value().parse::<u32>() {
-                                                let v = v.max(1);
-                                                format_nth.set(v);
-                                                save("parley_format_nth", &v.to_string());
-                                            }
-                                        },
-                                    }
-                                }
-
-                                label { r#for: "fmt-depth", "Reformat depth (chunks)" }
-                                input {
-                                    id: "fmt-depth",
-                                    r#type: "number",
-                                    class: "settings-input",
-                                    min: "1",
-                                    max: "6",
-                                    value: "{format_depth}",
-                                    oninput: move |evt: Event<FormData>| {
-                                        if let Ok(v) = evt.value().parse::<usize>() {
-                                            let v = v.clamp(1, 6);
-                                            format_depth.set(v);
-                                            save("parley_format_depth", &v.to_string());
-                                        }
-                                    },
-                                }
-
-                                label { r#for: "fmt-ctx-depth", "Additional visibility depth (chunks)" }
-                                input {
-                                    id: "fmt-ctx-depth",
-                                    r#type: "number",
-                                    class: "settings-input",
-                                    min: "1",
-                                    max: "6",
-                                    value: "{format_context_depth}",
-                                    oninput: move |evt: Event<FormData>| {
-                                        if let Ok(v) = evt.value().parse::<usize>() {
-                                            let v = v.clamp(1, 6);
-                                            format_context_depth.set(v);
-                                            save("parley_format_context_depth", &v.to_string());
-                                        }
-                                    },
-                                }
-
-                                p { class: "settings-hint",
-                                    "\u{00b6} Reformat always uses Sonnet 4.6 on the full transcript."
-                                }
-
-                                label { class: "checkbox-label",
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: format_on_stop(),
-                                        onchange: move |evt: Event<FormData>| {
-                                            let val = evt.value() == "true";
-                                            format_on_stop.set(val);
-                                            save("parley_format_on_stop", if val { "true" } else { "false" });
-                                        },
-                                    }
-                                    " Also format on stop (full pass, Sonnet 4.6)"
-                                }
-                            }
+                    button {
+                        class: "btn btn-reformat-main",
+                        style: "border-radius: 8px;",
+                        onclick: on_reformat,
+                        disabled: !has_text
+                            || reformatting()
+                            || state == RecState::Stopping
+                            || (reformat_model_config_id)().is_empty(),
+                        if reformatting() {
+                            "Reformatting\u{2026}"
+                        } else {
+                            "\u{00b6} Reformat"
                         }
                     }
                 }
@@ -2799,348 +2665,10 @@ pub fn App() -> Element {
                 }
             }
 
-            // ── Settings drawer ─────────────────────────────────────
-            if show_settings() {
-                div {
-                    class: "settings-overlay",
-                    onclick: move |_| show_settings.set(false),
-                }
-                div { class: "settings-drawer",
-                    h2 { "Settings" }
-
-                    // ── API keys (proxy-managed) ──────────────────────
-                    // Keys live in the OS keystore via the proxy's
-                    // `/api/secrets` surface. This panel manages the
-                    // `default` credential for each provider; named
-                    // credentials (multi-account) are managed via the
-                    // proxy directly until v2 expands the UI.
-                    h3 { class: "settings-section-heading", "API Keys" }
-                    SecretsKeyRow {
-                        provider: "assemblyai",
-                        label: "AssemblyAI API Key",
-                        hint: "Used for live transcription.",
-                        configured: assemblyai_configured(),
-                        on_changed: move |_| secrets_refresh.refresh(),
-                    }
-                    SecretsKeyRow {
-                        provider: "soniox",
-                        label: "Soniox API Key",
-                        hint: "Used for diarized live transcription.",
-                        configured: soniox_configured(),
-                        on_changed: move |_| secrets_refresh.refresh(),
-                    }
-                    SecretsKeyRow {
-                        provider: "anthropic",
-                        label: "Anthropic API Key",
-                        hint: "Used for paragraph detection and conversation mode.",
-                        configured: anthropic_configured(),
-                        on_changed: move |_| secrets_refresh.refresh(),
-                    }
-                    SecretsKeyRow {
-                        provider: "elevenlabs",
-                        label: "ElevenLabs API Key",
-                        hint: "Used for spoken AI replies in Conversation Mode. Optional.",
-                        configured: elevenlabs_configured(),
-                        on_changed: move |_| secrets_refresh.refresh(),
-                    }
-                    SecretsKeyRow {
-                        provider: "xai",
-                        label: "xAI API Key",
-                        hint: "Used for grok-stt transcription and grok-tts spoken replies. Optional.",
-                        configured: xai_configured(),
-                        on_changed: move |_| secrets_refresh.refresh(),
-                    }
-
-                    // ── Pipeline section ─────────────────────────────
-                    h3 { class: "settings-section-heading", "Pipeline" }
-                    p { class: "settings-hint",
-                        "Choose which providers handle speech-to-text and text-to-speech. \
-                         Both transcription mode and conversation mode read the same selection."
-                    }
-
-                    label { r#for: "pipeline-stt", "Speech-to-text" }
-                    div { class: "settings-row",
-                        crate::ui::stt_provider_picker::SttProviderPicker {
-                            selected_provider_id: pipeline_stt_provider,
-                        }
-                    }
-                    p { class: "settings-hint",
-                        "Used for Conversation Mode capture. The standalone \
-                         Transcription view is still AssemblyAI-only."
-                    }
-
-                    label { r#for: "pipeline-tts", "Text-to-speech" }
-                    div { class: "settings-row",
-                        select {
-                            id: "pipeline-tts",
-                            class: "settings-input",
-                            value: "{pipeline_tts_provider}",
-                            onchange: move |evt: Event<FormData>| {
-                                let new_provider = evt.value();
-                                // Voice ids are provider-specific; an
-                                // ElevenLabs id passed to xAI is invalid,
-                                // and vice versa. Clear the saved voice
-                                // so the VoicePicker auto-picks the new
-                                // provider's first voice once its catalog
-                                // loads. Doing this in the change handler
-                                // (instead of a use_effect) means a fresh
-                                // page load doesn't wipe the saved pick.
-                                if new_provider != *pipeline_tts_provider.peek() {
-                                    pipeline_tts_voice.set(String::new());
-                                }
-                                pipeline_tts_provider.set(new_provider);
-                            },
-                            option { value: "elevenlabs", "ElevenLabs" }
-                            option { value: "xai", "xAI (grok-tts)" }
-                            option { value: "off", "Off (text only)" }
-                        }
-                    }
-                    p { class: "settings-hint",
-                        "Used in Conversation Mode for spoken replies. \
-                         Requires the matching API key above (or set Off for text-only)."
-                    }
-
-                    if pipeline_tts_provider() != "off" {
-                        label { r#for: "pipeline-voice", "Voice" }
-                        div { class: "settings-row",
-                            crate::ui::voice_picker::VoicePicker {
-                                provider_id: ReadOnlySignal::from(pipeline_tts_provider),
-                                credential: ReadOnlySignal::from(voice_credential),
-                                selected_voice_id: pipeline_tts_voice,
-                            }
-                        }
-                        p { class: "settings-hint",
-                            "Voices come from the selected TTS provider's catalog."
-                        }
-                    }
-
-                    // ── Language models (read-only info) ─────────────
-                    h3 { class: "settings-section-heading", "Language models" }
-                    p { class: "settings-hint",
-                        "Formatting (paragraph detection) and conversation replies both use \
-                         Anthropic today. Per-purpose model + provider selection is configured \
-                         in your persona and model files under ~/.parley; the conversation \
-                         view's Model dropdown lets you swap the active heavy model per session."
-                    }
-
-                    label { r#for: "stt-provider", "Speech-to-text provider" }
-                    select {
-                        id: "stt-provider",
-                        class: "settings-input",
-                        value: "{stt_provider}",
-                        onchange: move |evt: Event<FormData>| {
-                            let val = evt.value();
-                            stt_provider.set(val.clone());
-                            save("parley_stt_provider", &val);
-                        },
-                        option { value: "assemblyai", "AssemblyAI" }
-                        option { value: "soniox", "Soniox" }
-                    }
-                    p { class: "settings-hint",
-                        "Used by Capture Mode and Conversation Mode voice input."
-                    }
-
-                    if (stt_provider)() == "soniox" {
-                        label { r#for: "soniox-latency-mode", "Soniox latency" }
-                        select {
-                            id: "soniox-latency-mode",
-                            class: "settings-input",
-                            value: "{soniox_latency_mode}",
-                            onchange: move |evt: Event<FormData>| {
-                                let value = evt.value();
-                                let mode = soniox_latency_mode_from_value(&value);
-                                let stored = mode.storage_value().to_string();
-                                soniox_latency_mode.set(stored.clone());
-                                save(SONIOX_LATENCY_MODE_COOKIE, &stored);
-                            },
-                            option { value: "fast", "Fast" }
-                            option { value: "balanced", "Balanced" }
-                            option { value: "careful", "Careful" }
-                        }
-                        p { class: "settings-hint",
-                            "Soniox-only endpoint and finalization timing."
-                        }
-
-                        label { r#for: "soniox-context-text", "Soniox context" }
-                        textarea {
-                            id: "soniox-context-text",
-                            class: "settings-input soniox-context-input",
-                            rows: "4",
-                            value: "{soniox_context_text}",
-                            oninput: move |evt: Event<FormData>| {
-                                let value = evt.value();
-                                soniox_context_text.set(value.clone());
-                                save_local(SONIOX_CONTEXT_TEXT_STORAGE_KEY, &value);
-                            },
-                        }
-                        p { class: "settings-hint",
-                            "Soniox-only recognition context. Use domain, topic, names, vocabulary, or a sample sentence; it biases recognition and punctuation, but does not revise already-final text using future speech."
-                        }
-                    }
-
-                    label { r#for: "idle-timeout", "Idle timeout (minutes)" }
-                    input {
-                        id: "idle-timeout",
-                        r#type: "number",
-                        class: "settings-input",
-                        min: "1",
-                        max: "60",
-                        value: "{idle_minutes}",
-                        oninput: move |evt: Event<FormData>| {
-                            if let Ok(v) = evt.value().parse::<u32>() {
-                                idle_minutes.set(v);
-                                save("parley_idle_minutes", &v.to_string());
-                            }
-                        },
-                    }
-
-                    p { class: "settings-hint",
-                        "Auto-disconnect after this many minutes of silence to save costs."
-                    }
-
-                    // ── Cost meter toggle ────────────────────────────
-                    label { class: "option-row settings-option-row",
-                        input {
-                            r#type: "checkbox",
-                            checked: "{show_cost_meter}",
-                            onchange: move |evt: Event<FormData>| {
-                                let v = evt.checked();
-                                show_cost_meter.set(v);
-                                save("parley_show_cost_meter", if v { "true" } else { "false" });
-                            },
-                        }
-                        "Show cost meter"
-                    }
-                    p { class: "settings-hint",
-                        "Display a running estimate of API costs (STT + LLM) in the status bar."
-                    }
-
-                    // ── Speakers section ────────────────────────────
-                    div { class: "settings-section-header", "Speakers" }
-
-                    // Speaker 1
-                    div { class: "speaker-card",
-                        div { class: "speaker-card-title", "Speaker 1 (You)" }
-                        div { class: "speaker-card-row",
-                            div { class: "speaker-field",
-                                label { "Name" }
-                                input {
-                                    r#type: "text",
-                                    class: "settings-input",
-                                    value: "{speaker1_name}",
-                                    oninput: move |evt: Event<FormData>| {
-                                        let val = evt.value();
-                                        speaker1_name.set(val.clone());
-                                        save("parley_speaker1_name", &val);
-                                    },
-                                }
-                            }
-                            div { class: "speaker-field",
-                                label { "Source" }
-                                select {
-                                    class: "settings-input",
-                                    value: "{speaker1_source}",
-                                    onchange: move |evt: Event<FormData>| {
-                                        let val = evt.value();
-                                        speaker1_source.set(val.clone());
-                                        save("parley_speaker1_source", &val);
-                                    },
-                                    option { value: "mic", "Microphone" }
-                                    option { value: "system", "System Audio" }
-                                }
-                            }
-                        }
-                    }
-
-                    // Speaker 2
-                    div { class: "speaker-card",
-                        div { class: "speaker-card-title",
-                            span { "Speaker 2 (Remote)" }
-                            label { class: "toggle-switch",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: "{speaker2_enabled}",
-                                    onchange: move |evt: Event<FormData>| {
-                                        let v = evt.checked();
-                                        speaker2_enabled.set(v);
-                                        save("parley_speaker2_enabled", if v { "true" } else { "false" });
-                                    },
-                                }
-                                span { class: "toggle-slider" }
-                            }
-                        }
-                        if (speaker2_enabled)() {
-                            div { class: "speaker-card-row",
-                                div { class: "speaker-field",
-                                    label { "Name" }
-                                    input {
-                                        r#type: "text",
-                                        class: "settings-input",
-                                        value: "{speaker2_name}",
-                                        oninput: move |evt: Event<FormData>| {
-                                            let val = evt.value();
-                                            speaker2_name.set(val.clone());
-                                            save("parley_speaker2_name", &val);
-                                        },
-                                    }
-                                }
-                                div { class: "speaker-field",
-                                    label { "Source" }
-                                    select {
-                                        class: "settings-input",
-                                        value: "{speaker2_source}",
-                                        onchange: move |evt: Event<FormData>| {
-                                            let val = evt.value();
-                                            speaker2_source.set(val.clone());
-                                            save("parley_speaker2_source", &val);
-                                        },
-                                        option { value: "mic", "Microphone" }
-                                        option { value: "system", "System Audio" }
-                                    }
-                                }
-                            }
-
-                            // Options
-                            div { class: "speaker-options",
-                                label { class: "option-row",
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: "{show_labels}",
-                                        onchange: move |evt: Event<FormData>| {
-                                            let v = evt.checked();
-                                            show_labels.set(v);
-                                            save("parley_show_labels", if v { "true" } else { "false" });
-                                        },
-                                    }
-                                    "Speaker labels ([Name] prefix)"
-                                }
-                                label { class: "option-row",
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: "{show_timestamps}",
-                                        onchange: move |evt: Event<FormData>| {
-                                            let v = evt.checked();
-                                            show_timestamps.set(v);
-                                            save("parley_show_timestamps", if v { "true" } else { "false" });
-                                        },
-                                    }
-                                    "Timestamps ([MM:SS] prefix)"
-                                }
-                            }
-
-                            p { class: "settings-hint settings-warn",
-                                "\u{26a0} Two speakers = 2\u{00d7} AssemblyAI usage"
-                            }
-                        }
-                    }
-
-                    button {
-                        class: "btn btn-close-settings",
-                        onclick: move |_| show_settings.set(false),
-                        "Close"
-                    }
-                }
-            }
+            // Settings drawer is now rendered at the Root shell level
+            // by `crate::ui::settings_drawer::SettingsDrawer`, so the
+            // gear button in `Root` works regardless of whether
+            // Transcribe or Conversation is the active tab.
         }
     }
 }
@@ -3158,7 +2686,7 @@ pub fn App() -> Element {
 /// Calls `on_changed` after any successful mutation so the parent
 /// can refresh its `use_secrets_status` resource.
 #[component]
-fn SecretsKeyRow(
+pub(crate) fn SecretsKeyRow(
     provider: &'static str,
     label: &'static str,
     hint: &'static str,

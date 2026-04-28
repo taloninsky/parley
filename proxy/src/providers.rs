@@ -78,6 +78,10 @@ pub enum ProviderId {
     /// xAI — used for streaming STT (`grok-stt`) and TTS with a single
     /// bearer token covering both surfaces. Spec: `docs/xai-speech-integration-spec.md`.
     Xai,
+    /// Cartesia — used for expressive streaming TTS (Sonic-3) over
+    /// WebSocket with per-turn `context_id` continuity. Spec:
+    /// `docs/cartesia-sonic-3-integration-spec.md`.
+    Cartesia,
 }
 
 impl ProviderId {
@@ -89,6 +93,7 @@ impl ProviderId {
             ProviderId::Soniox,
             ProviderId::ElevenLabs,
             ProviderId::Xai,
+            ProviderId::Cartesia,
         ]
     }
 
@@ -214,6 +219,12 @@ pub static REGISTRY: &[ProviderDescriptor] = &[
         categories: &[ProviderCategory::Stt, ProviderCategory::Tts],
         env_var: "PARLEY_XAI_API_KEY",
     },
+    ProviderDescriptor {
+        id: "cartesia",
+        display_name: "Cartesia",
+        categories: &[ProviderCategory::Tts],
+        env_var: "PARLEY_CARTESIA_API_KEY",
+    },
 ];
 
 #[cfg(test)]
@@ -258,6 +269,8 @@ mod tests {
         assert_eq!(json, "\"elevenlabs\"");
         let json = serde_json::to_string(&ProviderId::Xai).unwrap();
         assert_eq!(json, "\"xai\"");
+        let json = serde_json::to_string(&ProviderId::Cartesia).unwrap();
+        assert_eq!(json, "\"cartesia\"");
     }
 
     #[test]
@@ -272,6 +285,8 @@ mod tests {
         assert_eq!(p, ProviderId::ElevenLabs);
         let p: ProviderId = serde_json::from_str("\"xai\"").unwrap();
         assert_eq!(p, ProviderId::Xai);
+        let p: ProviderId = serde_json::from_str("\"cartesia\"").unwrap();
+        assert_eq!(p, ProviderId::Cartesia);
     }
 
     #[test]
@@ -334,11 +349,13 @@ mod tests {
             ProviderId::ElevenLabs.categories(),
             &[ProviderCategory::Tts]
         );
+        assert_eq!(ProviderId::Cartesia.categories(), &[ProviderCategory::Tts]);
         assert_eq!(ProviderId::Anthropic.display_name(), "Anthropic");
         assert_eq!(ProviderId::AssemblyAi.display_name(), "AssemblyAI");
         assert_eq!(ProviderId::Soniox.display_name(), "Soniox");
         assert_eq!(ProviderId::ElevenLabs.display_name(), "ElevenLabs");
         assert_eq!(ProviderId::Xai.display_name(), "xAI");
+        assert_eq!(ProviderId::Cartesia.display_name(), "Cartesia");
         assert_eq!(ProviderId::Anthropic.env_var(), "PARLEY_ANTHROPIC_API_KEY");
         assert_eq!(
             ProviderId::AssemblyAi.env_var(),
@@ -350,6 +367,7 @@ mod tests {
             "PARLEY_ELEVENLABS_API_KEY"
         );
         assert_eq!(ProviderId::Xai.env_var(), "PARLEY_XAI_API_KEY");
+        assert_eq!(ProviderId::Cartesia.env_var(), "PARLEY_CARTESIA_API_KEY");
     }
 
     #[test]

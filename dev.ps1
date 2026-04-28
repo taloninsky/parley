@@ -13,6 +13,49 @@ $ErrorActionPreference = "Stop"
 $proxyPort = 3033
 $proxyHost = "127.0.0.1"
 
+function Import-MsvcBuildEnvironment {
+    if (Get-Command link.exe -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if (-not $programFilesX86) {
+        throw "ProgramFiles(x86) is not set; cannot locate Visual Studio Build Tools."
+    }
+
+    $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) {
+        throw "MSVC linker link.exe was not found. Install Visual Studio Build Tools 2022 with the C++ workload, then re-run .\dev.ps1."
+    }
+
+    $vsInstall = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+    $vsInstall = ($vsInstall | Select-Object -First 1)
+    if (-not $vsInstall) {
+        throw "MSVC linker link.exe was not found. Install the Visual Studio Build Tools C++ toolset, then re-run .\dev.ps1."
+    }
+
+    $vsDevCmd = Join-Path $vsInstall "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path $vsDevCmd)) {
+        throw "Visual Studio Build Tools was found at '$vsInstall', but VsDevCmd.bat is missing. Repair the Build Tools installation."
+    }
+
+    Write-Host "Loading MSVC build environment from $vsInstall..." -ForegroundColor Cyan
+    $envDump = & cmd.exe /s /c "`"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set"
+    foreach ($line in $envDump) {
+        if ($line -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+        }
+    }
+
+    if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+        throw "Visual Studio Build Tools environment loaded, but link.exe is still not available on PATH."
+    }
+}
+
+Import-MsvcBuildEnvironment
+
 # Bail early if something is already bound to the proxy port — otherwise
 # `cargo run` would fail with a panic deep in the output and we'd have
 # no idea why STT stops working.

@@ -101,6 +101,7 @@ Each credential carries a `plan` field — a free-form string scoped to its prov
 - OpenAI: `api_default` / `api_zdr` / `chatgpt_team` / `chatgpt_enterprise`
 - AssemblyAI: `pay_as_you_go` / `enterprise` / `enterprise_zdr`
 - ElevenLabs: `creator` / `pro` / `enterprise` / `enterprise_zero_retention`
+- Cartesia: `free` / `starter` / `startup` / `enterprise` / `enterprise_zdr` — training is off by default on every plan and is dashboard-toggleable; GDPR / SOC 2 / HIPAA controls (BAA, custom retention) only land on `enterprise` and above.
 - Deepgram: `pay_as_you_go` / `enterprise` / `enterprise_zdr`
 
 The set of valid plans per provider lives in the provider posture registry (§5). Adding a new plan is a registry change, not a code change.

@@ -321,8 +321,11 @@ impl ConversationOrchestrator {
 
         // 2. Resolve the system prompt — inline is free, file
         //    requires I/O. Done before mutating the session for the
-        //    same reason as (1).
-        let system_text = resolve_system_prompt(&persona.system_prompt, &self.ctx.prompts_dir)?;
+        //    same reason as (1). Auto-prepends the expression-tag
+        //    instruction (spec §6.4) when the persona allows it and
+        //    the active TTS provider can render the tags.
+        let system_text =
+            build_system_prompt(&persona, &self.ctx.prompts_dir, self.ctx.tts.as_deref())?;
 
         // 3. Append the user turn and snapshot the message history
         //    we'll send.
@@ -351,7 +354,8 @@ impl ConversationOrchestrator {
         &self,
     ) -> Result<BoxStream<'static, OrchestratorEvent>, OrchestratorError> {
         let (persona, model, provider) = self.resolve_active().await?;
-        let system_text = resolve_system_prompt(&persona.system_prompt, &self.ctx.prompts_dir)?;
+        let system_text =
+            build_system_prompt(&persona, &self.ctx.prompts_dir, self.ctx.tts.as_deref())?;
 
         let history = {
             let session = self.session.lock().await;
@@ -749,11 +753,16 @@ impl TtsTurn {
     ) -> Result<Self, String> {
         let cache = ctx.tts_cache.as_ref().expect("tts_cache present");
         let hub = ctx.tts_hub.as_ref().expect("tts_hub present");
+        let format = ctx
+            .tts
+            .as_ref()
+            .expect("tts provider present")
+            .output_format();
         let writer = cache
-            .writer(session_id, &turn_id)
+            .writer(session_id, &turn_id, format)
             .await
             .map_err(|e| format!("tts cache open failed: {e}"))?;
-        let broadcaster = hub.open(turn_id.clone());
+        let broadcaster = hub.open(turn_id.clone(), format);
         Ok(Self {
             turn_id,
             cache: Some(writer),
@@ -819,9 +828,40 @@ impl TtsTurn {
 
         let provider = ctx.tts.as_ref().expect("tts provider present").clone();
         let voice_id = ctx.tts_voice_id.clone().expect("tts_voice_id present");
+        // Translate the LLM's neutral expression tags
+        // (`{warm}`, `{laugh}`, `{pause:short}`, …; spec §6.4) into
+        // whatever the active provider speaks natively. The default
+        // impl strips them; Cartesia / ElevenLabs override.
+        let synthesizable_text = provider.translate_expression_tags(&chunk.text);
+
+        // Some chunks reduce to nothing once neutral tags strip
+        // (e.g. `"{warm}"` or `"{pause:short}."` on its own).
+        // Cartesia rejects an empty / punctuation-only transcript
+        // with `unknown_error: Your initial transcript is empty or
+        // contains only punctuation`, and ElevenLabs returns a
+        // 422. Skip the synthesize call entirely for those — bump
+        // the sentence index so cross-chunk bookkeeping stays
+        // consistent, advance `previous_text`, and emit a
+        // zero-character `TtsSentenceDone` so the frontend cost
+        // counter is unchanged.
+        if !has_synthesizable_content(&synthesizable_text) {
+            let idx = self.sentence_index;
+            self.sentence_index += 1;
+            if !self.previous_text.is_empty() {
+                self.previous_text.push(' ');
+            }
+            self.previous_text.push_str(&synthesizable_text);
+            events.push(OrchestratorEvent::TtsSentenceDone {
+                turn_id: self.turn_id.clone(),
+                sentence_index: idx,
+                characters: 0,
+            });
+            return events;
+        }
+
         let request = TtsRequest {
             voice_id,
-            text: chunk.text.clone(),
+            text: synthesizable_text.clone(),
         };
         // Trim the prior-text window to a provider-friendly size.
         // ElevenLabs documents `previous_text` as accepting up to a
@@ -911,7 +951,11 @@ impl TtsTurn {
         if !self.previous_text.is_empty() {
             self.previous_text.push(' ');
         }
-        self.previous_text.push_str(&chunk.text);
+        // Carry the *translated* text into the previous_text window
+        // so providers don't see neutral `{warm}` / `{laugh}` markers
+        // in their continuation hints. Cheap (already computed
+        // `synthesizable_text` above for this chunk).
+        self.previous_text.push_str(&synthesizable_text);
         const PREVIOUS_TEXT_BUFFER_CAP: usize = 4096;
         if self.previous_text.len() > PREVIOUS_TEXT_BUFFER_CAP {
             let mut start = self.previous_text.len() - PREVIOUS_TEXT_BUFFER_CAP;
@@ -996,6 +1040,50 @@ fn speaker_for_persona(persona: &Persona) -> SpeakerId {
     format!("ai-{}", persona.id)
 }
 
+/// Build the dispatch-time system prompt for `persona`: starts from
+/// the persona's own text (inline or read from disk) and, when the
+/// Cheap "is this string worth sending to a TTS provider?" probe.
+/// True iff at least one character is alphabetic or numeric. Pure
+/// whitespace, lone punctuation, and stray tag-residue (e.g. `". "`
+/// after `{warm}` strips out) all return `false`.
+///
+/// Cartesia surfaces these as `unknown_error: Your initial
+/// transcript is empty or contains only punctuation`; ElevenLabs
+/// returns a 422. We dodge both by short-circuiting the synthesize
+/// call and emitting a zero-character `TtsSentenceDone` instead.
+fn has_synthesizable_content(text: &str) -> bool {
+    text.chars().any(|c| c.is_alphanumeric())
+}
+
+/// persona allows it AND the active TTS provider can render expressive
+/// tags, prepends the canonical neutral-vocabulary instruction so the
+/// LLM learns the `{warm}`, `{laugh}`, `{pause:short}`, … tag set.
+///
+/// Spec: `docs/conversation-mode-spec.md` §6.4. Personas can opt out
+/// via `persona.tts.use_expression_annotations = false` and bake
+/// whatever guidance they want directly into their prompt.
+fn build_system_prompt(
+    persona: &Persona,
+    prompts_dir: &std::path::Path,
+    tts: Option<&dyn TtsProvider>,
+) -> Result<String, OrchestratorError> {
+    let body = resolve_system_prompt(&persona.system_prompt, prompts_dir)?;
+    let should_prepend = persona.tts.use_expression_annotations
+        && tts.map(|p| p.supports_expressive_tags()).unwrap_or(false);
+    if !should_prepend {
+        return Ok(body);
+    }
+    let mut out =
+        String::with_capacity(body.len() + 1024 + parley_core::expression::NEUTRAL_TAGS.len() * 32);
+    out.push_str(&parley_core::expression::expression_tag_instruction());
+    // Two newlines so the auto-prepended block is visibly separate
+    // from the persona's own system prompt body. The LLM sees a clear
+    // section boundary, not a run-on paragraph.
+    out.push_str("\n\n");
+    out.push_str(&body);
+    Ok(out)
+}
+
 /// Resolve a [`SystemPrompt`] into its full text. Inline returns its
 /// own text; File reads from `prompts_dir`, accepting both `"name"`
 /// and `"name.md"` forms (matching `proxy::registry`'s validation
@@ -1037,6 +1125,25 @@ mod tests {
         PersonaContextSettings, PersonaTier, PersonaTiers, PersonaTtsSettings, SystemPrompt,
     };
     use parley_core::speaker::Speaker;
+
+    #[test]
+    fn has_synthesizable_content_rejects_empty_and_punctuation() {
+        // Cases the orchestrator now skips before calling the TTS
+        // provider — Cartesia would otherwise return
+        // `unknown_error: Your initial transcript is empty …`.
+        assert!(!has_synthesizable_content(""));
+        assert!(!has_synthesizable_content("   "));
+        assert!(!has_synthesizable_content("..."));
+        assert!(!has_synthesizable_content(". , !"));
+        assert!(!has_synthesizable_content("\t\n"));
+        // Anything with a letter or digit goes through; lone SSML
+        // markup or `[laughter]` carries enough content for
+        // providers to act on, so we don't second-guess them here.
+        assert!(has_synthesizable_content("hi"));
+        assert!(has_synthesizable_content("3"));
+        assert!(has_synthesizable_content("[laughter]"));
+        assert!(has_synthesizable_content("Sí."));
+    }
 
     struct FakeClock(u64);
     impl Clock for FakeClock {

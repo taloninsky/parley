@@ -66,7 +66,7 @@ use crate::orchestrator::{
 use crate::providers::ProviderId;
 use crate::secrets::{DEFAULT_CREDENTIAL, SecretsManager};
 use crate::session_store::{FsSessionStore, SessionStore, SessionStoreError};
-use crate::tts::{ElevenLabsTts, FsTtsCache, TtsBroadcastFrame, TtsHub, XaiTts};
+use crate::tts::{CartesiaTts, ElevenLabsTts, FsTtsCache, TtsBroadcastFrame, TtsHub, XaiTts};
 
 /// Default ElevenLabs voice id ("Jarnathan") used when an init or
 /// load request omits the `voice_id` field. Spec §6.
@@ -285,17 +285,41 @@ pub struct TurnRequest {
 }
 
 /// Body for `POST /conversation/switch`.
+///
+/// Accepts both persona/model swaps and TTS-only swaps (voice or
+/// provider) on the same endpoint. Fields that aren't sent fall
+/// back to either the active session's current binding or, for TTS,
+/// to the provider's default. The orchestrator is rebuilt around the
+/// resolved combination so the next turn dispatches against it.
 #[derive(Debug, Deserialize)]
 pub struct SwitchRequest {
     /// Persona to make active for the next turn.
     pub persona_id: PersonaId,
     /// Model config id to pair with that persona.
     pub model_config_id: ModelConfigId,
-    /// Named credential to draw the provider API key from. Defaults
-    /// to `default` when omitted. Same resolution rules as
+    /// Named credential to draw the LLM provider API key from.
+    /// Defaults to `default` when omitted. Same resolution rules as
     /// [`InitRequest::credential`].
     #[serde(default)]
     pub credential: Option<String>,
+    /// TTS provider id for spoken replies after the switch:
+    /// `elevenlabs`, `xai`, `cartesia`, or `off`. When omitted the
+    /// switch reuses the proxy's default (ElevenLabs); the browser
+    /// always sends an explicit value when changing voice
+    /// mid-session so the active provider doesn't silently flip.
+    #[serde(default)]
+    pub tts_provider: Option<String>,
+    /// Voice id to bind for spoken replies after the switch.
+    /// Provider-specific; an empty string lets the resolver pick the
+    /// provider's default voice. Spec
+    /// `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+    #[serde(default)]
+    pub voice_id: Option<String>,
+    /// Named credential for the TTS provider's API key. Defaults to
+    /// `default`. Field name retained for wire compatibility — applies
+    /// to whichever provider is selected via `tts_provider`.
+    #[serde(default)]
+    pub elevenlabs_credential: Option<String>,
 }
 
 /// Body for `POST /conversation/load`.
@@ -371,7 +395,7 @@ pub struct ModelSummary {
     /// Provider tag (anthropic, openai, ...). Lets the client warn
     /// before submitting credentials of the wrong shape.
     pub provider: LlmProviderTag,
-    /// Provider-specific model name (e.g. `claude-opus-4-7-...`).
+    /// Provider-specific model name (e.g. `claude-opus-4-7`).
     pub model_name: String,
     /// Total context window in tokens.
     pub context_window: u32,
@@ -477,11 +501,11 @@ async fn init_session(
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        silence_splicer: resolve_silence_splicer(&state, &tts),
         tts,
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
-        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -589,20 +613,27 @@ async fn switch_persona(
         &state.secrets,
     )?;
     snapshot.switch_persona(req.persona_id.clone(), req.model_config_id.clone());
-    // `switch` doesn't carry voice/elevenlabs fields today — reuse
-    // the default credential resolution (and the default voice).
-    // The browser can re-init with explicit values to change voice.
-    let (tts, tts_voice_id) = resolve_tts(&state, None, None, None);
+    // `switch` now carries optional TTS fields so a mid-session voice
+    // or provider change rebuilds the orchestrator with the new
+    // synthesizer. Omitted fields fall through to `resolve_tts`'s
+    // defaults (ElevenLabs + Jarnathan + `default` credential), which
+    // keeps the legacy "persona-only switch" path working.
+    let (tts, tts_voice_id) = resolve_tts(
+        &state,
+        req.tts_provider.as_deref(),
+        req.voice_id.as_deref(),
+        req.elevenlabs_credential.as_deref(),
+    );
     let ctx = OrchestratorContext {
         personas: state.registries.personas.clone(),
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        silence_splicer: resolve_silence_splicer(&state, &tts),
         tts,
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
-        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let new_orchestrator = Arc::new(ConversationOrchestrator::new(snapshot, ctx));
     *state.inner.lock().await = Some(new_orchestrator);
@@ -698,11 +729,11 @@ async fn load_session(
         models: state.registries.models.clone(),
         providers: HashMap::from([(model.id.clone(), provider)]),
         prompts_dir: state.registries.prompts_dir.clone(),
+        silence_splicer: resolve_silence_splicer(&state, &tts),
         tts,
         tts_cache: Some(state.tts.cache.clone()),
         tts_hub: Some(state.tts.hub.clone()),
         tts_voice_id,
-        silence_splicer: state.tts.silence_splicer.clone(),
     };
     let orchestrator = Arc::new(ConversationOrchestrator::new(session, ctx));
     *state.inner.lock().await = Some(orchestrator);
@@ -908,6 +939,26 @@ fn session_store_error_to_response(err: SessionStoreError) -> (StatusCode, Json<
 /// configured. The session still constructs successfully on a missing
 /// key — TTS dispatch simply no-ops and the session runs in text-only
 /// mode (spec §6 "graceful degradation").
+/// Pick a [`SilenceSplicer`] shaped for the provider's declared
+/// [`AudioFormat`]. When no provider is wired (TTS-off mode) or the
+/// state's `silence_splicer` slot is `None` (tests that disable
+/// splicing), returns `None` so the orchestrator skips silence
+/// insertion. Spec: `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+fn resolve_silence_splicer(
+    state: &ConversationApiState,
+    provider: &Option<Arc<dyn crate::tts::TtsProvider>>,
+) -> Option<Arc<crate::tts::silence::SilenceSplicer>> {
+    // `state.tts.silence_splicer` is `None` only in test wiring;
+    // production callers always set it. We use it here purely as a
+    // "splicing globally enabled?" toggle and replace its contents
+    // with a format-matched splicer per provider.
+    state.tts.silence_splicer.as_ref()?;
+    let p = provider.as_ref()?;
+    Some(Arc::new(crate::tts::silence::SilenceSplicer::for_format(
+        p.output_format(),
+    )))
+}
+
 fn resolve_tts(
     state: &ConversationApiState,
     tts_provider: Option<&str>,
@@ -932,6 +983,22 @@ fn resolve_tts(
                 .to_string();
             let provider: Arc<dyn crate::tts::TtsProvider> =
                 Arc::new(XaiTts::new(key, state.http.clone()));
+            (Some(provider), Some(voice))
+        }
+        "cartesia" => {
+            let key = match state.secrets.resolve(ProviderId::Cartesia, credential) {
+                Some(k) => k,
+                None => return (None, None),
+            };
+            // Same "non-empty id keeps cache keys stable" reasoning as
+            // the xAI arm. CartesiaTts also tolerates an empty voice
+            // and falls back to the Sonic-3 default internally.
+            let voice = voice_id
+                .filter(|v| !v.is_empty())
+                .unwrap_or(crate::tts::cartesia::CARTESIA_DEFAULT_VOICE)
+                .to_string();
+            let provider: Arc<dyn crate::tts::TtsProvider> =
+                Arc::new(CartesiaTts::new(key, state.http.clone()));
             (Some(provider), Some(voice))
         }
         // Default + unknown both fall through to ElevenLabs, the
@@ -982,19 +1049,25 @@ async fn stream_tts(
     // Step 1: subscribe FIRST so frames published while we read
     // the cache aren't lost. `None` means no live broadcast.
     let live_rx = state.tts.hub.subscribe(&turn_id);
+    // Live format takes precedence — the broadcaster knows the
+    // current provider's container shape. Falls back to the cache
+    // sidecar (set by `FsTtsCache::reader`) when the broadcast has
+    // already finished and we're replaying.
+    let live_format = state.tts.hub.format_for(&turn_id);
 
     // Step 2: snapshot cache (best-effort). `None` means no file.
-    let cache_bytes: Option<Vec<u8>> = match state.tts.cache.reader(&session_id, &turn_id).await {
-        Ok(Some(reader)) => Some(reader.into_bytes()),
-        Ok(None) => None,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody::new(format!("tts cache read failed: {e}"))),
-            ));
-        }
-    };
-    if live_rx.is_none() && cache_bytes.is_none() {
+    let cache_snapshot: Option<(Vec<u8>, crate::tts::AudioFormat)> =
+        match state.tts.cache.reader(&session_id, &turn_id).await {
+            Ok(Some(reader)) => Some(reader.into_parts()),
+            Ok(None) => None,
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody::new(format!("tts cache read failed: {e}"))),
+                ));
+            }
+        };
+    if live_rx.is_none() && cache_snapshot.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorBody::new(format!(
@@ -1003,13 +1076,30 @@ async fn stream_tts(
         ));
     }
 
+    // Resolve the format to advertise to the client. Live wins over
+    // cache when both are present (the live broadcaster is the
+    // active provider; cache may be from an earlier provider before
+    // a retry). Default to the cached format when there is no live
+    // broadcast, and to MP3 in the (unreachable) case where neither
+    // is present.
+    let format = live_format
+        .or_else(|| cache_snapshot.as_ref().map(|(_, f)| *f))
+        .unwrap_or(crate::tts::AudioFormat::Mp3_44100_128);
+    let cache_bytes: Option<Vec<u8>> = cache_snapshot.map(|(b, _)| b);
+
     let cache_len = cache_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
     let stream = async_stream::stream! {
+        // (0) Format frame — always first, so the browser can pick
+        // its sink (MediaSource for MP3, Web Audio for PCM) before
+        // any audio bytes arrive. Spec
+        // `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+        yield Ok::<_, Infallible>(format_event(format));
+
         // (a) Cache prefix as a single audio frame.
         if let Some(bytes) = cache_bytes
             && !bytes.is_empty()
         {
-            yield Ok::<_, Infallible>(audio_event(&bytes));
+            yield Ok(audio_event(&bytes));
         }
 
         // (b) Live tail. Skip frames already covered by the cache
@@ -1082,20 +1172,52 @@ async fn replay_tts(
                 Json(ErrorBody::new(format!("no tts cache for turn '{turn_id}'"))),
             )
         })?;
-    let bytes = reader.into_bytes();
-    let mut resp = (StatusCode::OK, bytes).into_response();
+    let (audio, format) = reader.into_parts();
+    // For PCM the cache holds raw samples that no browser will play
+    // directly. We prepend a real-length RIFF/WAVE header so the
+    // response is a complete, seekable WAV file. MP3 is already
+    // self-describing.
+    let body = match format.wav_header(audio.len() as u32) {
+        Some(mut header) => {
+            header.extend_from_slice(&audio);
+            header
+        }
+        None => audio,
+    };
+    let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut()
-        .insert(header::CONTENT_TYPE, "audio/mpeg".parse().unwrap());
+        .insert(header::CONTENT_TYPE, format.replay_mime().parse().unwrap());
     Ok(resp)
 }
 
-/// Build a single `audio` SSE frame from a chunk of MP3 bytes.
+/// Build a single `audio` SSE frame from a chunk of audio bytes.
+/// Bytes are base64-encoded so the SSE transport (which is
+/// line-oriented UTF-8 text) can carry binary payloads.
 fn audio_event(bytes: &[u8]) -> Event {
     let payload = serde_json::json!({
         "type": "audio",
         "b64": BASE64_STANDARD.encode(bytes),
     });
     Event::default().event("audio").data(payload.to_string())
+}
+
+/// Build the leading `format` SSE frame. Carries the canonical MIME
+/// (`audio/mpeg` for MP3, `audio/pcm-s16le-44100-mono` for raw PCM)
+/// plus the four PCM parameters the browser's Web Audio sink needs
+/// (sample_rate, channels, bytes_per_sample). Sent exactly once, as
+/// the very first frame on every TTS SSE stream — the browser uses
+/// it to pick a playback sink before any audio arrives. Spec
+/// `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+fn format_event(format: crate::tts::AudioFormat) -> Event {
+    let payload = serde_json::json!({
+        "type": "format",
+        "mime": format.sse_mime(),
+        "tag": format.tag(),
+        "sample_rate": format.sample_rate(),
+        "channels": format.channels(),
+        "bytes_per_sample": format.bytes_per_sample(),
+    });
+    Event::default().event("format").data(payload.to_string())
 }
 
 /// Terminal `done` SSE frame.
@@ -1678,6 +1800,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_endpoint_accepts_tts_provider_change() {
+        // Sanity-check the mid-session voice/provider swap path
+        // (spec `docs/cartesia-sonic-3-integration-spec.md` §6.4):
+        // a `/conversation/switch` carrying explicit `tts_provider`
+        // and `voice_id` succeeds when a key for that provider is
+        // configured, and the rest of the session (turn history,
+        // active persona) is preserved in the snapshot.
+        let persona = sample_persona("scholar", "m1", "x");
+        let model = sample_model("m1");
+        let registries = Arc::new(Registries {
+            personas: [(persona.id.clone(), persona.clone())].into(),
+            models: [(model.id.clone(), model.clone())].into(),
+            prompts_dir: PathBuf::from("/x"),
+            sessions_dir: PathBuf::from("/x-sessions"),
+        });
+        // Configure Anthropic + Cartesia keys so both LLM rebuild
+        // and TTS resolution succeed.
+        let store = Box::new(InMemoryKeyStore::new());
+        let env = Box::new(StaticEnv::new());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mgr = SecretsManager::new(store, env, tmp.path().join("credentials.json"));
+        mgr.set(ProviderId::Anthropic, DEFAULT_CREDENTIAL, "sk-anthropic")
+            .unwrap();
+        mgr.set(ProviderId::Cartesia, DEFAULT_CREDENTIAL, "sk-cartesia")
+            .unwrap();
+        std::mem::forget(tmp);
+        let state = ConversationApiState::new(registries, reqwest::Client::new(), Arc::new(mgr));
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
+        install_orchestrator(&state, persona.clone(), model.clone(), provider).await;
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/conversation/switch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "persona_id": "scholar",
+                            "model_config_id": "m1",
+                            "tts_provider": "cartesia",
+                            "voice_id": "00000000-0000-0000-0000-000000000001",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The snapshot still reports the same active persona — the
+        // switch was a TTS-only change, no persona drift.
+        let snap = router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/conversation/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read_body(snap).await).unwrap();
+        let history = v["persona_history"].as_array().unwrap();
+        let last = history.last().unwrap();
+        assert_eq!(last["persona_id"], "scholar");
+    }
+
+    #[tokio::test]
     async fn switch_with_unknown_persona_is_400() {
         let persona = sample_persona("scholar", "m1", "x");
         let model = sample_model("m1");
@@ -2250,7 +2443,13 @@ mod tests {
     /// `bytes`. Drives [`FsTtsCache::writer`] just like the
     /// orchestrator does at runtime.
     async fn seed_cache(cache: &FsTtsCache, session_id: &str, turn_id: &str, bytes: &[u8]) {
-        let mut w = cache.writer(session_id, turn_id).await.unwrap();
+        // Tests pre-date the multi-format era; default to MP3 so
+        // existing assertions about cache bytes / replay continue to
+        // hold without churn.
+        let mut w = cache
+            .writer(session_id, turn_id, crate::tts::AudioFormat::Mp3_44100_128)
+            .await
+            .unwrap();
         w.write(bytes).await.unwrap();
         w.finish().await.unwrap();
     }
@@ -2411,9 +2610,14 @@ mod tests {
         let body = read_body(resp).await;
         let frames = parse_sse(&body);
         let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["audio", "done"]);
+        assert_eq!(names, vec!["format", "audio", "done"]);
 
-        let audio_payload: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        let format_payload: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        assert_eq!(format_payload["type"], "format");
+        assert_eq!(format_payload["mime"], "audio/mpeg");
+        assert_eq!(format_payload["tag"], "mp3_44100_128");
+
+        let audio_payload: serde_json::Value = serde_json::from_str(&frames[1].1).unwrap();
         assert_eq!(audio_payload["type"], "audio");
         let decoded = BASE64_STANDARD
             .decode(audio_payload["b64"].as_str().unwrap())
@@ -2445,7 +2649,9 @@ mod tests {
         // Open a broadcast for turn-0001 and seed the cache with
         // 4 bytes (covers a hypothetical first frame whose
         // `total_bytes_after = 4`).
-        let bcast = tts.hub.open("turn-0001".into());
+        let bcast = tts
+            .hub
+            .open("turn-0001".into(), crate::tts::AudioFormat::Mp3_44100_128);
         seed_cache(&tts.cache, "sess-test", "turn-0001", b"\x01\x02\x03\x04").await;
 
         // Spawn the SSE request. Drain on a separate task so we
@@ -2484,15 +2690,15 @@ mod tests {
         let body = handle.await.unwrap();
         let frames = parse_sse(&body);
         let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["audio", "audio", "done"]);
+        assert_eq!(names, vec!["format", "audio", "audio", "done"]);
 
-        let snap_payload: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        let snap_payload: serde_json::Value = serde_json::from_str(&frames[1].1).unwrap();
         let snap_bytes = BASE64_STANDARD
             .decode(snap_payload["b64"].as_str().unwrap())
             .unwrap();
         assert_eq!(snap_bytes, b"\x01\x02\x03\x04");
 
-        let tail_payload: serde_json::Value = serde_json::from_str(&frames[1].1).unwrap();
+        let tail_payload: serde_json::Value = serde_json::from_str(&frames[2].1).unwrap();
         let tail_bytes = BASE64_STANDARD
             .decode(tail_payload["b64"].as_str().unwrap())
             .unwrap();
@@ -2514,7 +2720,9 @@ mod tests {
             Arc::new(MockProvider::new("mock", vec![], TokenUsage::default()));
         install_orchestrator(&state, persona, model, provider).await;
 
-        let bcast = tts.hub.open("turn-0001".into());
+        let bcast = tts
+            .hub
+            .open("turn-0001".into(), crate::tts::AudioFormat::Mp3_44100_128);
         let app = router(state);
         let handle = tokio::spawn(async move {
             let resp = app
@@ -2536,8 +2744,10 @@ mod tests {
         let body = handle.await.unwrap();
         let frames = parse_sse(&body);
         let names: Vec<&str> = frames.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["error"]);
-        let v: serde_json::Value = serde_json::from_str(&frames[0].1).unwrap();
+        // Format frame still leads even when the broadcaster fails
+        // before any audio — clients consistently get the sink hint.
+        assert_eq!(names, vec!["format", "error"]);
+        let v: serde_json::Value = serde_json::from_str(&frames[1].1).unwrap();
         assert_eq!(v["type"], "error");
         assert_eq!(v["message"], "boom");
     }

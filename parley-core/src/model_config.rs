@@ -77,7 +77,7 @@ impl Default for TokenRates {
 /// [model]
 /// id = "claude-opus-latest"
 /// provider = "anthropic"
-/// model_name = "claude-opus-4-7-20260301"
+/// model_name = "claude-opus-4-7"
 /// context_window = 200000
 ///
 /// [model.rates]
@@ -99,7 +99,7 @@ pub struct ModelConfig {
     /// Which provider hosts this model.
     pub provider: LlmProviderTag,
     /// The provider's own identifier for the model (e.g.,
-    /// `"claude-opus-4-7-20260301"`). Distinct from `id`, which is our
+    /// `"claude-opus-4-7"`). Distinct from `id`, which is our
     /// alias.
     pub model_name: String,
     /// Total context window in tokens. Used by the compaction logic
@@ -142,7 +142,7 @@ mod tests {
         ModelConfig {
             id: "claude-opus-latest".into(),
             provider: LlmProviderTag::Anthropic,
-            model_name: "claude-opus-4-7-20260301".into(),
+            model_name: "claude-opus-4-7".into(),
             context_window: 200_000,
             rates: TokenRates {
                 input_per_1m: 15.0,

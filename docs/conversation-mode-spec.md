@@ -345,7 +345,7 @@ Model configs live in `~/.parley/models/*.toml`:
 [model]
 id = "claude-opus-latest"
 provider = "anthropic"
-model_name = "claude-opus-4-7-20260301"
+model_name = "claude-opus-4-7"
 context_window = 200000
 
 [model.options]

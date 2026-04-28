@@ -1,10 +1,14 @@
 // UI components
 pub mod app;
+pub mod app_state;
 pub mod conversation;
 pub mod media_player;
+pub mod pcm_player;
 pub mod pipeline;
 pub mod root;
 pub mod secrets;
+pub mod settings_drawer;
 pub mod stt_provider_picker;
+pub mod tts_audio_sink;
 pub mod use_voice_input;
 pub mod voice_picker;

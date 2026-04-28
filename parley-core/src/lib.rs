@@ -10,6 +10,7 @@
 
 pub mod chat;
 pub mod conversation;
+pub mod expression;
 pub mod model_config;
 pub mod persona;
 pub mod profile;

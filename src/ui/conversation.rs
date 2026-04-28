@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::ui::media_player::MediaSourcePlayer;
+use crate::ui::tts_audio_sink::TtsAudioSink;
 use crate::ui::use_voice_input::{VoiceInputHandle, VoiceState, use_voice_input};
 
 const PROXY_BASE: &str = "http://127.0.0.1:3033";
@@ -270,9 +270,84 @@ enum Mode {
 #[derive(Debug, Clone, PartialEq)]
 enum SendStatus {
     Idle,
+    /// Running the `/format` cleanup pass before submitting the
+    /// user's voice turn. Spec `docs/global-reformat-spec.md` §5.
+    Reformatting,
     Sending,
     Streaming,
     Failed(String),
+}
+
+// ── Reformat helpers (Conversation Mode) ─────────────────────────────
+
+/// Result of a successful `/format` round-trip. `formatted` is the
+/// cleaned text when the proxy reports a change; otherwise `None`
+/// signals "no change needed" and the caller keeps the original.
+struct ReformatOutcome {
+    formatted: Option<String>,
+}
+
+/// Call `POST /format` for a single user turn (`depth=0,
+/// context_depth=0, multi_speaker=false`) and return the formatted
+/// text. On any error logs to console and returns `None`, letting the
+/// caller fall through with the raw input. Spec §5.
+async fn reformat_single_turn(
+    text: &str,
+    model_config_id: &str,
+    credential: &str,
+) -> Option<ReformatOutcome> {
+    if text.trim().is_empty() || model_config_id.is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "context": "",
+        "text": text,
+        "multi_speaker": false,
+        "model_config_id": model_config_id,
+        "credential": credential,
+    });
+    let body_str = serde_json::to_string(&body).ok()?;
+    let req = match build_post(&format!("{PROXY_BASE}/format"), &body_str) {
+        Ok(r) => r,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("[parley] reformat build_post failed: {e}").into());
+            return None;
+        }
+    };
+    let window = web_sys::window()?;
+    let resp_val = match JsFuture::from(window.fetch_with_request(&req)).await {
+        Ok(v) => v,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("[parley] reformat fetch failed: {e:?}").into());
+            return None;
+        }
+    };
+    let resp: web_sys::Response = resp_val.dyn_into().ok()?;
+    if !resp.ok() {
+        let body = match resp.text() {
+            Ok(p) => JsFuture::from(p)
+                .await
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        web_sys::console::warn_1(
+            &format!("[parley] reformat HTTP {}: {body}", resp.status()).into(),
+        );
+        return None;
+    }
+    let json_promise = resp.json().ok()?;
+    let json_val = JsFuture::from(json_promise).await.ok()?;
+    let s = js_sys::JSON::stringify(&json_val).ok()?.as_string()?;
+    let parsed: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let changed = parsed["changed"].as_bool().unwrap_or(false);
+    let formatted = if changed {
+        parsed["formatted"].as_str().map(|s| s.to_string())
+    } else {
+        None
+    };
+    Some(ReformatOutcome { formatted })
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────
@@ -457,10 +532,32 @@ fn extract_data_payload(frame: &str) -> Option<String> {
 /// payloads produced by `proxy::conversation_api::stream_tts`. The
 /// proxy uses the JSON discriminant on every frame; the SSE
 /// `event:` line is informational and ignored.
+///
+/// The very first frame on every stream is a `format` frame —
+/// drives the choice between [`MediaSourcePlayer`] (MP3) and
+/// [`PcmPlayer`] (raw PCM via Web Audio). Spec
+/// `docs/cartesia-sonic-3-integration-spec.md` §6.4.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)] // sample_rate / channels / bytes_per_sample are wire-only metadata
 enum TtsFrame {
-    /// Base64-encoded MP3 chunk.
+    /// Stream's audio container shape. Sent exactly once, as the
+    /// leading frame. `mime` carries the canonical type
+    /// (`audio/mpeg` for MP3, `audio/pcm-s16le-44100-mono` for raw
+    /// PCM); the four PCM hints are advisory and only consulted by
+    /// the PCM sink.
+    Format {
+        mime: String,
+        #[serde(default)]
+        tag: String,
+        #[serde(default)]
+        sample_rate: u32,
+        #[serde(default)]
+        channels: u16,
+        #[serde(default)]
+        bytes_per_sample: u16,
+    },
+    /// Base64-encoded audio chunk in the sink's native format.
     Audio { b64: String },
     /// Synthesis finished cleanly; cache is now closed.
     Done,
@@ -469,80 +566,87 @@ enum TtsFrame {
     Error { message: String },
 }
 
-/// Open `/conversation/tts/{turn_id}` and pump audio chunks into
-/// `player`. Returns when the stream closes (either `done` or an
-/// error). On `done`, calls `player.end()` so the `MediaSource`
-/// finalizes after the last buffered frame plays out. On error,
-/// stops the player and surfaces the message via `console.warn`.
-async fn consume_tts_stream(turn_id: String, player: MediaSourcePlayer) {
+/// Open `/conversation/tts/{turn_id}` and pump audio chunks into a
+/// format-matched sink.
+///
+/// The very first frame on the SSE stream is a `format` event whose
+/// `mime` field tells the browser which sink to construct
+/// ([`MediaSourcePlayer`] for MP3, [`PcmPlayer`] for raw PCM); we
+/// don't preallocate the sink in the caller because the active
+/// provider's container shape isn't known until the proxy commits
+/// to one.
+///
+/// Once constructed, the sink is published to `live_sink` (so the
+/// bubble UI can wire Pause/Play/Stop) and `playback_status` flips
+/// to `Playing`. On `done` or stream EOF, `end()` is called so the
+/// sink finalizes after the last buffered audio drains; on error,
+/// the sink is stopped and the message is logged via `console.warn`.
+///
+/// Returns when the stream closes.
+async fn consume_tts_stream(
+    turn_id: String,
+    mut live_sink: Signal<Option<TtsAudioSink>>,
+    mut live_sink_turn: Signal<Option<String>>,
+    mut playback_status: Signal<PlaybackStatus>,
+) {
     let url = format!("{PROXY_BASE}/conversation/tts/{turn_id}");
     let req = match build_get(&url) {
         Ok(r) => r,
         Err(e) => {
             web_sys::console::warn_1(&format!("tts stream: build_get failed: {e}").into());
-            player.stop();
             return;
         }
     };
     let window = match web_sys::window() {
         Some(w) => w,
-        None => {
-            player.stop();
-            return;
-        }
+        None => return,
     };
     let resp_val = match JsFuture::from(window.fetch_with_request(&req)).await {
         Ok(v) => v,
         Err(e) => {
             web_sys::console::warn_1(&format!("tts stream: fetch failed: {e:?}").into());
-            player.stop();
             return;
         }
     };
     let resp: web_sys::Response = match resp_val.dyn_into() {
         Ok(r) => r,
-        Err(_) => {
-            player.stop();
-            return;
-        }
+        Err(_) => return,
     };
     if !resp.ok() {
         web_sys::console::warn_1(&format!("tts stream: HTTP {}", resp.status()).into());
-        player.stop();
         return;
     }
 
     let body = match resp.body() {
         Some(b) => b,
-        None => {
-            player.stop();
-            return;
-        }
+        None => return,
     };
     let reader = match body
         .get_reader()
         .dyn_into::<web_sys::ReadableStreamDefaultReader>()
     {
         Ok(r) => r,
-        Err(_) => {
-            player.stop();
-            return;
-        }
+        Err(_) => return,
     };
     let decoder = match web_sys::TextDecoder::new_with_label("utf-8") {
         Ok(d) => d,
-        Err(_) => {
-            player.stop();
-            return;
-        }
+        Err(_) => return,
     };
+
+    // Sink is `None` until we've parsed the leading `format` frame.
+    // Each branch that wants to talk to it has to consult the Signal
+    // (or this local copy) — we update both in lockstep so the UI
+    // sees the sink the moment the format frame is processed.
+    let mut sink: Option<TtsAudioSink> = None;
 
     let mut buffer = String::new();
     loop {
         let read_result = match JsFuture::from(reader.read()).await {
             Ok(v) => v,
             Err(_) => {
-                player.stop();
+                if let Some(s) = sink.as_ref() {
+                    s.stop();
+                }
                 return;
             }
         };
@@ -570,27 +674,67 @@ async fn consume_tts_stream(turn_id: String, player: MediaSourcePlayer) {
                     continue;
                 };
                 match parsed {
-                    TtsFrame::Audio { b64 } => match B64.decode(b64.as_bytes()) {
-                        Ok(bytes) => {
-                            if let Err(e) = player.append(&bytes) {
+                    TtsFrame::Format { mime, .. } => {
+                        // The leading `format` frame is also the
+                        // signal that lets us pick a sink. If a
+                        // second `format` frame ever arrives (it
+                        // shouldn't), we leave the existing sink in
+                        // place — switching containers mid-stream
+                        // isn't a feature.
+                        if sink.is_some() {
+                            continue;
+                        }
+                        match TtsAudioSink::from_mime(&mime) {
+                            Ok(new_sink) => {
+                                let _ = new_sink.play();
+                                sink = Some(new_sink.clone());
+                                live_sink.set(Some(new_sink));
+                                live_sink_turn.set(Some(turn_id.clone()));
+                                playback_status.set(PlaybackStatus::Playing);
+                            }
+                            Err(e) => {
                                 web_sys::console::warn_1(
-                                    &format!("tts append failed: {e:?}").into(),
+                                    &format!("tts sink alloc failed for mime {mime}: {e:?}").into(),
                                 );
+                                return;
                             }
                         }
-                        Err(e) => {
+                    }
+                    TtsFrame::Audio { b64 } => {
+                        let bytes = match B64.decode(b64.as_bytes()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                web_sys::console::warn_1(
+                                    &format!("tts base64 decode failed: {e}").into(),
+                                );
+                                continue;
+                            }
+                        };
+                        let Some(sink) = sink.as_ref() else {
+                            // Audio before format is a server bug —
+                            // the proxy guarantees `format` first.
+                            // Drop the chunk; the cache replay will
+                            // still render correctly.
                             web_sys::console::warn_1(
-                                &format!("tts base64 decode failed: {e}").into(),
+                                &"tts audio frame received before format frame".into(),
                             );
+                            continue;
+                        };
+                        if let Err(e) = sink.append(&bytes) {
+                            web_sys::console::warn_1(&format!("tts append failed: {e:?}").into());
                         }
-                    },
+                    }
                     TtsFrame::Done => {
-                        let _ = player.end();
+                        if let Some(s) = sink.as_ref() {
+                            let _ = s.end();
+                        }
                         return;
                     }
                     TtsFrame::Error { message } => {
                         web_sys::console::warn_1(&format!("tts stream error: {message}").into());
-                        player.stop();
+                        if let Some(s) = sink.as_ref() {
+                            s.stop();
+                        }
                         return;
                     }
                 }
@@ -599,8 +743,10 @@ async fn consume_tts_stream(turn_id: String, player: MediaSourcePlayer) {
 
         if done {
             // Stream closed without an explicit `done` frame —
-            // finalize the player anyway so playback can complete.
-            let _ = player.end();
+            // finalize the sink anyway so playback can complete.
+            if let Some(s) = sink.as_ref() {
+                let _ = s.end();
+            }
             return;
         }
     }
@@ -626,6 +772,15 @@ enum PlaybackStatus {
 /// the proxy.
 #[component]
 pub fn ConversationView() -> Element {
+    // Pull the global AppSettings handles up-front; multiple sites
+    // below need them (mid-session voice change, voice→submit
+    // bridge, ¶ Reformat button). Spec §3, §5, §6.
+    let app_settings: crate::ui::app_state::AppSettings = use_context();
+    let anthropic_configured = app_settings.anthropic_configured;
+    let auto_format_in_conversation = app_settings.auto_format_in_conversation;
+    let reformat_model_config_id = app_settings.reformat_model_config_id;
+    let reformat_credential = app_settings.reformat_credential;
+
     // ── Local signals ────────────────────────────────────────────
     // Secrets status drives both the "is Anthropic configured?"
     // gate and the credential picker. Values themselves never reach
@@ -672,7 +827,7 @@ pub fn ConversationView() -> Element {
     // Dioxus's default `UnsyncStorage` on WASM accepts that.
     // Cleared back to `None` when the user clicks Stop or the
     // audio's `ended` event fires.
-    let mut live_player: Signal<Option<MediaSourcePlayer>> = use_signal(|| None);
+    let mut live_player: Signal<Option<TtsAudioSink>> = use_signal(|| None);
     let mut live_player_turn: Signal<Option<String>> = use_signal(|| None);
     let mut playback_status = use_signal(|| PlaybackStatus::Idle);
 
@@ -692,28 +847,78 @@ pub fn ConversationView() -> Element {
             // when the hook has flushed AssemblyAI and the final
             // text is stable. Any other transition is bookkeeping.
             if matches!(previous, VoiceState::Finalizing) && matches!(current, VoiceState::Idle) {
-                let text = voice.final_text.peek().trim().to_string();
-                if !text.is_empty() {
-                    input.set(text);
-                    submit_turn(SendHandles {
-                        selected_credential,
-                        selected_persona,
-                        selected_model,
-                        session_id,
-                        session_initialized,
-                        messages,
-                        streaming,
-                        input,
-                        status,
-                        available_sessions,
-                        applied_persona,
-                        applied_model,
-                        mode,
-                        voice,
-                        live_player,
-                        live_player_turn,
-                        playback_status,
-                    });
+                let raw = voice.final_text.peek().trim().to_string();
+                if !raw.is_empty() {
+                    // Auto-reformat user voice turns before submit
+                    // when the toggle is on AND the proxy can drive
+                    // it (Anthropic key + a model picked). Errors
+                    // fall through with the raw text — never block
+                    // submission. Spec §5.
+                    let do_reformat = (auto_format_in_conversation)()
+                        && anthropic_configured()
+                        && !reformat_model_config_id.peek().is_empty();
+                    if do_reformat {
+                        let model = reformat_model_config_id.peek().clone();
+                        let cred = reformat_credential.peek().clone();
+                        let raw_for_task = raw.clone();
+                        let mut input_sig = input;
+                        let mut status_sig = status;
+                        let prev_status = status.peek().clone();
+                        status_sig.set(SendStatus::Reformatting);
+                        spawn_local(async move {
+                            let cleaned = match reformat_single_turn(&raw_for_task, &model, &cred)
+                                .await
+                            {
+                                Some(out) => out.formatted.unwrap_or_else(|| raw_for_task.clone()),
+                                None => raw_for_task.clone(),
+                            };
+                            input_sig.set(cleaned);
+                            // Restore status to whatever it was so
+                            // submit_turn can flip it to Sending; if
+                            // reformat failed we fall through cleanly.
+                            status_sig.set(prev_status);
+                            submit_turn(SendHandles {
+                                selected_credential,
+                                selected_persona,
+                                selected_model,
+                                session_id,
+                                session_initialized,
+                                messages,
+                                streaming,
+                                input: input_sig,
+                                status: status_sig,
+                                available_sessions,
+                                applied_persona,
+                                applied_model,
+                                mode,
+                                voice,
+                                live_player,
+                                live_player_turn,
+                                playback_status,
+                            });
+                        });
+                    } else {
+                        input.set(raw);
+                        submit_turn(SendHandles {
+                            selected_credential,
+                            selected_persona,
+                            selected_model,
+                            session_id,
+                            session_initialized,
+                            messages,
+                            streaming,
+                            input,
+                            status,
+                            available_sessions,
+                            applied_persona,
+                            applied_model,
+                            mode,
+                            voice,
+                            live_player,
+                            live_player_turn,
+                            playback_status,
+                        });
+                    }
                 }
             }
         }
@@ -755,6 +960,124 @@ pub fn ConversationView() -> Element {
             ))),
         }
     });
+
+    // ── Mid-session voice/provider change ─────────────────────────
+    // Watch the lifted pipeline TTS pickers in AppSettings (driven by
+    // the gear-icon settings drawer at the Root level). When either
+    // changes *while a session is active*, push the new selection to
+    // the proxy via `POST /conversation/switch` so the next AI turn
+    // synthesizes with the new voice. The same endpoint also covers
+    // persona/model swaps; the SwitchRequest now carries both
+    // (`docs/cartesia-sonic-3-integration-spec.md` §6.4).
+    {
+        let pipeline_tts_provider = app_settings.pipeline_tts_provider;
+        let pipeline_tts_voice = app_settings.pipeline_tts_voice;
+        // `last_*` track the values the proxy already knows about, so
+        // the effect skips no-op rebuilds (initial mount, reload from
+        // cookies, etc.) and only fires when the user actually picks a
+        // new provider or voice via the drawer.
+        let mut last_tts_provider = use_signal(String::new);
+        let mut last_tts_voice = use_signal(String::new);
+        // Bare `use_effect` (no `use_reactive!`) so both signals
+        // auto-subscribe via the function-call read below; the
+        // single-dep `use_reactive!` form doesn't fan out cleanly to
+        // multiple watched signals.
+        use_effect(move || {
+            let new_provider = pipeline_tts_provider();
+            let new_voice = pipeline_tts_voice();
+            let prev_provider = last_tts_provider.peek().clone();
+            let prev_voice = last_tts_voice.peek().clone();
+            web_sys::console::log_1(
+                &format!(
+                    "[conversation] tts effect: prev=({prev_provider:?},{prev_voice:?}) new=({new_provider:?},{new_voice:?}) session_initialized={}",
+                    session_initialized.peek(),
+                )
+                .into(),
+            );
+            if new_provider == prev_provider && new_voice == prev_voice {
+                return;
+            }
+            last_tts_provider.set(new_provider.clone());
+            last_tts_voice.set(new_voice.clone());
+            if !*session_initialized.peek() {
+                // No live session yet — the next /init will pick
+                // these values up from cookies. Nothing to push.
+                return;
+            }
+            let persona = applied_persona.peek().clone();
+            let model = applied_model.peek().clone();
+            if persona.is_empty() || model.is_empty() {
+                web_sys::console::warn_1(
+                    &"[conversation] tts switch skipped: applied persona/model empty".into(),
+                );
+                return;
+            }
+            let credential = selected_credential.peek().clone();
+            spawn_local(async move {
+                let payload = serde_json::json!({
+                    "persona_id": persona,
+                    "model_config_id": model,
+                    "credential": credential,
+                    "tts_provider": new_provider,
+                    "voice_id": new_voice,
+                });
+                let body = match serde_json::to_string(&payload) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[conversation] switch payload: {e}").into(),
+                        );
+                        return;
+                    }
+                };
+                web_sys::console::log_1(
+                    &format!("[conversation] POST /conversation/switch body={body}").into(),
+                );
+                let req = match build_post(&format!("{PROXY_BASE}/conversation/switch"), &body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[conversation] switch build_post: {e}").into(),
+                        );
+                        return;
+                    }
+                };
+                let window = match web_sys::window() {
+                    Some(w) => w,
+                    None => return,
+                };
+                match JsFuture::from(window.fetch_with_request(&req)).await {
+                    Ok(resp_val) => match resp_val.dyn_into::<web_sys::Response>() {
+                        Ok(resp) => {
+                            if resp.ok() {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[conversation] tts switch ok: HTTP {}",
+                                        resp.status()
+                                    )
+                                    .into(),
+                                );
+                            } else {
+                                web_sys::console::warn_1(
+                                    &format!(
+                                        "[conversation] tts switch failed: HTTP {}",
+                                        resp.status()
+                                    )
+                                    .into(),
+                                );
+                            }
+                        }
+                        Err(_) => web_sys::console::warn_1(
+                            &"[conversation] tts switch: bad response".into(),
+                        ),
+                    },
+                    Err(e) => web_sys::console::warn_1(
+                        &format!("[conversation] tts switch fetch err: {e:?}").into(),
+                    ),
+                }
+            });
+        });
+    }
 
     // ── Submit handler ────────────────────────────────────────────
     // Bundle every signal the submit pipeline touches into one
@@ -939,32 +1262,96 @@ pub fn ConversationView() -> Element {
             // clicks Start Turn.
             div { style: "display: flex; align-items: center; justify-content: space-between; gap: 1rem;",
                 h2 { style: "margin: 0;", "Conversation" }
-                div { class: "mode-switch", role: "group", aria_label: "Conversation input mode",
-                    button {
-                        class: if matches!(mode(), Mode::Voice) { "active" } else { "" },
-                        aria_pressed: matches!(mode(), Mode::Voice).to_string(),
-                        onclick: move |_| {
-                            if !matches!(mode(), Mode::Voice) {
-                                mode.set(Mode::Voice);
+                div { style: "display: flex; align-items: center; gap: 0.75rem;",
+                    // ¶ Reformat — runs `/format` over the most recent
+                    // user message in place. Disabled when streaming,
+                    // when no user message exists, when no model is
+                    // picked in Settings → Reformatting, or when the
+                    // Anthropic credential isn't configured. Spec §6.
+                    {
+                        let last_user_idx = messages()
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, m)| matches!(m.role, Role::User))
+                            .map(|(i, _)| i);
+                        let model_picked = !reformat_model_config_id().is_empty();
+                        let busy = matches!(
+                            status(),
+                            SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
+                        );
+                        let can = anthropic_configured()
+                            && model_picked
+                            && last_user_idx.is_some()
+                            && !busy;
+                        rsx! {
+                            button {
+                                class: "convo-send",
+                                disabled: !can,
+                                onclick: move |_| {
+                                    let idx = match last_user_idx {
+                                        Some(i) => i,
+                                        None => return,
+                                    };
+                                    let model = reformat_model_config_id.peek().clone();
+                                    let cred = reformat_credential.peek().clone();
+                                    let original = messages()[idx].content.clone();
+                                    let mut messages = messages;
+                                    let mut status_sig = status;
+                                    let prev_status = status_sig.peek().clone();
+                                    status_sig.set(SendStatus::Reformatting);
+                                    spawn_local(async move {
+                                        match reformat_single_turn(&original, &model, &cred).await
+                                        {
+                                            Some(out) => {
+                                                if let Some(formatted) = out.formatted {
+                                                    messages.with_mut(|m| {
+                                                        if let Some(msg) = m.get_mut(idx) {
+                                                            msg.content = formatted;
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                            None => {
+                                                web_sys::console::log_1(
+                                                    &"[parley] Reformat: no change or error".into(),
+                                                );
+                                            }
+                                        }
+                                        status_sig.set(prev_status);
+                                    });
+                                },
+                                "\u{00b6} Reformat"
                             }
-                        },
-                        "Voice"
+                        }
                     }
-                    button {
-                        class: if matches!(mode(), Mode::Type) { "active" } else { "" },
-                        aria_pressed: matches!(mode(), Mode::Type).to_string(),
-                        onclick: move |_| {
-                            if !matches!(mode(), Mode::Type) {
-                                // Stop any in-flight capture so the
-                                // mic releases immediately on the
-                                // mode flip.
-                                if matches!(*voice.state.peek(), VoiceState::Listening) {
-                                    voice.stop.call(());
+                    div { class: "mode-switch", role: "group", aria_label: "Conversation input mode",
+                        button {
+                            class: if matches!(mode(), Mode::Voice) { "active" } else { "" },
+                            aria_pressed: matches!(mode(), Mode::Voice).to_string(),
+                            onclick: move |_| {
+                                if !matches!(mode(), Mode::Voice) {
+                                    mode.set(Mode::Voice);
                                 }
-                                mode.set(Mode::Type);
-                            }
-                        },
-                        "Type"
+                            },
+                            "Voice"
+                        }
+                        button {
+                            class: if matches!(mode(), Mode::Type) { "active" } else { "" },
+                            aria_pressed: matches!(mode(), Mode::Type).to_string(),
+                            onclick: move |_| {
+                                if !matches!(mode(), Mode::Type) {
+                                    // Stop any in-flight capture so the
+                                    // mic releases immediately on the
+                                    // mode flip.
+                                    if matches!(*voice.state.peek(), VoiceState::Listening) {
+                                        voice.stop.call(());
+                                    }
+                                    mode.set(Mode::Type);
+                                }
+                            },
+                            "Type"
+                        }
                     }
                 }
             }
@@ -1243,12 +1630,20 @@ pub fn ConversationView() -> Element {
                         let new_persona = selected_persona.peek().clone();
                         let new_model = selected_model.peek().clone();
                         let credential = selected_credential.peek().clone();
+                        // Preserve the active TTS pick so the
+                        // persona-switch doesn't silently reset to the
+                        // ElevenLabs default. The endpoint defaults
+                        // tts_provider to "elevenlabs" when omitted.
+                        let tts_pick = crate::ui::pipeline::tts_provider();
+                        let voice_pick = crate::ui::pipeline::tts_voice_id();
                         status.set(SendStatus::Sending);
                         spawn_local(async move {
                             let body = match serde_json::to_string(&serde_json::json!({
                                 "persona_id": new_persona,
                                 "model_config_id": new_model,
                                 "credential": credential,
+                                "tts_provider": tts_pick,
+                                "voice_id": voice_pick,
                             })) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -1403,7 +1798,11 @@ pub fn ConversationView() -> Element {
                                                 src: "{PROXY_BASE}/conversation/tts/{tid_owned}/replay",
                                                 controls: true,
                                                 preload: "none",
-                                                style: "height: 1.6rem;",
+                                                // Browser-native audio bars are ~32-36px tall;
+                                                // anything smaller clips the play button + scrubber
+                                                // and makes the timeline unclickable. Cap height
+                                                // at the bar's natural size.
+                                                style: "height: 2.25rem;",
                                             }
                                         }
                                     }
@@ -1432,6 +1831,7 @@ pub fn ConversationView() -> Element {
                     div { style: "min-height: 1.25rem; margin-bottom: 0.5rem; font-size: 0.875rem; display: flex; gap: 1rem; align-items: center;",
                         match status() {
                             SendStatus::Idle => rsx! { span { style: "color: #8888aa;", "Ready" } },
+                            SendStatus::Reformatting => rsx! { span { style: "color: #c0c0d0;", "Cleaning up…" } },
                             SendStatus::Sending => rsx! { span { style: "color: #c0c0d0;", "Sending…" } },
                             SendStatus::Streaming => rsx! { span { style: "color: #4ecca3;", "Streaming…" } },
                             SendStatus::Failed(msg) => rsx! {
@@ -1481,9 +1881,16 @@ pub fn ConversationView() -> Element {
                     }
                     button {
                         class: "convo-send",
-                        disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                        disabled: matches!(
+                            status(),
+                            SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
+                        ),
                         onclick: move |_| submit_turn(handles),
-                        "Send"
+                        if matches!(status(), SendStatus::Reformatting) {
+                            "Cleaning up…"
+                        } else {
+                            "Send"
+                        }
                     }
                 }
             } else {
@@ -1520,7 +1927,10 @@ pub fn ConversationView() -> Element {
                         if matches!(*voice.state.read(), VoiceState::Listening | VoiceState::Finalizing) {
                             button {
                                 class: "convo-send",
-                                disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming)
+                                disabled: matches!(
+                                    status(),
+                                    SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
+                                )
                                     || matches!(*voice.state.read(), VoiceState::Finalizing),
                                 onclick: move |_| {
                                     // Force-end AssemblyAI; the
@@ -1530,14 +1940,25 @@ pub fn ConversationView() -> Element {
                                     // when the final text is ready.
                                     voice.stop.call(());
                                 },
-                                "Send Turn"
+                                if matches!(status(), SendStatus::Reformatting) {
+                                    "Cleaning up…"
+                                } else {
+                                    "Send Turn"
+                                }
                             }
                         } else {
                             button {
                                 class: "convo-send",
-                                disabled: matches!(status(), SendStatus::Sending | SendStatus::Streaming),
+                                disabled: matches!(
+                                    status(),
+                                    SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
+                                ),
                                 onclick: move |_| voice.start.call(()),
-                                "Start Turn"
+                                if matches!(status(), SendStatus::Reformatting) {
+                                    "Cleaning up…"
+                                } else {
+                                    "Start Turn"
+                                }
                             }
                         }
                         if let VoiceState::Error(msg) = &*voice.state.read() {
@@ -1580,12 +2001,14 @@ struct SendHandles {
     /// Voice input hook handle. Used by the consumer to trigger
     /// auto-listen after the AI's TTS playback finishes.
     voice: VoiceInputHandle,
-    /// The currently-attached live `MediaSourcePlayer`, if any.
-    /// `None` between turns and after Stop. Bubble UI consults
+    /// The currently-attached live [`TtsAudioSink`], if any.
+    /// `None` between turns and after Stop, plus during the brief
+    /// window between `TtsStarted` and the SSE `format` frame
+    /// (where the sink type isn't yet known). Bubble UI consults
     /// this (paired with `live_player_turn`) to decide whether
     /// to show live (Pause/Play/Stop) or replay (Play/Stop)
     /// controls.
-    live_player: Signal<Option<MediaSourcePlayer>>,
+    live_player: Signal<Option<TtsAudioSink>>,
     /// AI turn id the live player is bound to.
     live_player_turn: Signal<Option<String>>,
     /// Reactive playback state for the live player.
@@ -1903,9 +2326,9 @@ async fn consume_turn_response(
     mut available_sessions: Signal<Vec<SessionSummary>>,
     mode: Signal<Mode>,
     voice: VoiceInputHandle,
-    mut live_player: Signal<Option<MediaSourcePlayer>>,
-    mut live_player_turn: Signal<Option<String>>,
-    mut playback_status: Signal<PlaybackStatus>,
+    live_player: Signal<Option<TtsAudioSink>>,
+    live_player_turn: Signal<Option<String>>,
+    playback_status: Signal<PlaybackStatus>,
 ) {
     // `drain_sse` takes an `FnMut`, so the closure can capture
     // signal handles by value (they're Copy) and mutate them
@@ -1957,33 +2380,25 @@ async fn consume_turn_response(
             if turn_id.is_empty() {
                 return;
             }
-            // Replace any prior live player with a fresh one. The
-            // previous player (if it survived through to here)
-            // gets dropped, which detaches its audio element.
-            // Spec: `MediaSourcePlayer::stop` revokes the object
-            // URL so the browser reclaims the buffer.
+            // Replace any prior live sink with a fresh dispatch.
+            // The previous sink (if it survived through to here)
+            // gets stopped — for MP3 that detaches its audio
+            // element; for PCM that closes the AudioContext.
             if let Some(prev) = live_player.peek().clone() {
                 prev.stop();
             }
-            match MediaSourcePlayer::new() {
-                Ok(player) => {
-                    let player_for_task = player.clone();
-                    let tid_for_task = turn_id.clone();
-                    spawn_local(async move {
-                        consume_tts_stream(tid_for_task, player_for_task).await;
-                    });
-                    let _ = player.play();
-                    live_player.set(Some(player));
-                    live_player_turn.set(Some(turn_id));
-                    playback_status.set(PlaybackStatus::Playing);
-                    *had_tts_inner.borrow_mut() = true;
-                }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!("MediaSourcePlayer::new failed: {e:?}").into(),
-                    );
-                }
-            }
+            // Defer sink construction to `consume_tts_stream`,
+            // which reads the proxy's leading `format` SSE frame
+            // and picks MediaSource (MP3) or Web Audio (PCM)
+            // accordingly. Spec
+            // `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+            let lp = live_player;
+            let lpt = live_player_turn;
+            let ps = playback_status;
+            spawn_local(async move {
+                consume_tts_stream(turn_id, lp, lpt, ps).await;
+            });
+            *had_tts_inner.borrow_mut() = true;
         }
         WireEvent::TtsFinished { .. } | WireEvent::TtsSentenceDone { .. } => {
             // Synthesis-side bookkeeping; playback continues
@@ -2031,50 +2446,60 @@ async fn consume_turn_response(
         }
     }
 
-    // ── Auto-listen handoff ─────────────────────────────────
-    // Skip when the turn failed (don't barge on the user with
-    // an open mic on top of an error banner) or when the user
-    // is in Type mode.
+    // ── End-of-turn cleanup + (Voice-mode) auto-listen handoff ─
+    //
+    // Independent of mode, we wire an `on_ended` hook on the live
+    // sink so that — once the audio finishes draining — the UI
+    // demotes from live controls (Pause/Play/Stop on a sink that
+    // has nothing left to play) to the historical replay bar
+    // (`<audio src=…/replay>`). Without this, Type-mode turns left
+    // the live controls visible forever and clicking Play on a
+    // played-out sink was silent (the MP3 audio element's
+    // currentTime sits at duration; the PCM sink's buffer queue
+    // is empty). Spec: `docs/conversation-mode-spec.md` §7.2.
+    //
+    // Auto-listen (re-opening the mic for the next user turn) is
+    // still gated on Voice mode and only happens after the audio
+    // has drained.
     let is_voice = matches!(*mode.peek(), Mode::Voice);
     let failed = failure.borrow().is_some();
-    if failed || !is_voice {
-        return;
-    }
+
     if *had_tts.borrow() {
-        // Defer auto-listen until the audio element fires its
-        // `ended` event. The `MediaSourcePlayer::on_ended` hook
-        // also flips `playback_status` back to `Idle` so the
-        // bubble UI demotes from live controls to a replay
-        // button.
         if let Some(player) = live_player.peek().clone() {
-            voice.start.call(());
+            // Voice mode: open the mic now (in parallel with the
+            // remaining TTS audio) so the user can speak the
+            // moment the AI finishes — not after a perceptible
+            // gap while we wait for the playback driver to
+            // schedule the start.
+            if is_voice && !failed {
+                voice.start.call(());
+            }
             let cb_voice = voice;
-            // Replace any previous on_ended; the closure clears
-            // the live player slot too so the UI picks up the
-            // transition. Signals are `Copy`, so we shadow with
-            // local `mut` bindings inside the closure body —
-            // `Fn` closures can't borrow their captures mutably,
-            // but they can copy them on each invocation.
             let lp = live_player;
             let lpt = live_player_turn;
             let ps = playback_status;
             player.on_ended(Box::new(move || {
+                // Signals are `Copy`; shadow as `mut` locally so
+                // the `Fn` closure can re-set them on each
+                // invocation without borrowing mutably.
                 let mut lp = lp;
                 let mut lpt = lpt;
                 let mut ps = ps;
                 lp.set(None);
                 lpt.set(None);
                 ps.set(PlaybackStatus::Idle);
-                cb_voice.start.call(());
+                if is_voice && !failed {
+                    cb_voice.start.call(());
+                }
             }));
-        } else {
+        } else if is_voice && !failed {
             // Edge case: TtsStarted never fired (synthesis
             // failed before the first audio chunk). Trigger
             // auto-listen anyway so the user isn't stuck
             // waiting for audio that won't come.
             voice.start.call(());
         }
-    } else {
+    } else if is_voice && !failed {
         // TTS off (no provider configured). The AI turn just
         // landed; pick up the mic immediately.
         voice.start.call(());

@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use parley_core::conversation::TurnId;
 use tokio::sync::broadcast;
 
+use super::AudioFormat;
+
 /// One frame published to the live audio channel for a turn.
 #[derive(Debug, Clone)]
 pub enum TtsBroadcastFrame {
@@ -63,11 +65,20 @@ pub enum TtsBroadcastFrame {
 /// doesn't drop frames before the subscriber catches up.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Registry entry for one live turn: the broadcast channel plus
+/// the [`AudioFormat`] subscribers should announce to their clients
+/// before relaying audio frames.
+#[derive(Clone)]
+struct HubEntry {
+    tx: broadcast::Sender<TtsBroadcastFrame>,
+    format: AudioFormat,
+}
+
 /// Registry of live per-turn TTS broadcasts. Cheap to clone (`Arc`
 /// internally); the orchestrator and the HTTP layer share one.
 #[derive(Clone, Default)]
 pub struct TtsHub {
-    inner: Arc<Mutex<HashMap<TurnId, broadcast::Sender<TtsBroadcastFrame>>>>,
+    inner: Arc<Mutex<HashMap<TurnId, HubEntry>>>,
 }
 
 impl TtsHub {
@@ -76,17 +87,25 @@ impl TtsHub {
         Self::default()
     }
 
-    /// Open a broadcast channel for `turn_id`. Returns a
-    /// [`TtsBroadcaster`] that publishes into it. If a channel
-    /// already exists for `turn_id` (e.g. a stale entry from a
-    /// crash or a retry), it is replaced — late subscribers to the
-    /// old channel will see no further frames but won't error.
-    pub fn open(&self, turn_id: TurnId) -> TtsBroadcaster {
+    /// Open a broadcast channel for `turn_id` declaring `format`.
+    /// Returns a [`TtsBroadcaster`] that publishes into it. The
+    /// declared format is exposed via [`Self::format_for`] so SSE
+    /// subscribers can emit a leading `format` frame to the browser
+    /// before relaying audio. Spec:
+    /// `docs/cartesia-sonic-3-integration-spec.md` §6.4.
+    ///
+    /// If a channel already exists for `turn_id` (e.g. a stale entry
+    /// from a crash or a retry), it is replaced — late subscribers
+    /// to the old channel will see no further frames but won't error.
+    pub fn open(&self, turn_id: TurnId, format: AudioFormat) -> TtsBroadcaster {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
-        self.inner
-            .lock()
-            .expect("tts hub mutex poisoned")
-            .insert(turn_id.clone(), tx.clone());
+        self.inner.lock().expect("tts hub mutex poisoned").insert(
+            turn_id.clone(),
+            HubEntry {
+                tx: tx.clone(),
+                format,
+            },
+        );
         TtsBroadcaster {
             turn_id,
             tx,
@@ -102,7 +121,17 @@ impl TtsHub {
             .lock()
             .expect("tts hub mutex poisoned")
             .get(turn_id)
-            .map(|tx| tx.subscribe())
+            .map(|e| e.tx.subscribe())
+    }
+
+    /// Return the [`AudioFormat`] the broadcaster is producing for
+    /// `turn_id`. `None` when no live broadcast exists.
+    pub fn format_for(&self, turn_id: &str) -> Option<AudioFormat> {
+        self.inner
+            .lock()
+            .expect("tts hub mutex poisoned")
+            .get(turn_id)
+            .map(|e| e.format)
     }
 
     /// `true` when a live broadcast is registered for `turn_id`.
@@ -120,7 +149,7 @@ impl TtsHub {
 pub struct TtsBroadcaster {
     turn_id: TurnId,
     tx: broadcast::Sender<TtsBroadcastFrame>,
-    hub: Arc<Mutex<HashMap<TurnId, broadcast::Sender<TtsBroadcastFrame>>>>,
+    hub: Arc<Mutex<HashMap<TurnId, HubEntry>>>,
 }
 
 impl TtsBroadcaster {
@@ -161,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn open_then_subscribe_receives_frames_in_order() {
         let hub = TtsHub::new();
-        let bcast = hub.open("turn-0001".into());
+        let bcast = hub.open("turn-0001".into(), AudioFormat::Mp3_44100_128);
         let mut rx = hub.subscribe("turn-0001").expect("live");
         bcast.send(TtsBroadcastFrame::Audio {
             bytes: vec![1, 2, 3],
@@ -208,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn finish_removes_entry_from_hub() {
         let hub = TtsHub::new();
-        let bcast = hub.open("turn-0001".into());
+        let bcast = hub.open("turn-0001".into(), AudioFormat::Mp3_44100_128);
         assert!(hub.is_live("turn-0001"));
         bcast.finish();
         assert!(!hub.is_live("turn-0001"));
@@ -218,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn fail_emits_error_frame_and_removes() {
         let hub = TtsHub::new();
-        let bcast = hub.open("turn-0001".into());
+        let bcast = hub.open("turn-0001".into(), AudioFormat::Mp3_44100_128);
         let mut rx = hub.subscribe("turn-0001").expect("live");
         bcast.fail("nope".into());
         match rx.recv().await.unwrap() {
@@ -230,14 +259,21 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_broadcaster_without_finish_keeps_entry() {
-        // We deliberately don't auto-finish on drop — the
-        // orchestrator only ever drops the broadcaster via
-        // `finish` or `fail`. This test pins that contract so a
-        // future Drop impl is a deliberate decision.
         let hub = TtsHub::new();
         {
-            let _bcast = hub.open("turn-0001".into());
+            let _bcast = hub.open("turn-0001".into(), AudioFormat::Mp3_44100_128);
         }
         assert!(hub.is_live("turn-0001"));
+    }
+
+    #[tokio::test]
+    async fn format_for_returns_declared_format() {
+        let hub = TtsHub::new();
+        let _bcast = hub.open("turn-0001".into(), AudioFormat::Pcm_S16LE_44100_Mono);
+        assert_eq!(
+            hub.format_for("turn-0001"),
+            Some(AudioFormat::Pcm_S16LE_44100_Mono)
+        );
+        assert_eq!(hub.format_for("missing"), None);
     }
 }

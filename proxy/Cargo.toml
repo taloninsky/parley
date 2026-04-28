@@ -20,6 +20,8 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

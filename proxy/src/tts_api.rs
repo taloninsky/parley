@@ -22,7 +22,8 @@ use crate::providers::{ProviderId, UnknownProvider};
 use crate::secrets::SecretsManager;
 use crate::tts::xai::XaiTts;
 use crate::tts::{
-    AudioFormat, ElevenLabsTts, SynthesisContext, TtsChunk, TtsError, TtsProvider, TtsRequest,
+    AudioFormat, CartesiaTts, ElevenLabsTts, SynthesisContext, TtsChunk, TtsError, TtsProvider,
+    TtsRequest,
 };
 
 /// Shared state for the TTS API router.
@@ -96,6 +97,7 @@ async fn synthesize(
     let provider: Box<dyn TtsProvider> = match provider_id {
         ProviderId::Xai => Box::new(XaiTts::new(api_key, state.client.clone())),
         ProviderId::ElevenLabs => Box::new(ElevenLabsTts::new(api_key, state.client.clone())),
+        ProviderId::Cartesia => Box::new(CartesiaTts::new(api_key, state.client.clone())),
         other => {
             return bad_request(
                 "unsupported_provider_for_tts",
@@ -172,6 +174,7 @@ async fn voices(
     let provider: Box<dyn TtsProvider> = match provider_id {
         ProviderId::Xai => Box::new(XaiTts::new(api_key, state.client.clone())),
         ProviderId::ElevenLabs => Box::new(ElevenLabsTts::new(api_key, state.client.clone())),
+        ProviderId::Cartesia => Box::new(CartesiaTts::new(api_key, state.client.clone())),
         other => {
             return bad_request(
                 "unsupported_provider_for_tts",
@@ -193,9 +196,7 @@ async fn voices(
 }
 
 fn audio_format_str(f: AudioFormat) -> &'static str {
-    match f {
-        AudioFormat::Mp3_44100_128 => "mp3_44100_128",
-    }
+    f.tag()
 }
 
 // ── response helpers ──────────────────────────────────────────────────

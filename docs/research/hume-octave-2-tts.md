@@ -17,7 +17,11 @@
 
 Hume Octave 2 is worth adding to the TTS shortlist, but I would not make it the default provider yet.
 
-Its best fit is **expressive, emotionally aware persona speech**: coaching, roleplay, narrative assistant responses, and any Parley mode where delivery quality matters more than raw cost. It is less compelling as the default low-cost conversational TTS provider because the public pricing is materially higher than xAI and ElevenLabs, Octave 2 is still marked preview, and some of the most interesting control surfaces are not fully available on Octave 2 yet.
+Its best fit is **expressive, emotionally aware persona speech**: coaching, roleplay, narrative assistant responses, and any Parley mode where delivery quality matters more than raw cost. It is less compelling as the default low-cost conversational TTS provider for three reasons that materially affect default-provider eligibility:
+
+- Public pricing is higher than xAI and ElevenLabs.
+- Octave 2 is still marked preview.
+- Octave 2 is missing pieces of its expressive control surface (natural-language `description` acting instructions and multilingual voice design are documented as coming soon).
 
 The right next move is a small `HumeTts` spike behind the existing `TtsProvider` trait, using a fixed saved voice, `version: "2"`, streaming output, and a measured TTFA/listening comparison against ElevenLabs, xAI, and Gradium.
 
@@ -36,7 +40,7 @@ Octave 2 is the current preview generation. Public docs and launch material stat
 | Non-streaming modes | JSON with base64 audio, file response |
 | Output formats | MP3, WAV, PCM |
 | Voice library | 100+ Hume voices plus account custom voices |
-| Voice cloning | Available by tier; guided recording flow usually under 30 seconds; docs and launch copy cite 15 seconds of audio for high-quality clones |
+| Voice cloning | Available by tier; Hume documents high-quality clones from as little as 15 seconds of audio |
 | Voice design | Octave 1 voice design creates voices compatible with Octave 2; Octave 2 multilingual voice design is still coming |
 | Acting instructions | `speed` and `trailing_silence` work across models; natural-language `description` acting instructions are Octave 1-only as of the docs, with Octave 2 support coming |
 | Timestamps | Octave 2 supports word and phoneme timestamps through `include_timestamp_types` |
@@ -62,7 +66,7 @@ Request fields that matter for Parley:
 | `version` | Set to `"2"` to opt into Octave 2. Octave 2 requests require a `voice`. |
 | `utterances[].text` | Max 5,000 characters per utterance. Parley's sentence/paragraph chunking already keeps below this. |
 | `utterances[].voice` | Voice may be referenced by `id`, or by `name` plus `provider` (`HUME_AI` or `CUSTOM_VOICE`). |
-| `utterances[].description` | Strong expressive control in Octave 1; Octave 2 support is documented as coming soon. Do not depend on it for Octave 2 v1. |
+| `utterances[].description` | Strong expressive control in Octave 1; Octave 2 support is documented as coming soon. Max 1,000 characters per utterance. Do not depend on it for Octave 2 v1. |
 | `utterances[].speed` | Nonlinear scale from `0.5` to `2.0`. Works across models. |
 | `utterances[].trailing_silence` | Adds silence after an utterance. Works across models. |
 | `context` | Can reference a previous `generation_id` or context utterances to preserve prosody/continuity. Hume warns this can increase generation time. |
@@ -85,63 +89,43 @@ Request fields that matter for Parley:
 - **Public pricing is premium.** The pricing page lists overage at `$0.15 / 1,000` characters on Creator, `$0.12 / 1,000` on Pro, `$0.10 / 1,000` on Scale, and `$0.05 / 1,000` on Business. Included subscription characters reduce effective cost, but Hume is still a premium provider compared with the current ElevenLabs cost constant and the xAI pricing captured in [xai-speech-integration-spec.md](../xai-speech-integration-spec.md).
 - **Octave 2 is preview.** Treat API behavior and quality claims as spike inputs, not settled production assumptions.
 - **Octave 2 expressive controls are not fully landed.** Natural-language `description` acting instructions are documented as Octave 1-only for now. Octave 2 can still infer delivery and supports speed/silence, but the provider-native expression translation layer should wait for a verified Octave 2 control surface.
-- **No Rust SDK is advertised.** Hume has TypeScript, Python, .NET, Swift, CLI, and examples. A Rust adapter is still straightforward with `reqwest` and a WebSocket client, but we do not get Gradium's `gradium-rs` advantage.
+- **No Rust SDK is advertised.** Hume publishes TypeScript, Python, and .NET SDKs plus a CLI and open-source examples; no Rust SDK as of 2026-04-26. A Rust adapter is still straightforward with `reqwest` and a WebSocket client, but we do not get Gradium's `gradium-rs` advantage.
 - **Voice cloning and conversion require consent handling.** Parley should not expose clone/conversion workflows until the UI can capture and store explicit user consent/provenance.
 
 ## Provider Comparison
 
 | Provider | Best reason to use | Parley status | Main concern |
 | --- | --- | --- | --- |
-| ElevenLabs | Already implemented; stable streaming MP3 path | Current `TtsProvider` | Current default model intentionally disables expressive tags; continuity is only partially wired. |
-| xAI Speech | Cheap unified STT/TTS vendor, strong fit with existing xAI spec | Specified in [xai-speech-integration-spec.md](../xai-speech-integration-spec.md) | New API; quality and protocol details need implementation spike. |
-| Gradium | Lowest-latency voice-agent path, Rust SDK, strong full-duplex research pedigree | Researched in [voice-agents.md](voice-agents.md) | Less transcript-rich for STT; TTS provider still needs implementation and cost validation. |
-| Hume Octave 2 | Most compelling expressive/persona voice candidate; timestamps and continuation are attractive | New candidate | Premium pricing, preview status, and Octave 2 control-surface gaps. |
+| ElevenLabs | Already implemented; stable streaming MP3 path | Implemented | Current default model intentionally disables expressive tags; continuity is only partially wired. |
+| xAI Speech | Cheap unified STT/TTS vendor, strong fit with existing xAI spec | Specified, not implemented ([xai-speech-integration-spec.md](../xai-speech-integration-spec.md)) | New API; quality and protocol details need implementation spike. |
+| Gradium | Lowest-latency voice-agent path, Rust SDK, strong full-duplex research pedigree | Researched only ([voice-agents.md](voice-agents.md)) | Less transcript-rich for STT; TTS provider still needs implementation and cost validation. |
+| Hume Octave 2 | Most compelling expressive/persona voice candidate; timestamps and continuation are attractive | Researched only (this doc) | Premium pricing, preview status, and Octave 2 control-surface gaps. |
 
-## Integration Sketch
+## Integration Direction
 
-### Minimal Adapter
+This section is intentionally directional. The implementation contract — file paths, request fields, error codes, test cases, trait changes — lives in [hume-octave-2-tts-integration-spec.md](../hume-octave-2-tts-integration-spec.md). The points below describe what kind of integration is feasible and what the API surface implies; they are not a build plan.
 
-1. Add `ProviderId::Hume` in `proxy/src/providers.rs` with env var `PARLEY_HUME_API_KEY`.
-2. Add `proxy/src/tts/hume.rs` implementing `TtsProvider`.
-3. Use `POST /v0/tts/stream/file` first:
-   - `version: "2"`
-   - `instant_mode: true`
-   - `num_generations: 1`
-   - one `utterances` item per Parley chunk
-   - fixed saved voice by ID
-   - MP3 format
-4. Return `TtsChunk::Audio(bytes)` for response chunks and `TtsChunk::Done { characters }` at EOF.
-5. Set `supports_expressive_tags()` to `false` initially. Hume's inline `[pause]` support is not the same as ElevenLabs v3 tag syntax, and Octave 2 natural-language acting instructions need verification.
-6. Add mock HTTP tests matching the ElevenLabs adapter pattern.
+- **Phase 1 (feasible against today's trait):** a minimal adapter using `POST /v0/tts/stream/file` with a fixed saved voice, Octave 2, and instant mode. Treats Hume as a generic streaming MP3 source and forwards bytes through the existing pipeline. Does not require trait changes.
+- **Phase 2 (better fit):** move to `POST /v0/tts/stream/json` to capture `generation_id` for continuation and optional word/phoneme timestamps. This requires the trait to carry per-chunk metadata and provider continuation state — Parley's current stream is bytes plus a terminal character count.
+- **Phase 3 (later):** `wss://api.hume.ai/v0/tts/stream/input` becomes interesting only when Parley streams LLM deltas directly into TTS instead of dispatching per sentence. The current orchestrator, cache, and SSE player are shaped around chunked HTTP synthesis, so WebSocket should not be the first implementation.
 
-### Likely Trait Changes
-
-Hume exposes useful features that the current trait cannot represent cleanly:
-
-| Needed change | Why |
-| --- | --- |
-| Add audio format variants or make `AudioFormat` structured | Hume examples return MP3 at 48 kHz by default; Parley currently only models `Mp3_44100_128`. |
-| Add provider-specific voice reference shape | Hume voices can be `{ id }` or `{ name, provider }`; `voice_id: String` is enough for a spike but too narrow for UI. |
-| Let `Done` carry provider continuation state | Hume continuation wants a prior `generation_id`; the current `ProviderContinuationState` can be passed in but not returned. |
-| Support metadata-bearing audio streams | Streamed JSON carries audio plus timestamps; Parley's current stream only carries raw audio and a terminal character count. |
-| Replace boolean `supports_expressive_tags()` with provider expression capabilities | Hume style prompts, xAI/ElevenLabs tags, SSML, and speed/silence controls are different native targets. |
-
-### Better Adapter After Minimal Spike
-
-Use `POST /v0/tts/stream/json` instead of streamed file. Decode base64 audio chunks into `TtsChunk::Audio`, capture `generation_id` for continuation, and optionally capture word/phoneme timestamps for future highlighting. This is the adapter shape that actually takes advantage of Hume rather than treating it as generic MP3 TTS.
-
-### WebSocket Adapter Later
-
-`wss://api.hume.ai/v0/tts/stream/input` becomes interesting when Parley moves from sentence-level HTTP dispatch to streaming LLM deltas directly into TTS. That should not be the first implementation because Parley's current orchestrator, cache, and SSE player are already shaped around chunked HTTP synthesis.
+Hume exercises corners of the abstraction that ElevenLabs has not. The integration spec captures the trait-evolution decisions; the only research-level claim here is that **Hume cannot be cleanly represented at full fidelity by the current `TtsProvider` trait** — specifically around audio format variants, voice reference shape, returned continuation state, metadata-bearing streams, and a richer expressive-capability signal than a single boolean.
 
 ## Validation Plan
 
+Each test names what would be observed and which result would change the recommendation. A research spike that does not pre-commit to falsifiers tends to confirm whatever the author already believed.
+
 1. **Credential/voice setup:** create or select one saved Hume voice compatible with Octave 2; record the voice ID and provider.
 2. **Latency spike:** measure TTFA and full-sentence completion for `stream/file`, `stream/json`, and WebSocket from the dev environment. Compare against ElevenLabs, xAI, and Gradium using the same text.
+   - *Falsifier:* if median TTFA exceeds **600 ms** from the dev region on `stream/file` with instant mode, drop Hume from the conversational shortlist and keep it only as a non-interactive narration candidate.
 3. **Listening test:** run the same assistant responses through all candidate providers. Include neutral explanation, empathetic response, mild humor, urgent instruction, and multi-sentence narrative.
+   - *Falsifier:* if Hume does not measurably outperform ElevenLabs and xAI on the empathetic and narrative samples in a blind comparison, the premium-expression positioning fails and there is no reason to add a third TTS provider.
 4. **Continuity test:** synthesize a paragraph split into sentence chunks with and without Hume `context`. Listen for prosody jumps and measure latency overhead.
+   - *Falsifier:* if `context` adds more than **200 ms** to per-chunk TTFA without an audible continuity benefit, the Phase 2 adapter loses its main reason to exist and Phase 1 becomes the ceiling.
 5. **Timestamp test:** request `include_timestamp_types: ["word"]` and verify whether returned timings are stable enough for read-along highlighting.
+   - *Falsifier:* if word timestamps drift by more than ~50 ms against perceived audio in informal review, defer the read-along highlighting use case rather than pinning it to Hume.
 6. **Cost sanity check:** compute effective per-turn cost against representative Parley assistant responses, not just vendor list prices.
+   - *Falsifier:* if effective per-turn cost on the Pro tier exceeds **3x** the projected xAI cost for the same turns, Hume is not a credible default candidate even after quality wins.
 
 ## Recommendation
 
@@ -155,3 +139,13 @@ For near-term Parley development, Hume is best framed as:
 - a provider to evaluate once the TTS trait grows beyond raw bytes and character counts.
 
 I would prioritize xAI for low-cost default TTS, Gradium for low-latency full-duplex experiments, and Hume for the question: "Can Parley's AI voice sound emotionally intentional instead of merely readable?"
+
+## Sources
+
+Verified 2026-04-26.
+
+- [Hume TTS Overview](https://dev.hume.ai/docs/text-to-speech-tts/overview) — Octave 1 vs Octave 2 capability matrix (languages, latency, voice cloning, voice design, acting instructions, continuation, timestamps), streaming/non-streaming endpoint list, instant mode behavior, and API limits (5,000 char text per utterance, 1,000 char description per utterance, 5 generations per request, MP3/WAV/PCM formats).
+- [Hume Pricing](https://www.hume.ai/pricing) — overage rates `$0.15`, `$0.12`, `$0.10`, `$0.05` per 1,000 characters across Creator, Pro, Scale, Business; included character allowances per tier.
+- [Hume SDKs (intro)](https://dev.hume.ai/intro#sdks) — published SDKs are TypeScript, Python, .NET, plus a CLI; no Rust SDK as of this date.
+- [Hume Continuation guide](https://dev.hume.ai/docs/text-to-speech-tts/continuation) — `context` and `generation_id` model for prosodic continuity across requests.
+- [Hume Voice Cloning](https://dev.hume.ai/docs/voice/voice-cloning) — high-quality clones from as little as 15 seconds of audio.
