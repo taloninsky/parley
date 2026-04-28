@@ -226,8 +226,20 @@ async fn check_formatting(
 
         let input_tokens = parsed["input_tokens"].as_u64().unwrap_or(0);
         let output_tokens = parsed["output_tokens"].as_u64().unwrap_or(0);
+        let changed = parsed["changed"].as_bool().unwrap_or(false);
+        let formatted_len = parsed["formatted"].as_str().map(str::len).unwrap_or(0);
+        let formatted_has_break = parsed["formatted"]
+            .as_str()
+            .map(|formatted| formatted.contains("\n\n"))
+            .unwrap_or(false);
+        web_sys::console::log_1(
+            &format!(
+                "[parley] Reformat response: changed={changed}, formatted_len={formatted_len}, formatted_has_break={formatted_has_break}, input_tokens={input_tokens}, output_tokens={output_tokens}",
+            )
+            .into(),
+        );
 
-        if !parsed["changed"].as_bool().unwrap_or(false) {
+        if !changed {
             web_sys::console::log_1(&"[parley] Reformat: no changes needed".into());
             return Some(FormatResult {
                 formatted: None,

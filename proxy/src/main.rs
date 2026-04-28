@@ -41,6 +41,7 @@ struct AppState {
     client: reqwest::Client,
     secrets: Arc<SecretsManager>,
     soniox_temporary_api_key_url: String,
+    anthropic_messages_url: String,
     /// Registry view shared with the conversation API. The `/format`
     /// handler looks up `model_config_id` here to resolve the
     /// provider tag + raw model name. See
@@ -279,11 +280,16 @@ paragraph, the answer is ALWAYS "changed": true.
 
 What you fix:
 1. PARAGRAPH BREAKS — break the text into paragraphs at every clear
-   boundary. Boundaries include speaker transitions (see multi-speaker
-   rules below when present), the start of a new topic, a long pause, or
-   a clear shift in subject. Long monologues from a single speaker SHOULD
-   be split into multiple paragraphs at topic boundaries. A single
-   paragraph longer than ~5 sentences is almost always wrong.
+    boundary. Boundaries include speaker transitions (see multi-speaker
+    rules below when present), the start of a new topic, a long pause, or
+    a clear shift in subject. Paragraphing is semantic: split when the
+    speaker moves from one subject of discussion to another, starts a new
+    line of reasoning, changes from background to conclusion/action items,
+    or uses transition phrases such as "moving on", "another thing", "the
+    next thing", "on a different note", or "switching topics". Long
+    monologues from a single speaker SHOULD be split into multiple
+    paragraphs at topic boundaries. A single paragraph longer than ~5
+    sentences is almost always wrong.
 2. PUNCTUATION & CAPITALIZATION — add or remove commas, periods, question
    marks, exclamation marks, semicolons, colons, and em-dashes when context
    makes the correct punctuation clear. Capitalize the first word of each
@@ -442,7 +448,7 @@ async fn format_text(
     // for paragraph splits at speaker boundaries.
     let multi_speaker = body.multi_speaker || input_has_speaker_tags(&body.text);
 
-    let system_prompt = if multi_speaker {
+    let mut system_prompt = if multi_speaker {
         format!(
             "{}\n\n\
             ADDITIONAL RULES FOR MULTI-SPEAKER DIALOG:\n\
@@ -482,6 +488,18 @@ async fn format_text(
         FORMAT_SYSTEM_PROMPT.to_string()
     };
 
+    if likely_needs_paragraph_split(&body.text) {
+        system_prompt.push_str(
+            "\n\nREQUEST-SPECIFIC PARAGRAPH REQUIREMENT:\n\
+            The EDITABLE text is a long single paragraph. Returning \
+            {\"changed\": false} is invalid for this request. You MUST return \
+            {\"changed\": true, \"formatted\": \"...\"} and insert paragraph \
+            breaks at the best semantic boundaries you can infer from the \
+            content. Preserve every spoken word in order; only change \
+            punctuation, capitalization, and whitespace.",
+        );
+    }
+
     eprintln!(
         "[proxy] /format dispatching to model={} multi_speaker={} (resolved)",
         model_name, multi_speaker,
@@ -510,7 +528,7 @@ async fn format_text(
     });
 
     let resp = match client
-        .post(ANTHROPIC_MESSAGES_URL)
+        .post(&state.anthropic_messages_url)
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -580,8 +598,26 @@ async fn format_text(
                     // Server-side validation: reject if the formatter changed
                     // the canonical letter sequence (see `letter_sequence`).
                     if let Some(formatted) = parsed["formatted"].as_str() {
+                        let mut final_formatted = formatted.to_string();
+                        if let Some(with_breaks) =
+                            apply_safe_structural_fallback(&final_formatted, multi_speaker)
+                        {
+                            eprintln!(
+                                "[proxy] formatter output still lacked obvious structural breaks — applying safe fallback"
+                            );
+                            final_formatted = with_breaks;
+                        }
+                        if likely_needs_paragraph_split(&final_formatted)
+                            && let Some(with_breaks) = insert_readability_breaks(&final_formatted)
+                        {
+                            eprintln!(
+                                "[proxy] formatter output still looked like one long paragraph — applying readability fallback"
+                            );
+                            final_formatted = with_breaks;
+                        }
+
                         let orig_letters = letter_sequence(&body.text);
-                        let fmt_letters = letter_sequence(formatted);
+                        let fmt_letters = letter_sequence(&final_formatted);
                         if orig_letters != fmt_letters {
                             eprintln!(
                                 "[proxy] formatter changed letters — rejecting response \
@@ -589,6 +625,22 @@ async fn format_text(
                                 orig_letters.len(),
                                 fmt_letters.len(),
                             );
+                            if let Some(formatted) =
+                                apply_deterministic_formatting_fallback(&body.text, multi_speaker)
+                            {
+                                eprintln!(
+                                    "[proxy] rejected formatter text still needed structure — applying deterministic fallback"
+                                );
+                                return (
+                                    StatusCode::OK,
+                                    Json(serde_json::json!({
+                                        "changed": true,
+                                        "formatted": formatted,
+                                        "input_tokens": input_tokens,
+                                        "output_tokens": output_tokens,
+                                    })),
+                                );
+                            }
                             return (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
@@ -603,13 +655,20 @@ async fn format_text(
                         // boundaries — log a one-line diagnostic so we can
                         // observe how often this is firing in practice.
                         let orig_words = body.text.split_whitespace().count();
-                        let fmt_words = formatted.split_whitespace().count();
+                        let fmt_words = final_formatted.split_whitespace().count();
                         if orig_words != fmt_words {
                             eprintln!(
                                 "[proxy] formatter merged/split tokens \
                                  (orig {orig_words} words → fmt {fmt_words} words)"
                             );
                         }
+                        let final_changed = changed || final_formatted != body.text;
+                        let mut result = parsed;
+                        result["changed"] = serde_json::json!(final_changed);
+                        result["formatted"] = serde_json::json!(final_formatted);
+                        result["input_tokens"] = serde_json::json!(input_tokens);
+                        result["output_tokens"] = serde_json::json!(output_tokens);
+                        return (StatusCode::OK, Json(result));
                     } else if !changed {
                         // The formatter returned `{"changed": false}`.
                         // Surface a one-line diagnostic flagging the
@@ -619,18 +678,67 @@ async fn format_text(
                         // always needs at least a paragraph split.
                         let speaker_tags = input_has_speaker_tags(&body.text);
                         let has_paragraph_break = body.text.contains("\n\n");
+                        let likely_split_needed = likely_needs_paragraph_split(&body.text);
                         let suspicious = speaker_tags && !has_paragraph_break;
                         eprintln!(
                             "[proxy] formatter declined to change anything \
                              ({} chars, multi_speaker={multi_speaker}, \
                              speaker_tags={speaker_tags}, \
-                             has_paragraph_break={has_paragraph_break}{})",
+                             has_paragraph_break={has_paragraph_break}, \
+                             likely_split_needed={likely_split_needed}{})",
                             body.text.len(),
                             if suspicious {
                                 ", SUSPICIOUS: speaker tags but no paragraph break"
                             } else {
                                 ""
                             },
+                        );
+                        if let Some(formatted) =
+                            apply_safe_structural_fallback(&body.text, multi_speaker)
+                        {
+                            eprintln!(
+                                "[proxy] formatter declined an obvious structural split — applying safe fallback"
+                            );
+                            return (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "changed": true,
+                                    "formatted": formatted,
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                })),
+                            );
+                        }
+                        if likely_split_needed
+                            && let Some(formatted) = insert_readability_breaks(&body.text)
+                        {
+                            eprintln!(
+                                "[proxy] formatter declined a long single paragraph — applying readability fallback"
+                            );
+                            return (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "changed": true,
+                                    "formatted": formatted,
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                })),
+                            );
+                        }
+                    } else if let Some(formatted) =
+                        apply_deterministic_formatting_fallback(&body.text, multi_speaker)
+                    {
+                        eprintln!(
+                            "[proxy] formatter response omitted formatted text — applying deterministic fallback"
+                        );
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "changed": true,
+                                "formatted": formatted,
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                            })),
                         );
                     }
                     // Merge token usage into the response
@@ -640,8 +748,23 @@ async fn format_text(
                     (StatusCode::OK, Json(result))
                 }
                 Err(_) => {
-                    // Haiku returned invalid JSON — treat as no change
                     eprintln!("[proxy] Haiku returned invalid JSON: {full_json}");
+                    if let Some(formatted) =
+                        apply_deterministic_formatting_fallback(&body.text, multi_speaker)
+                    {
+                        eprintln!(
+                            "[proxy] invalid formatter JSON — applying deterministic fallback"
+                        );
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "changed": true,
+                                "formatted": formatted,
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                            })),
+                        );
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({
@@ -691,6 +814,388 @@ fn input_has_speaker_tags(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Insert paragraph breaks only at boundaries that are structurally obvious
+/// and preserve the canonical letter sequence. This is a safety net for the
+/// formatter's conservative failure mode: if the model returns `changed:false`
+/// or emits punctuation without splitting, the proxy can still honor hard
+/// speaker transitions and explicit topic-shift phrases without inventing or
+/// deleting words.
+fn apply_safe_structural_fallback(text: &str, multi_speaker: bool) -> Option<String> {
+    let mut formatted = text.to_string();
+
+    if multi_speaker || input_has_speaker_tags(text) {
+        formatted = insert_breaks_before_inline_markers(&formatted);
+    }
+
+    formatted = insert_breaks_before_topic_shift_cues(&formatted);
+
+    (formatted != text).then_some(formatted)
+}
+
+fn apply_deterministic_formatting_fallback(text: &str, multi_speaker: bool) -> Option<String> {
+    let mut formatted = text.to_string();
+
+    if let Some(with_breaks) = apply_safe_structural_fallback(&formatted, multi_speaker) {
+        formatted = with_breaks;
+    }
+
+    if let Some(with_breaks) = insert_readability_breaks(&formatted) {
+        formatted = with_breaks;
+    }
+
+    (formatted != text).then_some(formatted)
+}
+
+fn likely_needs_paragraph_split(text: &str) -> bool {
+    paragraph_slices(text)
+        .iter()
+        .any(|paragraph| paragraph_likely_needs_split(paragraph.text))
+}
+
+fn insert_readability_breaks(text: &str) -> Option<String> {
+    let paragraphs = paragraph_slices(text);
+    if !paragraphs
+        .iter()
+        .any(|paragraph| paragraph_likely_needs_split(paragraph.text))
+    {
+        return None;
+    }
+
+    let mut formatted = text.to_string();
+    let mut changed = false;
+
+    for paragraph in paragraphs.into_iter().rev() {
+        if let Some(replacement) = insert_readability_breaks_in_paragraph(paragraph.text) {
+            formatted.replace_range(paragraph.start..paragraph.end, &replacement);
+            changed = true;
+        }
+    }
+
+    changed.then_some(formatted)
+}
+
+#[derive(Clone, Copy)]
+struct ParagraphSlice<'a> {
+    start: usize,
+    end: usize,
+    text: &'a str,
+}
+
+fn paragraph_slices(text: &str) -> Vec<ParagraphSlice<'_>> {
+    let mut paragraphs = Vec::new();
+    let mut start = 0;
+    let mut newline_run_start: Option<usize> = None;
+    let mut newline_run_count = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            if newline_run_count == 0 {
+                newline_run_start = Some(idx);
+            }
+            newline_run_count += 1;
+            continue;
+        }
+
+        if newline_run_count >= 2 {
+            let end = newline_run_start.unwrap_or(idx);
+            paragraphs.push(ParagraphSlice {
+                start,
+                end,
+                text: &text[start..end],
+            });
+            start = idx;
+        }
+
+        newline_run_start = None;
+        newline_run_count = 0;
+    }
+
+    if newline_run_count >= 2 {
+        let end = newline_run_start.unwrap_or(text.len());
+        paragraphs.push(ParagraphSlice {
+            start,
+            end,
+            text: &text[start..end],
+        });
+        start = text.len();
+    }
+
+    paragraphs.push(ParagraphSlice {
+        start,
+        end: text.len(),
+        text: &text[start..],
+    });
+
+    paragraphs
+}
+
+fn paragraph_likely_needs_split(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let words = count_words(trimmed);
+    let sentence_boundaries = sentence_boundary_indices(trimmed).len();
+    trimmed.len() >= 900 || words >= 120 || sentence_boundaries >= 6
+}
+
+fn insert_readability_breaks_in_paragraph(text: &str) -> Option<String> {
+    if !paragraph_likely_needs_split(text) {
+        return None;
+    }
+
+    let sentence_boundaries = sentence_boundary_indices(text);
+    if sentence_boundaries.len() >= 6 {
+        return Some(split_by_sentence_groups(text, &sentence_boundaries, 3));
+    }
+
+    if count_words(text) >= 120 {
+        return split_by_word_count(text, 90);
+    }
+
+    None
+}
+
+fn sentence_boundary_indices(text: &str) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let mut iter = text.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if !matches!(ch, '.' | '?' | '!') {
+            continue;
+        }
+        let end = idx + ch.len_utf8();
+        let next = iter.peek().map(|(_, next)| *next);
+        if next.map(|c| c.is_whitespace()).unwrap_or(true) {
+            boundaries.push(end);
+        }
+    }
+    boundaries
+}
+
+fn split_by_sentence_groups(
+    text: &str,
+    boundaries: &[usize],
+    sentences_per_paragraph: usize,
+) -> String {
+    let mut out = String::with_capacity(text.len() + boundaries.len());
+    let mut last = 0;
+    for (idx, boundary) in boundaries.iter().enumerate() {
+        out.push_str(&text[last..*boundary]);
+        last = *boundary;
+        if (idx + 1) % sentences_per_paragraph == 0 && idx + 1 < boundaries.len() {
+            out.push_str("\n\n");
+            last = skip_leading_whitespace(text, last);
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn split_by_word_count(text: &str, words_per_paragraph: usize) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + text.len() / words_per_paragraph.max(1));
+    let mut word_count = 0usize;
+    let mut inserted_break = false;
+    let mut previous_end = 0usize;
+
+    for (start, word) in word_spans(text) {
+        out.push_str(&text[previous_end..start]);
+        if word_count > 0 && word_count % words_per_paragraph == 0 {
+            let trimmed_len = out.trim_end_matches(|c: char| c.is_whitespace()).len();
+            out.truncate(trimmed_len);
+            out.push_str("\n\n");
+            inserted_break = true;
+        }
+        out.push_str(word);
+        previous_end = start + word.len();
+        word_count += 1;
+    }
+    out.push_str(&text[previous_end..]);
+
+    inserted_break.then_some(out)
+}
+
+fn word_spans(text: &str) -> Vec<(usize, &str)> {
+    let mut spans = Vec::new();
+    let mut in_word = false;
+    let mut word_start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if in_word {
+                spans.push((word_start, &text[word_start..idx]));
+                in_word = false;
+            }
+        } else if !in_word {
+            in_word = true;
+            word_start = idx;
+        }
+    }
+    if in_word {
+        spans.push((word_start, &text[word_start..]));
+    }
+    spans
+}
+
+fn skip_leading_whitespace(text: &str, mut idx: usize) -> usize {
+    while idx < text.len() {
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn insert_breaks_before_inline_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut paragraph_prefix = String::new();
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '[' && bracketed_marker_end(text, idx).is_some() {
+            let previous_nonspace = paragraph_prefix.chars().any(|c| !c.is_whitespace());
+            if previous_nonspace && !prefix_is_only_markers_and_space(&paragraph_prefix) {
+                let trimmed_len = out.trim_end_matches(|c: char| c.is_whitespace()).len();
+                out.truncate(trimmed_len);
+                if !out.ends_with("\n\n") {
+                    out.push_str("\n\n");
+                }
+                paragraph_prefix.clear();
+            }
+        }
+
+        out.push(ch);
+        paragraph_prefix.push(ch);
+        if ch == '\n' && text[idx..].starts_with("\n\n") {
+            paragraph_prefix.clear();
+        }
+    }
+
+    out
+}
+
+fn bracketed_marker_end(text: &str, start: usize) -> Option<usize> {
+    let mut saw_content = false;
+    for (offset, ch) in text[start + 1..].char_indices() {
+        if ch == ']' {
+            return saw_content.then_some(start + 1 + offset);
+        }
+        if !ch.is_whitespace() {
+            saw_content = true;
+        }
+    }
+    None
+}
+
+fn prefix_is_only_markers_and_space(prefix: &str) -> bool {
+    let mut idx = 0;
+    while idx < prefix.len() {
+        let rest = &prefix[idx..];
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            idx += ch.len_utf8();
+            continue;
+        }
+        if ch == '['
+            && let Some(end) = bracketed_marker_end(prefix, idx)
+        {
+            idx = end + 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn insert_breaks_before_topic_shift_cues(text: &str) -> String {
+    const CUES: &[&str] = &[
+        "switching topics",
+        "switching gears",
+        "on a different note",
+        "moving on",
+        "another thing",
+        "the next thing",
+        "next topic",
+        "now let's talk about",
+        "now lets talk about",
+        "i also want to talk about",
+        "i want to talk about",
+    ];
+
+    let lower = text.to_lowercase();
+    let mut positions: Vec<usize> = CUES
+        .iter()
+        .flat_map(|cue| find_word_boundary_matches(&lower, cue))
+        .filter(|pos| {
+            let before = &text[..*pos];
+            let after = &text[*pos..];
+            !before.ends_with("\n\n")
+                && count_words(before) >= 20
+                && count_words(after) >= 8
+                && !same_paragraph_prefix_ends_with_break(before)
+        })
+        .collect();
+    positions.sort_unstable();
+    positions.dedup();
+
+    if positions.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + positions.len() * 2);
+    let mut last = 0;
+    for pos in positions {
+        out.push_str(&text[last..pos]);
+        let trimmed_len = out.trim_end_matches(|c: char| c.is_whitespace()).len();
+        out.truncate(trimmed_len);
+        if !out.ends_with("\n\n") {
+            out.push_str("\n\n");
+        }
+        last = pos;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn find_word_boundary_matches(haystack_lower: &str, needle_lower: &str) -> Vec<usize> {
+    let mut matches = Vec::new();
+    let mut start = 0;
+    while let Some(relative) = haystack_lower[start..].find(needle_lower) {
+        let pos = start + relative;
+        let end = pos + needle_lower.len();
+        if is_word_boundary(haystack_lower, pos) && is_word_boundary(haystack_lower, end) {
+            matches.push(pos);
+        }
+        start = end;
+    }
+    matches
+}
+
+fn is_word_boundary(text: &str, idx: usize) -> bool {
+    if idx == 0 || idx == text.len() {
+        return true;
+    }
+    let before = text[..idx].chars().next_back();
+    let after = text[idx..].chars().next();
+    !matches!((before, after), (Some(a), Some(b)) if a.is_alphanumeric() && b.is_alphanumeric())
+}
+
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+fn same_paragraph_prefix_ends_with_break(text_before: &str) -> bool {
+    text_before
+        .rsplit_once("\n\n")
+        .map(|(_, tail)| tail.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Strip out bracketed structural markers (e.g. `[Gavin]`, `[05:23]`,
@@ -922,6 +1427,7 @@ async fn main() {
         client: client.clone(),
         secrets: secrets_manager.clone(),
         soniox_temporary_api_key_url: SONIOX_TEMPORARY_API_KEY_URL.to_string(),
+        anthropic_messages_url: ANTHROPIC_MESSAGES_URL.to_string(),
         registries: registries.clone(),
     });
     let conversation_state = conversation_api::ConversationApiState::new(
@@ -1000,6 +1506,7 @@ mod tests {
             client: reqwest::Client::new(),
             secrets,
             soniox_temporary_api_key_url: upstream_url,
+            anthropic_messages_url: ANTHROPIC_MESSAGES_URL.to_string(),
             registries: empty_registries(),
         });
         Router::new()
@@ -1354,6 +1861,76 @@ mod tests {
         assert!(input_has_speaker_tags(text));
     }
 
+    // ── safe structural fallback ──────────────────────────────────
+
+    #[test]
+    fn structural_fallback_splits_inline_speaker_transition() {
+        let text =
+            "[Gavin] First point about the interview [Remote] Second point from the remote anchor";
+        let formatted = apply_safe_structural_fallback(text, false)
+            .expect("inline speaker transition should split");
+        assert_eq!(
+            formatted,
+            "[Gavin] First point about the interview\n\n[Remote] Second point from the remote anchor"
+        );
+        assert!(words_match(text, &formatted));
+    }
+
+    #[test]
+    fn structural_fallback_keeps_timestamp_and_speaker_prefix_together() {
+        let text = "[05:23] [Gavin] First point about the interview [Remote] Second point";
+        let formatted = apply_safe_structural_fallback(text, false)
+            .expect("inline second speaker should split");
+        assert_eq!(
+            formatted,
+            "[05:23] [Gavin] First point about the interview\n\n[Remote] Second point"
+        );
+        assert!(!formatted.contains("[05:23]\n\n[Gavin]"));
+        assert!(words_match(text, &formatted));
+    }
+
+    #[test]
+    fn structural_fallback_splits_explicit_topic_shift_cue() {
+        let text = "We need to talk through the budget because the last estimate missed hosting storage logging and support costs for the pilot rollout switching topics the launch plan also needs a dry run with support product and engineering before we announce anything publicly";
+        let formatted =
+            apply_safe_structural_fallback(text, false).expect("explicit topic shift should split");
+        assert_eq!(
+            formatted,
+            "We need to talk through the budget because the last estimate missed hosting storage logging and support costs for the pilot rollout\n\nswitching topics the launch plan also needs a dry run with support product and engineering before we announce anything publicly"
+        );
+        assert!(words_match(text, &formatted));
+    }
+
+    #[test]
+    fn long_single_paragraph_is_considered_split_needed() {
+        let text = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        assert!(likely_needs_paragraph_split(text));
+    }
+
+    #[test]
+    fn readability_fallback_splits_long_sentence_sequence() {
+        let text = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        let formatted = insert_readability_breaks(text)
+            .expect("six sentence paragraph should receive a readability split");
+        assert_eq!(
+            formatted,
+            "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern.\n\nFourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention."
+        );
+        assert!(words_match(text, &formatted));
+    }
+
+    #[test]
+    fn readability_fallback_splits_long_paragraph_even_with_existing_blank_line() {
+        let text = "Short setup paragraph.\n\nFirst sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        assert!(likely_needs_paragraph_split(text));
+
+        let formatted = insert_readability_breaks(text)
+            .expect("long second paragraph should split despite existing blank line");
+        assert!(formatted.starts_with("Short setup paragraph.\n\nFirst sentence"));
+        assert!(formatted.contains("concern.\n\nFourth sentence"));
+        assert!(words_match(text, &formatted));
+    }
+
     // ── strip_bracketed_markers ────────────────────────────────────
 
     #[test]
@@ -1489,7 +2066,8 @@ mod tests {
         let state = Arc::new(AppState {
             client: reqwest::Client::new(),
             secrets,
-            soniox_temporary_api_key_url: upstream_url,
+            soniox_temporary_api_key_url: SONIOX_TEMPORARY_API_KEY_URL.to_string(),
+            anthropic_messages_url: upstream_url,
             registries,
         });
         Router::new()
@@ -1601,10 +2179,281 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn format_anthropic_happy_path_uses_resolved_model_name() {
-        // Stand up a wiremock that asserts the outgoing payload's
-        // `model` field matches the registry config's model_name —
-        // proving the lookup actually drove the request.
+    async fn format_changed_false_with_inline_speaker_transition_gets_safe_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": "\"changed\": false}",
+                }],
+                "usage": { "input_tokens": 22, "output_tokens": 2 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let original =
+            "[Gavin] First point about the interview [Remote] Second point from the remote anchor";
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        assert_eq!(
+            json["formatted"].as_str().unwrap(),
+            "[Gavin] First point about the interview\n\n[Remote] Second point from the remote anchor"
+        );
+        assert_eq!(json["input_tokens"], 22);
+        assert_eq!(json["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn format_changed_false_with_long_single_paragraph_gets_readability_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": "\"changed\": false}",
+                }],
+                "usage": { "input_tokens": 77, "output_tokens": 2 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let original = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        let formatted = json["formatted"].as_str().unwrap();
+        assert!(formatted.contains("\n\nFourth sentence"));
+        assert!(words_match(original, formatted));
+        assert_eq!(json["input_tokens"], 77);
+        assert_eq!(json["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn format_changed_false_with_formatted_field_keeps_fallback_changed_true() {
+        let server = MockServer::start().await;
+        let original = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": format!("\"changed\": false, \"formatted\": {} }}", serde_json::to_string(original).unwrap()),
+                }],
+                "usage": { "input_tokens": 81, "output_tokens": 64 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        let formatted = json["formatted"].as_str().unwrap();
+        assert!(formatted.contains("\n\nFourth sentence"));
+        assert!(words_match(original, formatted));
+        assert_eq!(json["input_tokens"], 81);
+        assert_eq!(json["output_tokens"], 64);
+    }
+
+    #[tokio::test]
+    async fn format_invalid_json_with_long_single_paragraph_gets_readability_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": "\"changed\": true, \"formatted\": \"unterminated",
+                }],
+                "usage": { "input_tokens": 91, "output_tokens": 725 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let original = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        let formatted = json["formatted"].as_str().unwrap();
+        assert!(formatted.contains("\n\nFourth sentence"));
+        assert!(words_match(original, formatted));
+        assert_eq!(json["input_tokens"], 91);
+        assert_eq!(json["output_tokens"], 725);
+    }
+
+    #[tokio::test]
+    async fn format_rejected_letter_change_uses_deterministic_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": "\"changed\": true, \"formatted\": \"Different words entirely.\"}",
+                }],
+                "usage": { "input_tokens": 93, "output_tokens": 44 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let original = "First sentence sets up the context for the discussion. Second sentence adds more detail about the current state. Third sentence explains the first concern. Fourth sentence moves into a related operational concern. Fifth sentence starts to summarize the risk. Sixth sentence introduces the next decision that needs attention.";
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        let formatted = json["formatted"].as_str().unwrap();
+        assert!(formatted.contains("\n\nFourth sentence"));
+        assert!(words_match(original, formatted));
+        assert_eq!(json["input_tokens"], 93);
+        assert_eq!(json["output_tokens"], 44);
+    }
+
+    #[tokio::test]
+    async fn format_changed_true_without_required_split_gets_safe_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("x-api-key", "test-anthropic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{
+                    "text": "\"changed\": true, \"formatted\": \"[Gavin] First point about the interview. [Remote] Second point from the remote anchor.\"}",
+                }],
+                "usage": { "input_tokens": 24, "output_tokens": 18 },
+            })))
+            .mount(&server)
+            .await;
+
+        let app = format_test_app(
+            server.uri(),
+            anthropic_secrets(),
+            registries_with_anthropic_haiku(),
+        );
+        let original =
+            "[Gavin] First point about the interview [Remote] Second point from the remote anchor";
+        let body = serde_json::json!({
+            "text": original,
+            "model_config_id": "haiku-cfg",
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::post("/format")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["changed"], true);
+        assert_eq!(
+            json["formatted"].as_str().unwrap(),
+            "[Gavin] First point about the interview.\n\n[Remote] Second point from the remote anchor."
+        );
+    }
+
+    #[tokio::test]
+    async fn format_anthropic_model_config_id_calls_upstream_when_configured() {
+        // The Anthropic URL is injected into AppState in tests so the
+        // formatter path can be exercised without a live provider key.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/")) // wiremock root path
@@ -1618,24 +2467,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Override the const URL by injecting a mock through a custom
-        // state — but `format_text` has the URL baked in
-        // (`ANTHROPIC_MESSAGES_URL`). For this happy-path test we
-        // exercise the request-decoding + registry-lookup branches via
-        // a 412 path instead: a missing credential returns 412 before
-        // any HTTP call, which is enough to confirm that the
-        // dispatcher routed the model_config_id to the Anthropic
-        // branch.
-        let _ = server; // silence unused — kept to document intent above.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let no_key = Arc::new(SecretsManager::new(
-            Box::new(InMemoryKeyStore::new()),
-            Box::new(StaticEnv::new()),
-            temp.path().join("credentials.json"),
-        ));
         let app = format_test_app(
-            "http://127.0.0.1/unused".to_string(),
-            no_key,
+            server.uri(),
+            anthropic_secrets(),
             registries_with_anthropic_haiku(),
         );
         let body = serde_json::json!({
@@ -1652,9 +2486,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        assert_eq!(json["error"], "provider_not_configured");
-        assert_eq!(json["provider"], "anthropic");
+        assert_eq!(json["changed"], false);
+        assert_eq!(json["input_tokens"], 10);
+        assert_eq!(json["output_tokens"], 2);
     }
 }

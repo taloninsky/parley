@@ -1,6 +1,6 @@
 # Global Reformat Settings + Cross-Mode STT Cleanup — Specification
 
-> Status: **Proposed**
+> Status: **Implemented**
 > Author: Gavin + Droid
 > Date: 2026-04-28
 >
@@ -213,6 +213,49 @@ Also verify that:
   matches a real Anthropic model id (causing `/format` to 4xx silently).
 - The `parley_auto_format` cookie default. The current code uses
   `.map(|s| s != "false").unwrap_or(true)` so default is `true`; OK.
+
+### 7.1 As-built formatter split fix
+
+`/format` now treats paragraphing as a semantic formatting responsibility,
+not only a speaker-tag cleanup pass. The formatter prompt explicitly requires
+splits when a speaker moves to a new subject of discussion, changes reasoning
+track, or uses transition phrases such as "switching topics", "moving on", or
+"another thing".
+
+The proxy also applies a conservative structural fallback when the model
+returns `{"changed": false}` or emits a formatted result that still missed an
+obvious split. The fallback only inserts blank lines where it can preserve the
+canonical letter/digit sequence:
+
+- before inline bracketed speaker/timestamp markers that appear after spoken text, while keeping leading `[05:23] [Gavin]`-style prefixes together;
+- before explicit topic-shift cues with enough text on both sides to be a real paragraph boundary.
+
+For long single-paragraph transcripts, `/format` now adds a request-specific
+instruction that forbids `{"changed": false}` and requires inferred semantic
+paragraph boundaries. If the model still returns no change, the proxy applies
+a readability fallback to any individual paragraph that is still too long:
+sentence groups for punctuated text, or word-count chunks for unpunctuated
+text. That fallback is intentionally a last resort; semantic subject changes
+remain primarily LLM-driven, while the deterministic path guarantees that an
+obvious wall of text is not returned unchanged just because another part of
+the paste already had a blank line.
+
+The endpoint normalizes `changed` after all fallback passes. This matters
+because Anthropic can return `{"changed": false, "formatted": "..."}`; if the
+proxy inserts paragraph breaks into that formatted field, it must return
+`changed: true` so the browser applies the text instead of logging "no changes
+needed".
+
+Malformed model output is also fail-closed into deterministic paragraphing.
+If Anthropic spends tokens but returns invalid JSON, omits the `formatted`
+field, or emits a formatted string that fails the canonical letter-sequence
+guard, the proxy applies the structural/readability fallback before returning
+`changed: false`.
+
+Regression coverage lives in `proxy/src/main.rs` around
+`apply_safe_structural_fallback`, `insert_readability_breaks`, and the
+`/format` endpoint tests that mock Anthropic returning `changed:false` or
+returning a formatted string without the required paragraph split.
 
 ---
 
