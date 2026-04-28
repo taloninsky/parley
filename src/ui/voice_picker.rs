@@ -75,9 +75,9 @@ pub async fn fetch_voices(
 #[component]
 pub fn VoicePicker(
     /// TTS provider id (e.g. `"xai"`, `"elevenlabs"`).
-    provider_id: ReadOnlySignal<String>,
+    provider_id: ReadSignal<String>,
     /// Named credential (typically `"default"`).
-    credential: ReadOnlySignal<String>,
+    credential: ReadSignal<String>,
     /// Current selection; mutated when the user picks.
     selected_voice_id: Signal<String>,
 ) -> Element {
@@ -107,7 +107,11 @@ pub fn VoicePicker(
                 .into(),
             );
             if !in_list {
-                sel.set(list[0].id.clone());
+                let selected = list[0].id.clone();
+                gloo_timers::callback::Timeout::new(0, move || {
+                    sel.set(selected);
+                })
+                .forget();
             }
         } else {
             web_sys::console::log_1(&"[voice-picker] effect: voices not ready".into());

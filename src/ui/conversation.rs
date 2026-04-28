@@ -842,41 +842,71 @@ pub fn ConversationView() -> Element {
         let current = voice.state.read().clone();
         let previous = last_voice_state.peek().clone();
         if current != previous {
-            last_voice_state.set(current.clone());
-            // We only care about the Finalizing → Idle edge; that's
-            // when the hook has flushed AssemblyAI and the final
-            // text is stable. Any other transition is bookkeeping.
-            if matches!(previous, VoiceState::Finalizing) && matches!(current, VoiceState::Idle) {
-                let raw = voice.final_text.peek().trim().to_string();
-                if !raw.is_empty() {
-                    // Auto-reformat user voice turns before submit
-                    // when the toggle is on AND the proxy can drive
-                    // it (Anthropic key + a model picked). Errors
-                    // fall through with the raw text — never block
-                    // submission. Spec §5.
-                    let do_reformat = (auto_format_in_conversation)()
-                        && anthropic_configured()
-                        && !reformat_model_config_id.peek().is_empty();
-                    if do_reformat {
-                        let model = reformat_model_config_id.peek().clone();
-                        let cred = reformat_credential.peek().clone();
-                        let raw_for_task = raw.clone();
-                        let mut input_sig = input;
-                        let mut status_sig = status;
-                        let prev_status = status.peek().clone();
-                        status_sig.set(SendStatus::Reformatting);
-                        spawn_local(async move {
-                            let cleaned = match reformat_single_turn(&raw_for_task, &model, &cred)
+            gloo_timers::callback::Timeout::new(0, move || {
+                last_voice_state.set(current.clone());
+                // We only care about the Finalizing → Idle edge; that's
+                // when the hook has flushed AssemblyAI and the final
+                // text is stable. Any other transition is bookkeeping.
+                if matches!(previous, VoiceState::Finalizing) && matches!(current, VoiceState::Idle)
+                {
+                    let raw = voice.final_text.peek().trim().to_string();
+                    if !raw.is_empty() {
+                        // Auto-reformat user voice turns before submit
+                        // when the toggle is on AND the proxy can drive
+                        // it (Anthropic key + a model picked). Errors
+                        // fall through with the raw text — never block
+                        // submission. Spec §5.
+                        let do_reformat = *auto_format_in_conversation.peek()
+                            && *anthropic_configured.peek()
+                            && !reformat_model_config_id.peek().is_empty();
+                        if do_reformat {
+                            let model = reformat_model_config_id.peek().clone();
+                            let cred = reformat_credential.peek().clone();
+                            let raw_for_task = raw.clone();
+                            let mut input_sig = input;
+                            let mut status_sig = status;
+                            let prev_status = status.peek().clone();
+                            status_sig.set(SendStatus::Reformatting);
+                            spawn_local(async move {
+                                let cleaned = match reformat_single_turn(
+                                    &raw_for_task,
+                                    &model,
+                                    &cred,
+                                )
                                 .await
-                            {
-                                Some(out) => out.formatted.unwrap_or_else(|| raw_for_task.clone()),
-                                None => raw_for_task.clone(),
-                            };
-                            input_sig.set(cleaned);
-                            // Restore status to whatever it was so
-                            // submit_turn can flip it to Sending; if
-                            // reformat failed we fall through cleanly.
-                            status_sig.set(prev_status);
+                                {
+                                    Some(out) => {
+                                        out.formatted.unwrap_or_else(|| raw_for_task.clone())
+                                    }
+                                    None => raw_for_task.clone(),
+                                };
+                                input_sig.set(cleaned);
+                                // Restore status to whatever it was so
+                                // submit_turn can flip it to Sending; if
+                                // reformat failed we fall through cleanly.
+                                status_sig.set(prev_status);
+                                submit_turn(SendHandles {
+                                    selected_credential,
+                                    selected_persona,
+                                    selected_model,
+                                    session_id,
+                                    session_initialized,
+                                    messages,
+                                    streaming,
+                                    input: input_sig,
+                                    status: status_sig,
+                                    available_sessions,
+                                    applied_persona,
+                                    applied_model,
+                                    mode,
+                                    voice,
+                                    live_player,
+                                    live_player_turn,
+                                    playback_status,
+                                });
+                            });
+                        } else {
+                            input.set(raw);
                             submit_turn(SendHandles {
                                 selected_credential,
                                 selected_persona,
@@ -885,8 +915,8 @@ pub fn ConversationView() -> Element {
                                 session_initialized,
                                 messages,
                                 streaming,
-                                input: input_sig,
-                                status: status_sig,
+                                input,
+                                status,
                                 available_sessions,
                                 applied_persona,
                                 applied_model,
@@ -896,31 +926,11 @@ pub fn ConversationView() -> Element {
                                 live_player_turn,
                                 playback_status,
                             });
-                        });
-                    } else {
-                        input.set(raw);
-                        submit_turn(SendHandles {
-                            selected_credential,
-                            selected_persona,
-                            selected_model,
-                            session_id,
-                            session_initialized,
-                            messages,
-                            streaming,
-                            input,
-                            status,
-                            available_sessions,
-                            applied_persona,
-                            applied_model,
-                            mode,
-                            voice,
-                            live_player,
-                            live_player_turn,
-                            playback_status,
-                        });
+                        }
                     }
                 }
-            }
+            })
+            .forget();
         }
     });
 
@@ -997,85 +1007,89 @@ pub fn ConversationView() -> Element {
             if new_provider == prev_provider && new_voice == prev_voice {
                 return;
             }
-            last_tts_provider.set(new_provider.clone());
-            last_tts_voice.set(new_voice.clone());
-            if !*session_initialized.peek() {
-                // No live session yet — the next /init will pick
-                // these values up from cookies. Nothing to push.
-                return;
-            }
-            let persona = applied_persona.peek().clone();
-            let model = applied_model.peek().clone();
-            if persona.is_empty() || model.is_empty() {
-                web_sys::console::warn_1(
-                    &"[conversation] tts switch skipped: applied persona/model empty".into(),
-                );
-                return;
-            }
-            let credential = selected_credential.peek().clone();
-            spawn_local(async move {
-                let payload = serde_json::json!({
-                    "persona_id": persona,
-                    "model_config_id": model,
-                    "credential": credential,
-                    "tts_provider": new_provider,
-                    "voice_id": new_voice,
-                });
-                let body = match serde_json::to_string(&payload) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        web_sys::console::warn_1(
-                            &format!("[conversation] switch payload: {e}").into(),
-                        );
-                        return;
-                    }
-                };
-                web_sys::console::log_1(
-                    &format!("[conversation] POST /conversation/switch body={body}").into(),
-                );
-                let req = match build_post(&format!("{PROXY_BASE}/conversation/switch"), &body) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        web_sys::console::warn_1(
-                            &format!("[conversation] switch build_post: {e}").into(),
-                        );
-                        return;
-                    }
-                };
-                let window = match web_sys::window() {
-                    Some(w) => w,
-                    None => return,
-                };
-                match JsFuture::from(window.fetch_with_request(&req)).await {
-                    Ok(resp_val) => match resp_val.dyn_into::<web_sys::Response>() {
-                        Ok(resp) => {
-                            if resp.ok() {
-                                web_sys::console::log_1(
-                                    &format!(
-                                        "[conversation] tts switch ok: HTTP {}",
-                                        resp.status()
-                                    )
-                                    .into(),
-                                );
-                            } else {
-                                web_sys::console::warn_1(
-                                    &format!(
-                                        "[conversation] tts switch failed: HTTP {}",
-                                        resp.status()
-                                    )
-                                    .into(),
-                                );
-                            }
-                        }
-                        Err(_) => web_sys::console::warn_1(
-                            &"[conversation] tts switch: bad response".into(),
-                        ),
-                    },
-                    Err(e) => web_sys::console::warn_1(
-                        &format!("[conversation] tts switch fetch err: {e:?}").into(),
-                    ),
+            gloo_timers::callback::Timeout::new(0, move || {
+                last_tts_provider.set(new_provider.clone());
+                last_tts_voice.set(new_voice.clone());
+                if !*session_initialized.peek() {
+                    // No live session yet — the next /init will pick
+                    // these values up from cookies. Nothing to push.
+                    return;
                 }
-            });
+                let persona = applied_persona.peek().clone();
+                let model = applied_model.peek().clone();
+                if persona.is_empty() || model.is_empty() {
+                    web_sys::console::warn_1(
+                        &"[conversation] tts switch skipped: applied persona/model empty".into(),
+                    );
+                    return;
+                }
+                let credential = selected_credential.peek().clone();
+                spawn_local(async move {
+                    let payload = serde_json::json!({
+                        "persona_id": persona,
+                        "model_config_id": model,
+                        "credential": credential,
+                        "tts_provider": new_provider,
+                        "voice_id": new_voice,
+                    });
+                    let body = match serde_json::to_string(&payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            web_sys::console::warn_1(
+                                &format!("[conversation] switch payload: {e}").into(),
+                            );
+                            return;
+                        }
+                    };
+                    web_sys::console::log_1(
+                        &format!("[conversation] POST /conversation/switch body={body}").into(),
+                    );
+                    let req = match build_post(&format!("{PROXY_BASE}/conversation/switch"), &body)
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            web_sys::console::warn_1(
+                                &format!("[conversation] switch build_post: {e}").into(),
+                            );
+                            return;
+                        }
+                    };
+                    let window = match web_sys::window() {
+                        Some(w) => w,
+                        None => return,
+                    };
+                    match JsFuture::from(window.fetch_with_request(&req)).await {
+                        Ok(resp_val) => match resp_val.dyn_into::<web_sys::Response>() {
+                            Ok(resp) => {
+                                if resp.ok() {
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[conversation] tts switch ok: HTTP {}",
+                                            resp.status()
+                                        )
+                                        .into(),
+                                    );
+                                } else {
+                                    web_sys::console::warn_1(
+                                        &format!(
+                                            "[conversation] tts switch failed: HTTP {}",
+                                            resp.status()
+                                        )
+                                        .into(),
+                                    );
+                                }
+                            }
+                            Err(_) => web_sys::console::warn_1(
+                                &"[conversation] tts switch: bad response".into(),
+                            ),
+                        },
+                        Err(e) => web_sys::console::warn_1(
+                            &format!("[conversation] tts switch fetch err: {e:?}").into(),
+                        ),
+                    }
+                });
+            })
+            .forget();
         });
     }
 

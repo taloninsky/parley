@@ -236,8 +236,8 @@ pub fn SettingsDrawer() -> Element {
                 label { r#for: "pipeline-voice", "Voice" }
                 div { class: "settings-row",
                     crate::ui::voice_picker::VoicePicker {
-                        provider_id: ReadOnlySignal::from(pipeline_tts_provider),
-                        credential: ReadOnlySignal::from(voice_credential),
+                        provider_id: ReadSignal::from(pipeline_tts_provider),
+                        credential: ReadSignal::from(voice_credential),
                         selected_voice_id: pipeline_tts_voice,
                     }
                 }

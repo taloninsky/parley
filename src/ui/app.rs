@@ -1,19 +1,22 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::audio::capture::BrowserCapture;
 use crate::stt::assemblyai::{AssemblyAiSession, TurnEvent, fetch_temp_token};
 use crate::stt::soniox::{SonioxConfig, SonioxLatencyMode, SonioxSession, fetch_temp_api_key};
 use crate::ui::secrets;
-use parley_core::stt::{SttMarker, SttStreamEvent, TokenStreamNormalizer};
+use parley_core::stt::{SttStreamEvent, TokenStreamNormalizer};
 use parley_core::word_graph::SttWord;
 use parley_core::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
+const AUTO_FORMAT_CHAR_LIMIT: usize = 500;
 
 /// Read the textarea's selectionStart / selectionEnd from the DOM.
 fn get_cursor() -> Option<(u32, u32)> {
@@ -54,6 +57,14 @@ fn scroll_textarea_to_bottom() {
     let _ = web_sys::window()
         .unwrap()
         .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 0);
+}
+
+fn defer_ui_update(update: impl FnOnce() + 'static) {
+    gloo_timers::callback::Timeout::new(0, update).forget();
+}
+
+fn spawn_browser_task(future: impl Future<Output = ()> + 'static) {
+    spawn_local(future);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -400,21 +411,28 @@ async fn check_formatting(
     })
 }
 
-/// Bump the per-session "turns since last format" counter and, if it
-/// hits the configured `Nth` interval, kick off a `/format` round-trip
-/// in the background.
+fn has_sentence_marker(text: &str) -> bool {
+    text.chars()
+        .any(|ch| matches!(ch, '.' | '?' | '!' | '\u{3002}' | '\u{ff1f}' | '\u{ff01}'))
+}
+
+/// Note newly committed STT text and kick off a `/format` round-trip once the
+/// stream reaches either a sentence marker or a punctuation-free character cap.
 ///
-/// Called by every STT ingest path on a turn-commit (`AssemblyAI`
-/// already has its own equivalent through the periodic ticker; this
-/// helper exists so the Soniox + xAI completion sites have feature
-/// parity per spec `docs/global-reformat-spec.md` §7).
+/// Called by every Capture Mode STT ingest path after text has actually
+/// been committed to the transcript, so provider-specific turn shapes
+/// still feed one formatter trigger policy. Punctuation is the preferred
+/// boundary; the character cap is the provider-agnostic fallback for STT
+/// streams that finalize words without punctuation.
 ///
 /// All inputs are `Copy` (signals + `Rc`), so the helper is cheap to
 /// call from inside an STT callback. The actual format request runs
 /// on a spawned task and never blocks the audio pipeline.
 #[allow(clippy::too_many_arguments)]
-fn bump_format_counter_and_maybe_run(
-    counter: &Rc<Cell<u32>>,
+fn note_committed_text_and_maybe_format(
+    sentence_counter: &Rc<Cell<u32>>,
+    pending_chars: &Rc<Cell<usize>>,
+    committed_text: &str,
     anthropic_configured: Memo<bool>,
     auto_format_enabled: Signal<bool>,
     format_nth: Signal<u32>,
@@ -426,20 +444,44 @@ fn bump_format_counter_and_maybe_run(
     mut llm_cost: Signal<f64>,
     multi_speaker: bool,
 ) {
-    if !anthropic_configured() || !(auto_format_enabled)() {
+    if !*anthropic_configured.peek() || !*auto_format_enabled.peek() {
         return;
     }
-    let nth = (format_nth)().max(1);
-    counter.set(counter.get() + 1);
-    if !counter.get().is_multiple_of(nth) {
+    let added_chars = committed_text.trim().chars().count();
+    if added_chars == 0 {
         return;
     }
-    let model = (reformat_model_config_id)();
-    let cred = (reformat_credential)();
-    let depth = (format_depth)();
-    let ctx_depth = (format_context_depth)();
-    spawn(async move {
-        let text = (transcript)();
+
+    let chars_since_format = pending_chars.get() + added_chars;
+    pending_chars.set(chars_since_format);
+
+    let nth = (*format_nth.peek()).max(1);
+    let sentence_ready = if has_sentence_marker(committed_text) {
+        sentence_counter.set(sentence_counter.get() + 1);
+        sentence_counter.get().is_multiple_of(nth)
+    } else {
+        false
+    };
+    let char_limit_ready = chars_since_format >= AUTO_FORMAT_CHAR_LIMIT;
+    if !sentence_ready && !char_limit_ready {
+        return;
+    }
+    let model = reformat_model_config_id.peek().clone();
+    if model.is_empty() {
+        return;
+    }
+    pending_chars.set(0);
+    web_sys::console::log_1(
+        &format!(
+            "[parley] Auto-format scheduled ({chars_since_format} chars since last pass, sentence_ready={sentence_ready}, char_limit_ready={char_limit_ready})",
+        )
+        .into(),
+    );
+    let cred = reformat_credential.peek().clone();
+    let depth = *format_depth.peek();
+    let ctx_depth = *format_context_depth.peek();
+    spawn_browser_task(async move {
+        let text = transcript.peek().clone();
         if text.is_empty() {
             return;
         }
@@ -447,13 +489,24 @@ fn bump_format_counter_and_maybe_run(
             check_formatting(&text, multi_speaker, &model, &cred, depth, ctx_depth).await
         {
             let (in_rate, out_rate) = llm_rates(&model);
+            let previous_cost = *llm_cost.peek();
             llm_cost.set(
-                llm_cost()
+                previous_cost
                     + token_cost(result.input_tokens, result.output_tokens, in_rate, out_rate),
             );
             if let Some(formatted) = result.formatted {
                 let cursor = get_cursor();
-                transcript.set(formatted);
+                let current = transcript.peek().clone();
+                if current == text {
+                    transcript.set(formatted);
+                } else if let Some(suffix) = current.strip_prefix(&text) {
+                    transcript.set(format!("{formatted}{suffix}"));
+                } else {
+                    web_sys::console::log_1(
+                        &"[parley] Auto-format result skipped because transcript changed shape"
+                            .into(),
+                    );
+                }
                 if let Some((s, e)) = cursor {
                     restore_cursor(s, e);
                 }
@@ -589,7 +642,7 @@ fn finalize_soniox_session_after_settle(
     session: Rc<RefCell<Option<SonioxSession>>>,
     mode: SonioxLatencyMode,
 ) {
-    spawn(async move {
+    spawn_browser_task(async move {
         let settle_ms = mode.finalize_settle_ms();
         if settle_ms > 0 {
             gloo_timers::future::TimeoutFuture::new(settle_ms).await;
@@ -763,7 +816,7 @@ fn graduate_live_words(
     }
 
     let cursor = get_cursor();
-    let mut prev = (transcript)();
+    let mut prev = transcript.peek().clone();
     let ls = last_speaker.borrow().clone();
     let mut last = ls;
 
@@ -907,7 +960,6 @@ pub fn App() -> Element {
         use_signal(|| None);
     let mut current_turn_shared: Signal<Option<Rc<RefCell<String>>>> = use_signal(|| None);
     let mut current_turn_order_shared: Signal<Option<Rc<Cell<u32>>>> = use_signal(|| None);
-    let mut needs_paragraph_check_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
     let mut turn_is_formatted1_shared: Signal<Option<Rc<Cell<bool>>>> = use_signal(|| None);
 
     // ── Speaker 2 handles ───────────────────────────────────────────
@@ -971,10 +1023,10 @@ pub fn App() -> Element {
         }
 
         if selected_stt_provider == "soniox" {
-            let s1_source = (speaker1_source)();
-            let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
-            let context_text = (soniox_context_text)();
-            spawn(async move {
+            let s1_source = speaker1_source.peek().clone();
+            let latency_mode = soniox_latency_mode_from_value(&soniox_latency_mode.peek());
+            let context_text = soniox_context_text.peek().clone();
+            spawn_browser_task(async move {
                 status_msg.set("Fetching Soniox token…".into());
                 let token = match fetch_temp_api_key().await {
                     Ok(token) => token,
@@ -997,15 +1049,12 @@ pub fn App() -> Element {
                 let provisional_by_lane: Rc<RefCell<BTreeMap<u8, String>>> =
                     Rc::new(RefCell::new(BTreeMap::new()));
                 let last_lane: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
-                // Auto-format trigger for the Soniox ingest path. The
-                // AssemblyAI path uses a periodic ticker driven by
-                // `needs_para_check`; Soniox has no equivalent ticker
-                // wired up today, so we drive the format pass inline:
-                // every Nth `FinalizeComplete` marker, kick off a
-                // formatting round-trip directly. Spec
-                // `docs/global-reformat-spec.md` §7 (cross-mode bug
-                // fix).
-                let soniox_turn_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+                // Soniox often finalizes text continuously without emitting a
+                // provider turn boundary. Treat each non-empty finalized batch
+                // as a formatter-countable commit so live formatting cannot
+                // starve while a long utterance is still in progress.
+                let soniox_sentence_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+                let soniox_pending_chars: Rc<Cell<usize>> = Rc::new(Cell::new(0));
 
                 let session = match SonioxSession::connect(
                     &token,
@@ -1015,113 +1064,132 @@ pub fn App() -> Element {
                         let provisional_by_lane = provisional_by_lane.clone();
                         let graph_rc = graph_rc.clone();
                         let last_lane = last_lane.clone();
-                        let stc = soniox_turn_counter.clone();
+                        let sentence_counter = soniox_sentence_counter.clone();
+                        let pending_chars = soniox_pending_chars.clone();
                         move |event: SttStreamEvent| {
                             if let SttStreamEvent::Error { message, .. } = &event {
-                                error_msg.set(Some(format!("Soniox error: {message}")));
-                                rec_state.set(RecState::Idle);
-                                status_msg.set("Ready".into());
+                                let message = message.clone();
+                                defer_ui_update(move || {
+                                    error_msg.set(Some(format!("Soniox error: {message}")));
+                                    rec_state.set(RecState::Idle);
+                                    status_msg.set("Ready".into());
+                                });
                                 return;
                             }
 
                             let batch = match normalizer.borrow_mut().accept_event(event) {
                                 Ok(batch) => batch,
                                 Err(err) => {
-                                    error_msg
-                                        .set(Some(format!("Soniox normalization failed: {err}")));
-                                    rec_state.set(RecState::Idle);
-                                    status_msg.set("Ready".into());
+                                    defer_ui_update(move || {
+                                        error_msg.set(Some(format!(
+                                            "Soniox normalization failed: {err}"
+                                        )));
+                                        rec_state.set(RecState::Idle);
+                                        status_msg.set("Ready".into());
+                                    });
                                     return;
                                 }
                             };
 
                             batch.apply_to_graph(&mut graph_rc.borrow_mut());
-
-                            for update in &batch.updates {
-                                let finalized_text = render_stt_words(&update.finalized);
-                                if !finalized_text.is_empty() {
-                                    let lane_name = soniox_lane_name(
-                                        update.lane,
-                                        &(speaker1_name)(),
-                                        &(speaker2_name)(),
-                                    );
-                                    let start_ms = update
-                                        .finalized
-                                        .first()
-                                        .map(|word| word.start_ms)
-                                        .unwrap_or_else(|| js_sys::Date::now() - start_time);
-                                    transcript.with_mut(|body| {
-                                        if !body.is_empty() {
-                                            body.push(' ');
+                            let provisional_by_lane = provisional_by_lane.clone();
+                            let last_lane = last_lane.clone();
+                            let sentence_counter = sentence_counter.clone();
+                            let pending_chars = pending_chars.clone();
+                            defer_ui_update(move || {
+                                let mut committed_finalized_text = false;
+                                let mut committed_text_for_format = String::new();
+                                let speaker1 = speaker1_name.peek().clone();
+                                let speaker2 = speaker2_name.peek().clone();
+                                let show_labels_now = *show_labels.peek();
+                                let show_timestamps_now = *show_timestamps.peek();
+                                for update in &batch.updates {
+                                    let finalized_text = render_stt_words(&update.finalized);
+                                    if !finalized_text.is_empty() {
+                                        committed_finalized_text = true;
+                                        if !committed_text_for_format.is_empty() {
+                                            committed_text_for_format.push(' ');
                                         }
-                                        let speaker_changed = last_lane
-                                            .borrow()
-                                            .map(|lane| lane != update.lane)
-                                            .unwrap_or(true);
-                                        if (show_timestamps)() && speaker_changed {
-                                            body.push_str(&format_timestamp(start_ms));
-                                            body.push(' ');
-                                        }
-                                        if (show_labels)() && speaker_changed {
-                                            body.push('[');
-                                            body.push_str(&lane_name);
-                                            body.push_str("] ");
-                                        }
-                                        body.push_str(finalized_text.trim());
-                                    });
-                                    *last_lane.borrow_mut() = Some(update.lane);
-                                }
-
-                                let provisional_text = render_stt_words(&update.provisional);
-                                if provisional_text.is_empty() {
-                                    provisional_by_lane.borrow_mut().remove(&update.lane);
-                                } else {
-                                    provisional_by_lane
-                                        .borrow_mut()
-                                        .insert(update.lane, provisional_text);
-                                }
-                            }
-
-                            let provisional = provisional_by_lane
-                                .borrow()
-                                .iter()
-                                .map(|(lane, text)| {
-                                    let lane_name = soniox_lane_name(
-                                        *lane,
-                                        &(speaker1_name)(),
-                                        &(speaker2_name)(),
-                                    );
-                                    if (show_labels)() {
-                                        format!("[{lane_name}] {text}")
-                                    } else {
-                                        text.clone()
+                                        committed_text_for_format.push_str(finalized_text.trim());
+                                        let lane_name =
+                                            soniox_lane_name(update.lane, &speaker1, &speaker2);
+                                        let start_ms = update
+                                            .finalized
+                                            .first()
+                                            .map(|word| word.start_ms)
+                                            .unwrap_or_else(|| js_sys::Date::now() - start_time);
+                                        transcript.with_mut(|body| {
+                                            if !body.is_empty() {
+                                                body.push(' ');
+                                            }
+                                            let speaker_changed = last_lane
+                                                .borrow()
+                                                .map(|lane| lane != update.lane)
+                                                .unwrap_or(true);
+                                            if show_timestamps_now && speaker_changed {
+                                                body.push_str(&format_timestamp(start_ms));
+                                                body.push(' ');
+                                            }
+                                            if show_labels_now && speaker_changed {
+                                                body.push('[');
+                                                body.push_str(&lane_name);
+                                                body.push_str("] ");
+                                            }
+                                            body.push_str(finalized_text.trim());
+                                        });
+                                        *last_lane.borrow_mut() = Some(update.lane);
                                     }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            partial.set(provisional);
-                            partial2.set(String::new());
 
-                            if batch.markers.contains(&SttMarker::FinalizeComplete) {
-                                provisional_by_lane.borrow_mut().clear();
-                                partial.set(String::new());
-                                // Bump the cross-mode format counter and
-                                // fire `/format` when the Nth turn lands.
-                                // See spec §7.
-                                bump_format_counter_and_maybe_run(
-                                    &stc,
-                                    anthropic_configured,
-                                    auto_format_enabled,
-                                    format_nth,
-                                    reformat_model_config_id,
-                                    reformat_credential,
-                                    format_depth,
-                                    format_context_depth,
-                                    transcript,
-                                    llm_cost,
-                                    false, // soniox is single-lane today
-                                );
-                            }
+                                    let provisional_text = render_stt_words(&update.provisional);
+                                    if provisional_text.is_empty() {
+                                        provisional_by_lane.borrow_mut().remove(&update.lane);
+                                    } else {
+                                        provisional_by_lane
+                                            .borrow_mut()
+                                            .insert(update.lane, provisional_text);
+                                    }
+                                }
+
+                                let provisional = provisional_by_lane
+                                    .borrow()
+                                    .iter()
+                                    .map(|(lane, text)| {
+                                        let lane_name =
+                                            soniox_lane_name(*lane, &speaker1, &speaker2);
+                                        if show_labels_now {
+                                            format!("[{lane_name}] {text}")
+                                        } else {
+                                            text.clone()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                partial.set(provisional);
+                                partial2.set(String::new());
+
+                                if committed_finalized_text {
+                                    note_committed_text_and_maybe_format(
+                                        &sentence_counter,
+                                        &pending_chars,
+                                        &committed_text_for_format,
+                                        anthropic_configured,
+                                        auto_format_enabled,
+                                        format_nth,
+                                        reformat_model_config_id,
+                                        reformat_credential,
+                                        format_depth,
+                                        format_context_depth,
+                                        transcript,
+                                        llm_cost,
+                                        false,
+                                    );
+                                }
+
+                                if batch.has_turn_boundary() {
+                                    provisional_by_lane.borrow_mut().clear();
+                                    partial.set(String::new());
+                                }
+                            });
                         }
                     },
                     move |_code, _reason| {},
@@ -1164,11 +1232,11 @@ pub fn App() -> Element {
             return;
         }
 
-        let multi = (speaker2_enabled)();
-        let s1_source = (speaker1_source)();
-        let s2_source = (speaker2_source)();
+        let multi = *speaker2_enabled.peek();
+        let s1_source = speaker1_source.peek().clone();
+        let s2_source = speaker2_source.peek().clone();
 
-        spawn(async move {
+        spawn_browser_task(async move {
             // Fetch token for speaker 1
             status_msg.set("Fetching token…".into());
             let token1 = match fetch_temp_token().await {
@@ -1226,15 +1294,14 @@ pub fn App() -> Element {
 
             let current_turn1: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             let current_turn_order1: Rc<Cell<u32>> = Rc::new(Cell::new(u32::MAX));
-            let needs_para_check: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let turn_commit_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+            let format_sentence_counter: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+            let format_pending_chars: Rc<Cell<usize>> = Rc::new(Cell::new(0));
             // Track when the current turn started speaking
             let speech_start1: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
             let formatted_flag1: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
             current_turn_shared.set(Some(current_turn1.clone()));
             current_turn_order_shared.set(Some(current_turn_order1.clone()));
-            needs_paragraph_check_shared.set(Some(needs_para_check.clone()));
             turn_is_formatted1_shared.set(Some(formatted_flag1.clone()));
 
             let session1 = {
@@ -1242,15 +1309,15 @@ pub fn App() -> Element {
                 let last_speaker = last_speaker.clone();
                 let ct = current_turn1.clone();
                 let cto = current_turn_order1.clone();
-                let npc = needs_para_check.clone();
-                let tcc = turn_commit_counter.clone();
-                let mut t_sig = transcript;
-                let mut p_sig = partial;
+                let sentence_counter = format_sentence_counter.clone();
+                let pending_chars = format_pending_chars.clone();
+                let t_sig = transcript;
+                let p_sig = partial;
                 let ss1 = speech_start1.clone();
                 let ts1 = turn_start1.clone();
                 let live_rc = live_turns_rc.clone();
                 let s2_for_force = session2_rc_for_s1.clone();
-                let mut ltv = live_turns_version;
+                let ltv = live_turns_version;
                 let ff1 = formatted_flag1.clone();
                 let graph_for_s1 = graph_rc.clone();
 
@@ -1273,101 +1340,199 @@ pub fn App() -> Element {
                             transcript: text,
                             is_formatted,
                             turn_order,
+                            end_of_turn,
                             ..
                         } = event;
                         last_activity.set(js_sys::Date::now());
                         let text = text.replace('\n', " ").replace("  ", " ");
+                        let ct = ct.clone();
+                        let cto = cto.clone();
+                        let sentence_counter = sentence_counter.clone();
+                        let pending_chars = pending_chars.clone();
+                        let last_speaker = last_speaker.clone();
+                        let ss1 = ss1.clone();
+                        let ts1 = ts1.clone();
+                        let live_rc = live_rc.clone();
+                        let s2_for_force = s2_for_force.clone();
+                        let ff1 = ff1.clone();
+                        let mut t_sig = t_sig;
+                        let mut p_sig = p_sig;
+                        let mut ltv = ltv;
+                        defer_ui_update(move || {
+                            let prev_order = cto.get();
+                            let is_new_turn = turn_order != prev_order;
 
-                        let prev_order = cto.get();
-                        let is_new_turn = turn_order != prev_order;
-
-                        if is_new_turn && prev_order != u32::MAX {
-                            let old_turn = ct.borrow().clone();
-                            if !old_turn.is_empty() {
-                                let name = (speaker1_name)();
-                                if multi {
-                                    // Cross-session force endpoint
-                                    if let Some(ref sess) = *s2_for_force.borrow() {
-                                        let _ = sess.force_endpoint();
-                                    }
-                                    // Insert words into live zone at chrono positions
-                                    let elapsed = ss1.get();
-                                    let new_words = split_turn_to_words(elapsed, &name, &old_turn);
-                                    let mut words = live_rc.borrow_mut();
-                                    for w in new_words {
-                                        let pos = words
-                                            .partition_point(|x| x.estimated_ms <= w.estimated_ms);
-                                        words.insert(pos, w);
-                                    }
-                                    drop(words);
-                                    ltv.set(ltv() + 1);
-                                } else {
-                                    // Single speaker: direct to transcript
-                                    let cursor = get_cursor();
-                                    let prev = (t_sig)();
-                                    let elapsed = js_sys::Date::now() - start_time;
-                                    let new_text = build_committed_text(
-                                        &prev,
-                                        &old_turn,
-                                        &name,
-                                        false,
-                                        (show_labels)(),
-                                        (show_timestamps)(),
-                                        elapsed,
-                                        &last_speaker.borrow(),
-                                    );
-                                    t_sig.set(new_text);
-                                    *last_speaker.borrow_mut() = name;
-                                    if let Some((s, e)) = cursor {
-                                        restore_cursor(s, e);
-                                    }
-                                }
-                                if anthropic_configured() && (auto_format_enabled)() {
-                                    tcc.set(tcc.get() + 1);
-                                    if tcc.get().is_multiple_of((format_nth)()) {
-                                        npc.set(true);
+                            if is_new_turn && prev_order != u32::MAX {
+                                let old_turn = ct.borrow().clone();
+                                if !old_turn.is_empty() {
+                                    let name = speaker1_name.peek().clone();
+                                    if multi {
+                                        // Cross-session force endpoint
+                                        if let Some(ref sess) = *s2_for_force.borrow() {
+                                            let _ = sess.force_endpoint();
+                                        }
+                                        // Insert words into live zone at chrono positions
+                                        let elapsed = ss1.get();
+                                        let new_words =
+                                            split_turn_to_words(elapsed, &name, &old_turn);
+                                        let mut words = live_rc.borrow_mut();
+                                        for w in new_words {
+                                            let pos = words.partition_point(|x| {
+                                                x.estimated_ms <= w.estimated_ms
+                                            });
+                                            words.insert(pos, w);
+                                        }
+                                        drop(words);
+                                        let previous_live_turns_version = *ltv.peek();
+                                        ltv.set(previous_live_turns_version + 1);
+                                    } else {
+                                        // Single speaker: direct to transcript
+                                        let cursor = get_cursor();
+                                        let prev = t_sig.peek().clone();
+                                        let elapsed = js_sys::Date::now() - start_time;
+                                        let new_text = build_committed_text(
+                                            &prev,
+                                            &old_turn,
+                                            &name,
+                                            false,
+                                            *show_labels.peek(),
+                                            *show_timestamps.peek(),
+                                            elapsed,
+                                            &last_speaker.borrow(),
+                                        );
+                                        t_sig.set(new_text);
+                                        *last_speaker.borrow_mut() = name;
+                                        if let Some((s, e)) = cursor {
+                                            restore_cursor(s, e);
+                                        }
+                                        note_committed_text_and_maybe_format(
+                                            &sentence_counter,
+                                            &pending_chars,
+                                            &old_turn,
+                                            anthropic_configured,
+                                            auto_format_enabled,
+                                            format_nth,
+                                            reformat_model_config_id,
+                                            reformat_credential,
+                                            format_depth,
+                                            format_context_depth,
+                                            t_sig,
+                                            llm_cost,
+                                            false,
+                                        );
                                     }
                                 }
                             }
-                        }
 
-                        if is_new_turn {
-                            // Record when this new turn started speaking
-                            let elapsed = js_sys::Date::now() - start_time;
-                            ss1.set(elapsed);
-                            ts1.set(elapsed);
-                        }
+                            if is_new_turn {
+                                // Record when this new turn started speaking
+                                let elapsed = js_sys::Date::now() - start_time;
+                                ss1.set(elapsed);
+                                ts1.set(elapsed);
+                            }
 
-                        cto.set(turn_order);
-                        *ct.borrow_mut() = text.clone();
-                        p_sig.set(text);
-                        ff1.set(is_formatted);
+                            if end_of_turn {
+                                let final_turn = if text.trim().is_empty() {
+                                    ct.borrow().clone()
+                                } else {
+                                    text.clone()
+                                };
+                                if !final_turn.is_empty() {
+                                    let name = speaker1_name.peek().clone();
+                                    if multi {
+                                        if let Some(ref sess) = *s2_for_force.borrow() {
+                                            let _ = sess.force_endpoint();
+                                        }
+                                        let elapsed = ss1.get();
+                                        let new_words =
+                                            split_turn_to_words(elapsed, &name, &final_turn);
+                                        let mut words = live_rc.borrow_mut();
+                                        for w in new_words {
+                                            let pos = words.partition_point(|x| {
+                                                x.estimated_ms <= w.estimated_ms
+                                            });
+                                            words.insert(pos, w);
+                                        }
+                                        drop(words);
+                                        let previous_live_turns_version = *ltv.peek();
+                                        ltv.set(previous_live_turns_version + 1);
+                                    } else {
+                                        let cursor = get_cursor();
+                                        let prev = t_sig.peek().clone();
+                                        let elapsed = js_sys::Date::now() - start_time;
+                                        let new_text = build_committed_text(
+                                            &prev,
+                                            &final_turn,
+                                            &name,
+                                            false,
+                                            *show_labels.peek(),
+                                            *show_timestamps.peek(),
+                                            elapsed,
+                                            &last_speaker.borrow(),
+                                        );
+                                        t_sig.set(new_text);
+                                        *last_speaker.borrow_mut() = name;
+                                        if let Some((s, e)) = cursor {
+                                            restore_cursor(s, e);
+                                        }
+                                        note_committed_text_and_maybe_format(
+                                            &sentence_counter,
+                                            &pending_chars,
+                                            &final_turn,
+                                            anthropic_configured,
+                                            auto_format_enabled,
+                                            format_nth,
+                                            reformat_model_config_id,
+                                            reformat_credential,
+                                            format_depth,
+                                            format_context_depth,
+                                            t_sig,
+                                            llm_cost,
+                                            false,
+                                        );
+                                    }
+                                }
+                                cto.set(u32::MAX);
+                                ct.borrow_mut().clear();
+                                p_sig.set(String::new());
+                                ff1.set(is_formatted);
+                                return;
+                            }
+
+                            cto.set(turn_order);
+                            *ct.borrow_mut() = text.clone();
+                            p_sig.set(text);
+                            ff1.set(is_formatted);
+                        });
                     },
                     {
                         let mut rec_state = rec_state;
                         let mut status_msg = status_msg;
                         let mut error_msg = error_msg;
                         move |code: u16, reason: String| {
-                            rec_state.set(RecState::Stopped);
-                            if code == 4001 {
-                                error_msg.set(Some("Not authorized — check your API key".into()));
-                                status_msg.set("Auth error".into());
-                            } else if code == 1006 {
-                                let detail = if reason.is_empty() {
-                                    "connection failed".to_string()
+                            defer_ui_update(move || {
+                                rec_state.set(RecState::Stopped);
+                                if code == 4001 {
+                                    error_msg
+                                        .set(Some("Not authorized — check your API key".into()));
+                                    status_msg.set("Auth error".into());
+                                } else if code == 1006 {
+                                    let detail = if reason.is_empty() {
+                                        "connection failed".to_string()
+                                    } else {
+                                        reason
+                                    };
+                                    error_msg.set(Some(format!("WebSocket error: {detail}")));
+                                    status_msg.set("Error".into());
+                                } else if code != 1000 {
+                                    error_msg.set(Some(format!(
+                                        "Connection closed (code {code}): {reason}"
+                                    )));
+                                    status_msg.set("Disconnected".into());
                                 } else {
-                                    reason
-                                };
-                                error_msg.set(Some(format!("WebSocket error: {detail}")));
-                                status_msg.set("Error".into());
-                            } else if code != 1000 {
-                                error_msg.set(Some(format!(
-                                    "Connection closed (code {code}): {reason}"
-                                )));
-                                status_msg.set("Disconnected".into());
-                            } else {
-                                status_msg.set("Disconnected".into());
-                            }
+                                    status_msg.set("Disconnected".into());
+                                }
+                            });
                         }
                     },
                 ) {
@@ -1418,14 +1583,12 @@ pub fn App() -> Element {
                                 let last_activity = last_activity.clone();
                                 let ct = ct2.clone();
                                 let cto = cto2.clone();
-                                let npc = needs_para_check.clone();
-                                let tcc = turn_commit_counter.clone();
-                                let mut p2_sig = partial2;
+                                let p2_sig = partial2;
                                 let ss2 = speech_start2.clone();
                                 let ts2 = turn_start2.clone();
                                 let live_rc = live_turns_rc.clone();
                                 let s1_for_force = session1_rc.clone();
-                                let mut ltv = live_turns_version;
+                                let ltv = live_turns_version;
                                 let ff2 = formatted_flag2.clone();
                                 let graph_for_s2 = graph_rc.clone();
 
@@ -1451,68 +1614,111 @@ pub fn App() -> Element {
                                             transcript: text,
                                             is_formatted,
                                             turn_order,
+                                            end_of_turn,
                                             ..
                                         } = event;
                                         last_activity.set(js_sys::Date::now());
                                         let text = text.replace('\n', " ").replace("  ", " ");
+                                        let ct = ct.clone();
+                                        let cto = cto.clone();
+                                        let ss2 = ss2.clone();
+                                        let ts2 = ts2.clone();
+                                        let live_rc = live_rc.clone();
+                                        let s1_for_force = s1_for_force.clone();
+                                        let ff2 = ff2.clone();
+                                        let mut p2_sig = p2_sig;
+                                        let mut ltv = ltv;
+                                        defer_ui_update(move || {
+                                            let prev_order = cto.get();
+                                            let is_new_turn = turn_order != prev_order;
 
-                                        let prev_order = cto.get();
-                                        let is_new_turn = turn_order != prev_order;
-
-                                        if is_new_turn && prev_order != u32::MAX {
-                                            let old_turn = ct.borrow().clone();
-                                            if !old_turn.is_empty() {
-                                                let name = (speaker2_name)();
-                                                // Cross-session force endpoint
-                                                if let Some(ref sess) = *s1_for_force.borrow() {
-                                                    let _ = sess.force_endpoint();
-                                                }
-                                                // Insert words into live zone at chrono positions
-                                                let elapsed = ss2.get();
-                                                let new_words =
-                                                    split_turn_to_words(elapsed, &name, &old_turn);
-                                                let mut words = live_rc.borrow_mut();
-                                                for w in new_words {
-                                                    let pos = words.partition_point(|x| {
-                                                        x.estimated_ms <= w.estimated_ms
-                                                    });
-                                                    words.insert(pos, w);
-                                                }
-                                                drop(words);
-                                                ltv.set(ltv() + 1);
-                                                if anthropic_configured() && (auto_format_enabled)()
-                                                {
-                                                    tcc.set(tcc.get() + 1);
-                                                    if tcc.get().is_multiple_of((format_nth)()) {
-                                                        npc.set(true);
+                                            if is_new_turn && prev_order != u32::MAX {
+                                                let old_turn = ct.borrow().clone();
+                                                if !old_turn.is_empty() {
+                                                    let name = speaker2_name.peek().clone();
+                                                    // Cross-session force endpoint
+                                                    if let Some(ref sess) = *s1_for_force.borrow() {
+                                                        let _ = sess.force_endpoint();
                                                     }
+                                                    // Insert words into live zone at chrono positions
+                                                    let elapsed = ss2.get();
+                                                    let new_words = split_turn_to_words(
+                                                        elapsed, &name, &old_turn,
+                                                    );
+                                                    let mut words = live_rc.borrow_mut();
+                                                    for w in new_words {
+                                                        let pos = words.partition_point(|x| {
+                                                            x.estimated_ms <= w.estimated_ms
+                                                        });
+                                                        words.insert(pos, w);
+                                                    }
+                                                    drop(words);
+                                                    let previous_live_turns_version = *ltv.peek();
+                                                    ltv.set(previous_live_turns_version + 1);
                                                 }
                                             }
-                                        }
 
-                                        if is_new_turn {
-                                            let elapsed = js_sys::Date::now() - start_time;
-                                            ss2.set(elapsed);
-                                            ts2.set(elapsed);
-                                        }
+                                            if is_new_turn {
+                                                let elapsed = js_sys::Date::now() - start_time;
+                                                ss2.set(elapsed);
+                                                ts2.set(elapsed);
+                                            }
 
-                                        cto.set(turn_order);
-                                        *ct.borrow_mut() = text.clone();
-                                        p2_sig.set(text);
-                                        ff2.set(is_formatted);
+                                            if end_of_turn {
+                                                let final_turn = if text.trim().is_empty() {
+                                                    ct.borrow().clone()
+                                                } else {
+                                                    text.clone()
+                                                };
+                                                if !final_turn.is_empty() {
+                                                    let name = speaker2_name.peek().clone();
+                                                    if let Some(ref sess) = *s1_for_force.borrow() {
+                                                        let _ = sess.force_endpoint();
+                                                    }
+                                                    let elapsed = ss2.get();
+                                                    let new_words = split_turn_to_words(
+                                                        elapsed,
+                                                        &name,
+                                                        &final_turn,
+                                                    );
+                                                    let mut words = live_rc.borrow_mut();
+                                                    for w in new_words {
+                                                        let pos = words.partition_point(|x| {
+                                                            x.estimated_ms <= w.estimated_ms
+                                                        });
+                                                        words.insert(pos, w);
+                                                    }
+                                                    drop(words);
+                                                    let previous_live_turns_version = *ltv.peek();
+                                                    ltv.set(previous_live_turns_version + 1);
+                                                }
+                                                cto.set(u32::MAX);
+                                                ct.borrow_mut().clear();
+                                                p2_sig.set(String::new());
+                                                ff2.set(is_formatted);
+                                                return;
+                                            }
+
+                                            cto.set(turn_order);
+                                            *ct.borrow_mut() = text.clone();
+                                            p2_sig.set(text);
+                                            ff2.set(is_formatted);
+                                        });
                                     },
                                     {
                                         let mut rec_state = rec_state;
                                         let mut status_msg = status_msg;
                                         let mut error_msg = error_msg;
                                         move |code: u16, reason: String| {
-                                            rec_state.set(RecState::Stopped);
-                                            if code != 1000 {
-                                                error_msg.set(Some(format!(
+                                            defer_ui_update(move || {
+                                                rec_state.set(RecState::Stopped);
+                                                if code != 1000 {
+                                                    error_msg.set(Some(format!(
                                                     "Speaker 2 disconnected (code {code}): {reason}"
                                                 )));
-                                            }
-                                            status_msg.set("Disconnected".into());
+                                                }
+                                                status_msg.set("Disconnected".into());
+                                            });
                                         }
                                     },
                                 ) {
@@ -1577,12 +1783,12 @@ pub fn App() -> Element {
                     status_msg.set("Recording…".into());
 
                     // ── Countdown ticker ─────────────────────────────
-                    countdown_secs.set(Some(idle_minutes() * 60));
+                    countdown_secs.set(Some(*idle_minutes.peek() * 60));
                     let last_activity = last_activity.clone();
                     let session_for_timeout = session1_rc.clone();
                     let cap_for_timeout = cap_rc;
                     let session2_for_timeout = if multi {
-                        (session_handle2)().clone()
+                        session_handle2.peek().clone()
                     } else {
                         None
                     };
@@ -1593,24 +1799,25 @@ pub fn App() -> Element {
                     let mut partial2_t = partial2;
                     let mut transcript_t = transcript;
                     let mut countdown_secs = countdown_secs;
-                    let ticker_needs_para = needs_para_check.clone();
                     let ticker_last_speaker = last_speaker.clone();
                     let ticker_live_turns = live_turns_rc.clone();
                     let ticker_ts1 = turn_start1.clone();
                     let ticker_ts2 = turn_start2.clone();
+                    let ticker_sentence_counter = format_sentence_counter.clone();
+                    let ticker_pending_chars = format_pending_chars.clone();
                     let mut ticker_ltv = live_turns_version;
 
-                    spawn(async move {
+                    spawn_browser_task(async move {
                         let mut blink_on = false;
                         let mut beep_cooldown: u32 = 0;
                         loop {
                             gloo_timers::future::TimeoutFuture::new(1_000).await;
-                            if rec_state() != RecState::Recording {
+                            if *rec_state.peek() != RecState::Recording {
                                 countdown_secs.set(None);
                                 set_tab_title("Parley");
                                 break;
                             }
-                            let timeout_total_secs = idle_minutes() * 60;
+                            let timeout_total_secs = *idle_minutes.peek() * 60;
                             let elapsed_ms = js_sys::Date::now() - last_activity.get();
                             let timeout_ms = (timeout_total_secs as f64) * 1000.0;
                             let remaining_ms = (timeout_ms - elapsed_ms).max(0.0);
@@ -1621,53 +1828,13 @@ pub fn App() -> Element {
                             {
                                 // $0.45/hr per session = $0.000125/sec
                                 let rate_per_sec = if multi { 0.000125 * 2.0 } else { 0.000125 };
-                                stt_cost.set(stt_cost() + rate_per_sec);
-                            }
-
-                            // Paragraph detection
-                            if ticker_needs_para.get() {
-                                ticker_needs_para.set(false);
-                                let model = (reformat_model_config_id)();
-                                let cred = (reformat_credential)();
-                                let depth = (format_depth)();
-                                let ctx_depth = (format_context_depth)();
-                                let mut t = transcript_t;
-                                let mut llm = llm_cost;
-                                spawn(async move {
-                                    let text = (t)();
-                                    if !text.is_empty()
-                                        && let Some(result) = check_formatting(
-                                            &text, multi, &model, &cred, depth, ctx_depth,
-                                        )
-                                        .await
-                                    {
-                                        // Accumulate LLM cost — `model` is the
-                                        // registry config id; `llm_rates` keys
-                                        // on substring of "haiku"/"sonnet" so
-                                        // typical config ids still resolve.
-                                        let (in_rate, out_rate) = llm_rates(&model);
-                                        llm.set(
-                                            llm()
-                                                + token_cost(
-                                                    result.input_tokens,
-                                                    result.output_tokens,
-                                                    in_rate,
-                                                    out_rate,
-                                                ),
-                                        );
-                                        if let Some(formatted) = result.formatted {
-                                            let cursor = get_cursor();
-                                            t.set(formatted);
-                                            if let Some((s, e)) = cursor {
-                                                restore_cursor(s, e);
-                                            }
-                                        }
-                                    }
-                                });
+                                let previous_stt_cost = *stt_cost.peek();
+                                stt_cost.set(previous_stt_cost + rate_per_sec);
                             }
 
                             // Graduate live turns (multi-speaker only)
                             if multi {
+                                let transcript_before_graduation = transcript_t.peek().clone();
                                 let before = ticker_live_turns.borrow().len();
                                 graduate_live_words(
                                     &ticker_live_turns,
@@ -1676,12 +1843,32 @@ pub fn App() -> Element {
                                     ticker_ts1.get(),
                                     ticker_ts2.get(),
                                     start_time,
-                                    (show_labels)(),
-                                    (show_timestamps)(),
+                                    *show_labels.peek(),
+                                    *show_timestamps.peek(),
                                 );
                                 let after = ticker_live_turns.borrow().len();
                                 if before != after {
-                                    ticker_ltv.set(ticker_ltv() + 1);
+                                    let previous_live_turns_version = *ticker_ltv.peek();
+                                    ticker_ltv.set(previous_live_turns_version + 1);
+                                    let transcript_after_graduation = transcript_t.peek().clone();
+                                    let committed_text = transcript_after_graduation
+                                        .strip_prefix(&transcript_before_graduation)
+                                        .unwrap_or(&transcript_after_graduation);
+                                    note_committed_text_and_maybe_format(
+                                        &ticker_sentence_counter,
+                                        &ticker_pending_chars,
+                                        committed_text,
+                                        anthropic_configured,
+                                        auto_format_enabled,
+                                        format_nth,
+                                        reformat_model_config_id,
+                                        reformat_credential,
+                                        format_depth,
+                                        format_context_depth,
+                                        transcript_t,
+                                        llm_cost,
+                                        true,
+                                    );
                                 }
                             }
 
@@ -1726,12 +1913,15 @@ pub fn App() -> Element {
                                     let _ = sess.terminate();
                                 }
                                 // Flush partials
-                                let p1 = (partial_t)();
+                                let p1 = partial_t.peek().clone();
                                 if !p1.is_empty() {
                                     if multi {
                                         let elapsed = js_sys::Date::now() - start_time;
-                                        let new_words =
-                                            split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
+                                        let new_words = split_turn_to_words(
+                                            elapsed,
+                                            &speaker1_name.peek(),
+                                            &p1,
+                                        );
                                         let mut words = ticker_live_turns.borrow_mut();
                                         for w in new_words {
                                             let pos = words.partition_point(|x| {
@@ -1740,16 +1930,16 @@ pub fn App() -> Element {
                                             words.insert(pos, w);
                                         }
                                     } else {
-                                        let prev = (transcript_t)();
-                                        let name = (speaker1_name)();
+                                        let prev = transcript_t.peek().clone();
+                                        let name = speaker1_name.peek().clone();
                                         let elapsed = js_sys::Date::now() - start_time;
                                         let new_text = build_committed_text(
                                             &prev,
                                             &p1,
                                             &name,
                                             false,
-                                            (show_labels)(),
-                                            (show_timestamps)(),
+                                            *show_labels.peek(),
+                                            *show_timestamps.peek(),
                                             elapsed,
                                             &ticker_last_speaker.borrow(),
                                         );
@@ -1759,11 +1949,14 @@ pub fn App() -> Element {
                                     partial_t.set(String::new());
                                 }
                                 if multi {
-                                    let p2 = (partial2_t)();
+                                    let p2 = partial2_t.peek().clone();
                                     if !p2.is_empty() {
                                         let elapsed = js_sys::Date::now() - start_time;
-                                        let new_words =
-                                            split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
+                                        let new_words = split_turn_to_words(
+                                            elapsed,
+                                            &speaker2_name.peek(),
+                                            &p2,
+                                        );
                                         let mut words = ticker_live_turns.borrow_mut();
                                         for w in new_words {
                                             let pos = words.partition_point(|x| {
@@ -1784,10 +1977,11 @@ pub fn App() -> Element {
                                         f64::MAX,
                                         f64::MAX,
                                         start_time,
-                                        (show_labels)(),
-                                        (show_timestamps)(),
+                                        *show_labels.peek(),
+                                        *show_timestamps.peek(),
                                     );
-                                    ticker_ltv.set(ticker_ltv() + 1);
+                                    let previous_live_turns_version = *ticker_ltv.peek();
+                                    ticker_ltv.set(previous_live_turns_version + 1);
                                 }
                                 rec_state.set(RecState::Stopped);
                                 status_msg.set("Idle timeout \u{2014} disconnected".into());
@@ -1816,25 +2010,25 @@ pub fn App() -> Element {
     // ── End Turn (speaker 1) ────────────────────────────────────────
     let on_end_turn1 = move |_| {
         if pipeline_stt_provider.peek().as_str() == "soniox" {
-            if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
-                let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
+            if let Some(sess_rc) = soniox_session_handle.peek().as_ref() {
+                let latency_mode = soniox_latency_mode_from_value(&soniox_latency_mode.peek());
                 finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
             }
             return;
         }
 
-        if let Some(sess_rc) = (session_handle)().as_ref()
+        if let Some(sess_rc) = session_handle.peek().as_ref()
             && let Some(ref sess) = *sess_rc.borrow()
         {
             let _ = sess.force_endpoint();
         }
-        let p = (partial)();
+        let p = partial.peek().clone();
         if !p.is_empty() {
-            let multi = (speaker2_enabled)();
-            let name = (speaker1_name)();
-            let start = (session_start_time)().unwrap_or(0.0);
+            let multi = *speaker2_enabled.peek();
+            let name = speaker1_name.peek().clone();
+            let start = session_start_time.peek().unwrap_or(0.0);
             if multi {
-                if let Some(ref live_rc) = (live_turns_shared)() {
+                if let Some(ref live_rc) = *live_turns_shared.peek() {
                     let elapsed = js_sys::Date::now() - start;
                     let new_words = split_turn_to_words(elapsed, &name, &p);
                     let mut words = live_rc.borrow_mut();
@@ -1843,11 +2037,12 @@ pub fn App() -> Element {
                         words.insert(pos, w);
                     }
                     drop(words);
-                    live_turns_version.set(live_turns_version() + 1);
+                    let previous_live_turns_version = *live_turns_version.peek();
+                    live_turns_version.set(previous_live_turns_version + 1);
                 }
             } else {
-                let prev = (transcript)();
-                let ls = (last_committed_speaker)();
+                let prev = transcript.peek().clone();
+                let ls = last_committed_speaker.peek().clone();
                 let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
                 let elapsed = js_sys::Date::now() - start;
                 let new_text = build_committed_text(
@@ -1855,8 +2050,8 @@ pub fn App() -> Element {
                     &p,
                     &name,
                     false,
-                    (show_labels)(),
-                    (show_timestamps)(),
+                    *show_labels.peek(),
+                    *show_timestamps.peek(),
                     elapsed,
                     &ls_name,
                 );
@@ -1867,10 +2062,10 @@ pub fn App() -> Element {
             }
             partial.set(String::new());
         }
-        if let Some(ct) = (current_turn_shared)().as_ref() {
+        if let Some(ct) = current_turn_shared.peek().as_ref() {
             *ct.borrow_mut() = String::new();
         }
-        if let Some(cto) = (current_turn_order_shared)().as_ref() {
+        if let Some(cto) = current_turn_order_shared.peek().as_ref() {
             cto.set(u32::MAX);
         }
     };
@@ -1878,23 +2073,23 @@ pub fn App() -> Element {
     // ── End Turn (speaker 2) ────────────────────────────────────────
     let on_end_turn2 = move |_| {
         if pipeline_stt_provider.peek().as_str() == "soniox" {
-            if let Some(sess_rc) = (soniox_session_handle)().as_ref() {
-                let latency_mode = soniox_latency_mode_from_value(&(soniox_latency_mode)());
+            if let Some(sess_rc) = soniox_session_handle.peek().as_ref() {
+                let latency_mode = soniox_latency_mode_from_value(&soniox_latency_mode.peek());
                 finalize_soniox_session_after_settle(sess_rc.clone(), latency_mode);
             }
             return;
         }
 
-        if let Some(sess_rc) = (session_handle2)().as_ref()
+        if let Some(sess_rc) = session_handle2.peek().as_ref()
             && let Some(ref sess) = *sess_rc.borrow()
         {
             let _ = sess.force_endpoint();
         }
-        let p = (partial2)();
+        let p = partial2.peek().clone();
         if !p.is_empty() {
-            let name = (speaker2_name)();
-            let start = (session_start_time)().unwrap_or(0.0);
-            if let Some(ref live_rc) = (live_turns_shared)() {
+            let name = speaker2_name.peek().clone();
+            let start = session_start_time.peek().unwrap_or(0.0);
+            if let Some(ref live_rc) = *live_turns_shared.peek() {
                 let elapsed = js_sys::Date::now() - start;
                 let new_words = split_turn_to_words(elapsed, &name, &p);
                 let mut words = live_rc.borrow_mut();
@@ -1903,14 +2098,15 @@ pub fn App() -> Element {
                     words.insert(pos, w);
                 }
                 drop(words);
-                live_turns_version.set(live_turns_version() + 1);
+                let previous_live_turns_version = *live_turns_version.peek();
+                live_turns_version.set(previous_live_turns_version + 1);
             }
             partial2.set(String::new());
         }
-        if let Some(ct) = (current_turn_shared2)().as_ref() {
+        if let Some(ct) = current_turn_shared2.peek().as_ref() {
             *ct.borrow_mut() = String::new();
         }
-        if let Some(cto) = (current_turn_order_shared2)().as_ref() {
+        if let Some(cto) = current_turn_order_shared2.peek().as_ref() {
             cto.set(u32::MAX);
         }
     };
@@ -1922,14 +2118,14 @@ pub fn App() -> Element {
         status_msg.set("Waiting for final transcript\u{2026}".into());
 
         if pipeline_stt_provider.peek().as_str() == "soniox" {
-            spawn(async move {
-                if let Some(cap_rc) = (capture_handle)().as_ref()
+            spawn_browser_task(async move {
+                if let Some(cap_rc) = capture_handle.peek().as_ref()
                     && let Some(capture) = cap_rc.borrow_mut().take()
                 {
                     capture.stop();
                 }
 
-                if let Some(sess_rc) = (soniox_session_handle)().as_ref()
+                if let Some(sess_rc) = soniox_session_handle.peek().as_ref()
                     && let Some(session) = sess_rc.borrow_mut().take()
                 {
                     let _ = session.finish();
@@ -1945,40 +2141,40 @@ pub fn App() -> Element {
             return;
         }
 
-        spawn(async move {
-            let multi = (speaker2_enabled)();
+        spawn_browser_task(async move {
+            let multi = *speaker2_enabled.peek();
 
             // 1. Stop audio capture — no more audio sent to STT
-            if let Some(cap_rc) = (capture_handle)().as_ref()
+            if let Some(cap_rc) = capture_handle.peek().as_ref()
                 && let Some(cap) = cap_rc.borrow_mut().take()
             {
                 cap.stop();
             }
             if multi
-                && let Some(cap_rc) = (capture_handle2)().as_ref()
+                && let Some(cap_rc) = capture_handle2.peek().as_ref()
                 && let Some(cap) = cap_rc.borrow_mut().take()
             {
                 cap.stop();
             }
 
             // 2. Force endpoint on active sessions and reset formatted flags
-            let s1_has_partial = !(partial)().is_empty();
-            let s2_has_partial = multi && !(partial2)().is_empty();
+            let s1_has_partial = !partial.peek().is_empty();
+            let s2_has_partial = multi && !partial2.peek().is_empty();
 
-            if s1_has_partial && let Some(ref ff) = (turn_is_formatted1_shared)() {
+            if s1_has_partial && let Some(ref ff) = *turn_is_formatted1_shared.peek() {
                 ff.set(false);
             }
-            if s2_has_partial && let Some(ref ff) = (turn_is_formatted2_shared)() {
+            if s2_has_partial && let Some(ref ff) = *turn_is_formatted2_shared.peek() {
                 ff.set(false);
             }
 
-            if let Some(sess_rc) = (session_handle)().as_ref()
+            if let Some(sess_rc) = session_handle.peek().as_ref()
                 && let Some(ref sess) = *sess_rc.borrow()
             {
                 let _ = sess.force_endpoint();
             }
             if multi
-                && let Some(sess_rc) = (session_handle2)().as_ref()
+                && let Some(sess_rc) = session_handle2.peek().as_ref()
                 && let Some(ref sess) = *sess_rc.borrow()
             {
                 let _ = sess.force_endpoint();
@@ -1988,12 +2184,14 @@ pub fn App() -> Element {
             let deadline = js_sys::Date::now() + 5_000.0;
             loop {
                 let s1_done = !s1_has_partial
-                    || (turn_is_formatted1_shared)()
+                    || turn_is_formatted1_shared
+                        .peek()
                         .as_ref()
                         .map(|f| f.get())
                         .unwrap_or(true);
                 let s2_done = !s2_has_partial
-                    || (turn_is_formatted2_shared)()
+                    || turn_is_formatted2_shared
+                        .peek()
                         .as_ref()
                         .map(|f| f.get())
                         .unwrap_or(true);
@@ -2004,27 +2202,27 @@ pub fn App() -> Element {
             }
 
             // 4. Terminate sessions
-            if let Some(sess_rc) = (session_handle)().as_ref()
+            if let Some(sess_rc) = session_handle.peek().as_ref()
                 && let Some(ref sess) = *sess_rc.borrow()
             {
                 let _ = sess.terminate();
             }
             if multi
-                && let Some(sess_rc) = (session_handle2)().as_ref()
+                && let Some(sess_rc) = session_handle2.peek().as_ref()
                 && let Some(ref sess) = *sess_rc.borrow()
             {
                 let _ = sess.terminate();
             }
 
             // 5. Flush speaker 1 partial
-            let start = (session_start_time)().unwrap_or(0.0);
-            let ls = (last_committed_speaker)();
-            let p1 = (partial)();
+            let start = session_start_time.peek().unwrap_or(0.0);
+            let ls = last_committed_speaker.peek().clone();
+            let p1 = partial.peek().clone();
             if !p1.is_empty() {
                 if multi {
-                    if let Some(ref live_rc) = (live_turns_shared)() {
+                    if let Some(ref live_rc) = *live_turns_shared.peek() {
                         let elapsed = js_sys::Date::now() - start;
-                        let new_words = split_turn_to_words(elapsed, &(speaker1_name)(), &p1);
+                        let new_words = split_turn_to_words(elapsed, &speaker1_name.peek(), &p1);
                         let mut words = live_rc.borrow_mut();
                         for w in new_words {
                             let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
@@ -2033,16 +2231,16 @@ pub fn App() -> Element {
                     }
                 } else {
                     let ls_name = ls.as_ref().map(|r| r.borrow().clone()).unwrap_or_default();
-                    let name = (speaker1_name)();
-                    let prev = (transcript)();
+                    let name = speaker1_name.peek().clone();
+                    let prev = transcript.peek().clone();
                     let elapsed = js_sys::Date::now() - start;
                     let new_text = build_committed_text(
                         &prev,
                         &p1,
                         &name,
                         false,
-                        (show_labels)(),
-                        (show_timestamps)(),
+                        *show_labels.peek(),
+                        *show_timestamps.peek(),
                         elapsed,
                         &ls_name,
                     );
@@ -2055,11 +2253,11 @@ pub fn App() -> Element {
             }
             // Flush speaker 2 partial
             if multi {
-                let p2 = (partial2)();
+                let p2 = partial2.peek().clone();
                 if !p2.is_empty() {
-                    if let Some(ref live_rc) = (live_turns_shared)() {
+                    if let Some(ref live_rc) = *live_turns_shared.peek() {
                         let elapsed = js_sys::Date::now() - start;
-                        let new_words = split_turn_to_words(elapsed, &(speaker2_name)(), &p2);
+                        let new_words = split_turn_to_words(elapsed, &speaker2_name.peek(), &p2);
                         let mut words = live_rc.borrow_mut();
                         for w in new_words {
                             let pos = words.partition_point(|x| x.estimated_ms <= w.estimated_ms);
@@ -2069,7 +2267,7 @@ pub fn App() -> Element {
                     partial2.set(String::new());
                 }
                 // Force-graduate all remaining live words
-                if let Some(ref live_rc) = (live_turns_shared)() {
+                if let Some(ref live_rc) = *live_turns_shared.peek() {
                     let ls_rc = ls
                         .clone()
                         .unwrap_or_else(|| Rc::new(RefCell::new(String::new())));
@@ -2080,10 +2278,11 @@ pub fn App() -> Element {
                         f64::MAX,
                         f64::MAX,
                         start,
-                        (show_labels)(),
-                        (show_timestamps)(),
+                        *show_labels.peek(),
+                        *show_timestamps.peek(),
                     );
-                    live_turns_version.set(live_turns_version() + 1);
+                    let previous_live_turns_version = *live_turns_version.peek();
+                    live_turns_version.set(previous_live_turns_version + 1);
                 }
             }
             // Run paragraph detection (gated by trigger strategy).
@@ -2096,26 +2295,27 @@ pub fn App() -> Element {
             // into one drawer entry. Users who want a higher-quality
             // stop pass simply pick Sonnet (or the equivalent
             // registry id) themselves.
-            let do_auto_format = (auto_format_enabled)();
-            let do_format_on_stop = (format_on_stop)();
-            let model_for_stop = (reformat_model_config_id)();
-            let cred_for_stop = (reformat_credential)();
+            let do_auto_format = *auto_format_enabled.peek();
+            let do_format_on_stop = *format_on_stop.peek();
+            let model_for_stop = reformat_model_config_id.peek().clone();
+            let cred_for_stop = reformat_credential.peek().clone();
             if do_auto_format {
                 let model = model_for_stop.clone();
                 let cred = cred_for_stop.clone();
-                let depth = (format_depth)();
-                let ctx_depth = (format_context_depth)();
+                let depth = *format_depth.peek();
+                let ctx_depth = *format_context_depth.peek();
                 let mut t = transcript;
                 let mut llm = llm_cost;
-                spawn(async move {
-                    let text = (t)();
+                spawn_browser_task(async move {
+                    let text = t.peek().clone();
                     if !text.is_empty()
                         && let Some(result) =
                             check_formatting(&text, multi, &model, &cred, depth, ctx_depth).await
                     {
                         let (in_rate, out_rate) = llm_rates(&model);
+                        let previous_llm_cost = *llm.peek();
                         llm.set(
-                            llm()
+                            previous_llm_cost
                                 + token_cost(
                                     result.input_tokens,
                                     result.output_tokens,
@@ -2133,14 +2333,15 @@ pub fn App() -> Element {
                     }
                     // Full-transcript pass on stop using the same picked model.
                     if do_format_on_stop {
-                        let text = (t)();
+                        let text = t.peek().clone();
                         if !text.is_empty()
                             && let Some(result) =
                                 check_formatting(&text, multi, &model, &cred, 0, 0).await
                         {
                             let (in_rate, out_rate) = llm_rates(&model);
+                            let previous_llm_cost = *llm.peek();
                             llm.set(
-                                llm()
+                                previous_llm_cost
                                     + token_cost(
                                         result.input_tokens,
                                         result.output_tokens,
@@ -2164,15 +2365,16 @@ pub fn App() -> Element {
                 let cred = cred_for_stop;
                 let mut t = transcript;
                 let mut llm = llm_cost;
-                spawn(async move {
-                    let text = (t)();
+                spawn_browser_task(async move {
+                    let text = t.peek().clone();
                     if !text.is_empty()
                         && let Some(result) =
                             check_formatting(&text, multi, &model, &cred, 0, 0).await
                     {
                         let (in_rate, out_rate) = llm_rates(&model);
+                        let previous_llm_cost = *llm.peek();
                         llm.set(
-                            llm()
+                            previous_llm_cost
                                 + token_cost(
                                     result.input_tokens,
                                     result.output_tokens,
@@ -2202,25 +2404,26 @@ pub fn App() -> Element {
 
     // ── Transfer action ─────────────────────────────────────────────
     let on_transfer = move |_| {
-        let text = (transcript)();
+        let text = transcript.peek().clone();
         if text.is_empty() {
             return;
         }
-        let mode = (transfer_mode)();
+        let mode = *transfer_mode.peek();
         match mode {
             TransferMode::Copy => {
                 if let Some(window) = web_sys::window() {
                     let clipboard = window.navigator().clipboard();
                     let _ = clipboard.write_text(&text);
                     transfer_feedback.set(Some("✓ Copied".into()));
-                    spawn(async move {
+                    spawn_browser_task(async move {
                         gloo_timers::future::TimeoutFuture::new(2_000).await;
                         transfer_feedback.set(None);
                     });
                 }
             }
             TransferMode::TxtFile => {
-                let filename = if (prompt_filename)() {
+                let should_prompt_filename = *prompt_filename.peek();
+                let filename = if should_prompt_filename {
                     let default = generate_filename("txt");
                     match web_sys::window()
                         .and_then(|w| w.prompt_with_message_and_default("Save as:", &default).ok())
@@ -2233,25 +2436,25 @@ pub fn App() -> Element {
                     generate_filename("txt")
                 };
                 trigger_download(&filename, &text, "text/plain");
-                let fb = if (prompt_filename)() {
+                let fb = if should_prompt_filename {
                     format!("✓ Saved as {filename}")
                 } else {
                     "✓ Saved".into()
                 };
                 transfer_feedback.set(Some(fb));
-                spawn(async move {
+                spawn_browser_task(async move {
                     gloo_timers::future::TimeoutFuture::new(2_000).await;
                     transfer_feedback.set(None);
                 });
             }
             TransferMode::MdFile => {
-                let multi = (speaker2_enabled)();
-                let duration_ms = (session_start_time)()
+                let multi = *speaker2_enabled.peek();
+                let duration_ms = (*session_start_time.peek())
                     .map(|st| js_sys::Date::now() - st)
                     .unwrap_or(0.0);
                 let md_content = if multi {
-                    let s1 = (speaker1_name)();
-                    let s2 = (speaker2_name)();
+                    let s1 = speaker1_name.peek().clone();
+                    let s2 = speaker2_name.peek().clone();
                     let date = js_sys::Date::new_0();
                     let iso = date.to_iso_string();
                     format!(
@@ -2271,7 +2474,8 @@ pub fn App() -> Element {
                         text
                     )
                 };
-                let filename = if (prompt_filename)() {
+                let should_prompt_filename = *prompt_filename.peek();
+                let filename = if should_prompt_filename {
                     let default = generate_filename("md");
                     match web_sys::window()
                         .and_then(|w| w.prompt_with_message_and_default("Save as:", &default).ok())
@@ -2284,13 +2488,13 @@ pub fn App() -> Element {
                     generate_filename("md")
                 };
                 trigger_download(&filename, &md_content, "text/markdown");
-                let fb = if (prompt_filename)() {
+                let fb = if should_prompt_filename {
                     format!("✓ Saved as {filename}")
                 } else {
                     "✓ Saved".into()
                 };
                 transfer_feedback.set(Some(fb));
-                spawn(async move {
+                spawn_browser_task(async move {
                     gloo_timers::future::TimeoutFuture::new(2_000).await;
                     transfer_feedback.set(None);
                 });
@@ -2306,30 +2510,28 @@ pub fn App() -> Element {
         transcript.set(String::new());
         partial.set(String::new());
         partial2.set(String::new());
-        if let Some(ct) = (current_turn_shared)().as_ref() {
+        if let Some(ct) = current_turn_shared.peek().as_ref() {
             *ct.borrow_mut() = String::new();
         }
-        if let Some(cto) = (current_turn_order_shared)().as_ref() {
+        if let Some(cto) = current_turn_order_shared.peek().as_ref() {
             cto.set(u32::MAX);
         }
-        if let Some(ct) = (current_turn_shared2)().as_ref() {
+        if let Some(ct) = current_turn_shared2.peek().as_ref() {
             *ct.borrow_mut() = String::new();
         }
-        if let Some(cto) = (current_turn_order_shared2)().as_ref() {
+        if let Some(cto) = current_turn_order_shared2.peek().as_ref() {
             cto.set(u32::MAX);
-        }
-        if let Some(npc) = (needs_paragraph_check_shared)().as_ref() {
-            npc.set(false);
         }
         // Clear live zone
-        if let Some(ref live_rc) = (live_turns_shared)() {
+        if let Some(ref live_rc) = *live_turns_shared.peek() {
             live_rc.borrow_mut().clear();
-            live_turns_version.set(live_turns_version() + 1);
+            let previous_live_turns_version = *live_turns_version.peek();
+            live_turns_version.set(previous_live_turns_version + 1);
         }
         // Reset cost counters
         stt_cost.set(0.0);
         llm_cost.set(0.0);
-        if rec_state() == RecState::Stopped {
+        if *rec_state.peek() == RecState::Stopped {
             rec_state.set(RecState::Idle);
             status_msg.set("Ready".into());
         }
@@ -2341,21 +2543,22 @@ pub fn App() -> Element {
         // Reformatting). The legacy "always Sonnet 4.6" hardcode was
         // removed when the picker moved to a single global home
         // (`docs/global-reformat-spec.md` §4).
-        let model = (reformat_model_config_id)();
-        let cred = (reformat_credential)();
-        let multi = (speaker2_enabled)();
+        let model = reformat_model_config_id.peek().clone();
+        let cred = reformat_credential.peek().clone();
+        let multi = *speaker2_enabled.peek();
         let mut t = transcript;
         let mut r = reformatting;
         let mut llm = llm_cost;
-        spawn(async move {
+        spawn_browser_task(async move {
             r.set(true);
-            let text = (t)();
+            let text = t.peek().clone();
             if !text.is_empty()
                 && let Some(result) = check_formatting(&text, multi, &model, &cred, 0, 0).await
             {
                 let (in_rate, out_rate) = llm_rates(&model);
+                let previous_llm_cost = *llm.peek();
                 llm.set(
-                    llm()
+                    previous_llm_cost
                         + token_cost(result.input_tokens, result.output_tokens, in_rate, out_rate),
                 );
                 if let Some(formatted) = result.formatted {
@@ -2561,7 +2764,10 @@ pub fn App() -> Element {
                         }
                         button {
                             class: "btn btn-transfer-arrow",
-                            onclick: move |_| show_transfer_menu.set(!(show_transfer_menu)()),
+                            onclick: move |_| {
+                                let is_open = *show_transfer_menu.peek();
+                                show_transfer_menu.set(!is_open);
+                            },
                             "\u{25be}"
                         }
                         if (show_transfer_menu)() {
@@ -2713,10 +2919,12 @@ pub(crate) fn SecretsKeyRow(
     // When the parent flips `configured` (e.g. after a delete from
     // another row), collapse back to the badge view automatically.
     use_effect(use_reactive!(|configured| {
-        editing.set(!configured);
-        if configured {
-            value.set(String::new());
-        }
+        defer_ui_update(move || {
+            editing.set(!configured);
+            if configured {
+                value.set(String::new());
+            }
+        });
     }));
 
     let input_id = format!("secret-{provider}");
@@ -2728,7 +2936,7 @@ pub(crate) fn SecretsKeyRow(
         }
         busy.set(true);
         error.set(String::new());
-        spawn(async move {
+        spawn_browser_task(async move {
             match secrets::set_credential(provider, "default", &key).await {
                 Ok(_) => {
                     value.set(String::new());
@@ -2743,7 +2951,7 @@ pub(crate) fn SecretsKeyRow(
     let on_remove = move |_| {
         busy.set(true);
         error.set(String::new());
-        spawn(async move {
+        spawn_browser_task(async move {
             match secrets::delete_credential(provider, "default").await {
                 Ok(()) => {
                     on_changed.call(());

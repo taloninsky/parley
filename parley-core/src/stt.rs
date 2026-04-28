@@ -215,6 +215,17 @@ pub struct NormalizedSttBatch {
 }
 
 impl NormalizedSttBatch {
+    /// True when this batch carries a provider boundary marker that should be
+    /// treated as a committed turn boundary by UI consumers.
+    pub fn has_turn_boundary(&self) -> bool {
+        self.markers.iter().any(|marker| {
+            matches!(
+                marker,
+                SttMarker::Endpoint | SttMarker::FinalizeComplete | SttMarker::Finished
+            )
+        })
+    }
+
     /// Apply all graph updates in deterministic lane order.
     pub fn apply_to_graph(&self, graph: &mut WordGraph) {
         for update in &self.updates {
@@ -704,6 +715,24 @@ mod tests {
             batch.markers,
             vec![SttMarker::Endpoint, SttMarker::FinalizeComplete]
         );
+        assert!(batch.has_turn_boundary());
+    }
+
+    #[test]
+    fn turn_boundary_detection_covers_provider_markers() {
+        for marker in [
+            SttMarker::Endpoint,
+            SttMarker::FinalizeComplete,
+            SttMarker::Finished,
+        ] {
+            let batch = NormalizedSttBatch {
+                updates: Vec::new(),
+                markers: vec![marker],
+            };
+            assert!(batch.has_turn_boundary(), "marker {marker:?} is a boundary");
+        }
+
+        assert!(!NormalizedSttBatch::default().has_turn_boundary());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use parley_core::stt::{SttGraphUpdate, SttMarker, SttStreamEvent, TokenStreamNormalizer};
+use parley_core::stt::{SttGraphUpdate, SttStreamEvent, TokenStreamNormalizer};
 use parley_core::word_graph::SttWord;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
@@ -85,6 +85,10 @@ fn render_updates(updates: &[SttGraphUpdate], provisional: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn defer_voice_update(update: impl FnOnce() + 'static) {
+    gloo_timers::callback::Timeout::new(0, update).forget();
 }
 
 /// Provider-neutral handle the hook owns.
@@ -273,9 +277,21 @@ pub fn use_voice_input() -> VoiceInputHandle {
             let LiveCapture { session, capture } = live;
             capture.stop();
             let _ = session.finalize();
+            let mut interim_text = interim_text;
+            let mut final_text = final_text;
             spawn_local(async move {
                 gloo_timers::future::TimeoutFuture::new(2000).await;
                 let _ = session.terminate();
+                let current_final = final_text.peek().trim().to_string();
+                let fallback = interim_text.peek().trim().to_string();
+                if !fallback.is_empty() {
+                    if current_final.is_empty() || fallback.starts_with(&current_final) {
+                        final_text.set(fallback);
+                    } else if !current_final.ends_with(&fallback) {
+                        final_text.set(format!("{current_final} {fallback}"));
+                    }
+                    interim_text.set(String::new());
+                }
                 drop(session);
                 state.set(VoiceState::Idle);
             });
@@ -317,8 +333,8 @@ pub fn use_voice_input() -> VoiceInputHandle {
 
 async fn start_assemblyai_session(
     mut state: Signal<VoiceState>,
-    mut interim_text: Signal<String>,
-    mut final_text: Signal<String>,
+    interim_text: Signal<String>,
+    final_text: Signal<String>,
 ) -> Option<SttSession> {
     let token = match fetch_temp_token().await {
         Ok(token) => token,
@@ -329,7 +345,11 @@ async fn start_assemblyai_session(
     };
 
     let on_turn = move |evt: TurnEvent| {
-        accept_turn_event(evt, &mut interim_text, &mut final_text);
+        let mut interim_text = interim_text;
+        let mut final_text = final_text;
+        defer_voice_update(move || {
+            accept_turn_event(evt, &mut interim_text, &mut final_text);
+        });
     };
     let on_close = move |_code: u16, _reason: String| {};
 
@@ -344,8 +364,8 @@ async fn start_assemblyai_session(
 
 async fn start_soniox_session(
     mut state: Signal<VoiceState>,
-    mut interim_text: Signal<String>,
-    mut final_text: Signal<String>,
+    interim_text: Signal<String>,
+    final_text: Signal<String>,
 ) -> Option<SttSession> {
     let latency_mode = selected_soniox_latency_mode();
     let context_text = selected_soniox_context_text();
@@ -364,34 +384,47 @@ async fn start_soniox_session(
         let finalize_seen = finalize_seen.clone();
         move |event: SttStreamEvent| {
             if let SttStreamEvent::Error { message, .. } = &event {
-                state.set(VoiceState::Error(format!("soniox: {message}")));
+                let message = message.clone();
+                defer_voice_update(move || {
+                    state.set(VoiceState::Error(format!("soniox: {message}")));
+                });
                 return;
             }
 
             let batch = match normalizer.borrow_mut().accept_event(event) {
                 Ok(batch) => batch,
                 Err(e) => {
-                    state.set(VoiceState::Error(format!("soniox normalize: {e}")));
+                    defer_voice_update(move || {
+                        state.set(VoiceState::Error(format!("soniox normalize: {e}")));
+                    });
                     return;
                 }
             };
 
             let finalized = render_updates(&batch.updates, false);
-            if !finalized.is_empty() {
-                final_text.with_mut(|s| {
-                    if !s.is_empty() {
-                        s.push(' ');
-                    }
-                    s.push_str(finalized.trim());
-                });
-            }
-
             let provisional = render_updates(&batch.updates, true);
-            interim_text.set(provisional);
-            if batch.markers.contains(&SttMarker::FinalizeComplete) {
+            let has_turn_boundary = batch.has_turn_boundary();
+            if has_turn_boundary {
                 finalize_seen.set(true);
-                interim_text.set(String::new());
             }
+            let mut interim_text = interim_text;
+            let mut final_text = final_text;
+            defer_voice_update(move || {
+                if !finalized.is_empty() {
+                    final_text.with_mut(|s| {
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(finalized.trim());
+                    });
+                }
+
+                interim_text.set(if has_turn_boundary {
+                    String::new()
+                } else {
+                    provisional
+                });
+            });
         }
     };
     let on_close = move |_code: u16, _reason: String| {};
@@ -416,11 +449,15 @@ async fn start_soniox_session(
 
 fn start_xai_session(
     mut state: Signal<VoiceState>,
-    mut interim_text: Signal<String>,
-    mut final_text: Signal<String>,
+    interim_text: Signal<String>,
+    final_text: Signal<String>,
 ) -> Option<SttSession> {
     let on_turn = move |evt: TurnEvent| {
-        accept_turn_event(evt, &mut interim_text, &mut final_text);
+        let mut interim_text = interim_text;
+        let mut final_text = final_text;
+        defer_voice_update(move || {
+            accept_turn_event(evt, &mut interim_text, &mut final_text);
+        });
     };
     let on_close = move |_code: u16, _reason: String| {};
 

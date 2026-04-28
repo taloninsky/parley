@@ -197,15 +197,28 @@ model is selected. Whole-log reformat is out of scope.
 
 ## 7. Bug fix: why reformat looks dead in Transcribe today
 
-Hypothesis (must be confirmed in implementation):
+As built:
 
-- The `auto_format_enabled` + `tcc.set(...)` block at `app.rs:1237` lives
-  only inside the **AssemblyAI** turn-commit branch. The Soniox ingest path
-  does not call it, so when the user picks Soniox auto-format never fires.
-  Same for the xAI proxy session.
-- Action: extract a `bump_format_counter(...)` helper and call it from the
-  AssemblyAI, Soniox, and xAI completion sites once they commit a turn to
-  the transcript.
+- The historical `auto_format_enabled` + `tcc.set(...)` block lived only in
+  the AssemblyAI turn-commit branch. Soniox appended finalized text through a
+  separate token-normalized path and only looked for `FinalizeComplete`, so
+  endpoint-shaped turns could bypass the formatter trigger.
+- Capture Mode now calls one shared trigger helper after text is actually
+  committed to the transcript: AssemblyAI single-speaker calls it immediately
+  after direct transcript commit; AssemblyAI multi-speaker calls it after live
+  words graduate into the transcript, not when they are merely inserted into
+  the live word zone; Soniox calls it whenever a token-normalized batch
+  appends finalized text, because Soniox may keep a long utterance alive
+  without emitting an endpoint marker.
+- The trigger policy is sentence/character based rather than provider-turn
+  based: sentence-ending punctuation (`.`, `?`, `!`, and common full-width
+  variants) increments the existing "every N" counter, while 500 committed
+  characters since the last pass forces a format request even if the STT
+  provider produced no punctuation.
+- xAI STT is Conversation-Mode-only today. Its voice path still reaches
+  `/format` through the Conversation voice → submit bridge; if xAI does not
+  deliver a final transcript before the stop timeout, the hook promotes the
+  last interim transcript so the bridge can reformat and submit the turn.
 
 Also verify that:
 
@@ -280,10 +293,12 @@ returning a formatted string without the required paragraph split.
 |---|---|
 | `proxy/src/main.rs` | `FormatRequest` shape; provider dispatch; new `model_config_id` field |
 | `proxy/src/llm/mod.rs` | (no change today; future non-Anthropic impls slot in here) |
+| `parley-core/src/stt.rs` | Provider-neutral turn-boundary helper for token-native STT batches |
 | `src/ui/app_state.rs` | New `format_*` signals on `AppSettings`; cookie loads + persistence effects |
 | `src/ui/settings_drawer.rs` | New "Reformatting" section with model dropdown, depth inputs, toggles |
-| `src/ui/app.rs` | Remove local `format_*` signals + `▾` combo dropdown; bump-format-counter helper called from all three STT ingest paths; pass `model_config_id` to `/format` |
+| `src/ui/app.rs` | Remove local `format_*` signals + `▾` combo dropdown; shared auto-format trigger called from committed AssemblyAI/Soniox transcript paths; pass `model_config_id` to `/format` |
 | `src/ui/conversation.rs` | Voice → submit bridge runs `/format` first; new `¶ Reformat` toolbar button |
+| `src/ui/use_voice_input.rs` | Conversation voice hook normalizes Soniox boundaries and preserves xAI interim text if no final arrives before stop timeout |
 | `docs/global-reformat-spec.md` | **This spec doc** |
 | `docs/formatting-config-spec.md` | Status banner pointing to this doc for cross-mode behavior |
 
@@ -293,18 +308,24 @@ returning a formatted string without the required paragraph split.
 
 1. `cargo test -p parley-proxy` — `/format` request decoding, provider
    dispatch, Anthropic happy-path JSON parse.
-2. `cargo check -p parley` (WASM crate) — compile after signal moves.
-3. Manual:
-   - **Transcribe**: select Soniox, speak a few turns, confirm Haiku
-     auto-format fires (console log line `[parley] Haiku applied
-     formatting`).
-   - **Transcribe**: ¶ Reformat full-pass with Sonnet still works.
-   - **Conversation**: enable Voice mode, speak a sloppy sentence, confirm
-     `input` is cleaned before submit; turn off the new toggle, confirm raw
-     text is sent.
-   - **Conversation**: ¶ Reformat button rewrites the last user bubble in
-     place.
-4. `cargo fmt && cargo clippy -- -D warnings`.
+2. `cargo test -p parley-core` — provider-neutral STT boundary detection.
+3. `cargo check -p parley --target wasm32-unknown-unknown` — compile after
+    signal moves.
+4. Manual:
+    - **Transcribe**: select AssemblyAI single-speaker, speak a few turns, confirm
+         auto-format fires after committed turns.
+    - **Transcribe**: select AssemblyAI two-speaker mode, confirm auto-format
+         fires only after live words graduate into the transcript.
+      - **Transcribe**: select Soniox, speak a few turns, confirm Haiku
+         auto-format fires (console log line `[parley] Haiku applied
+         formatting`).
+      - **Transcribe**: ¶ Reformat full-pass with Sonnet still works.
+    - **Conversation**: enable Voice mode with AssemblyAI, Soniox, and xAI in
+         turn; speak a sloppy sentence, confirm `input` is cleaned before submit;
+         turn off the new toggle, confirm raw text is sent.
+      - **Conversation**: ¶ Reformat button rewrites the last user bubble in
+         place.
+5. `cargo fmt && cargo clippy -- -D warnings`.
 
 ---
 
