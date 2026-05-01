@@ -69,6 +69,7 @@ web-sys = { version = "0.3", features = [
     "DisplayMediaStreamConstraints",
     "HtmlAnchorElement",
     "HtmlAudioElement",
+    "HtmlElement",
     "HtmlInputElement",
     "HtmlMediaElement",
     "HtmlSelectElement",

@@ -16,6 +16,7 @@ use parley_core::word_graph::SttWord;
 use parley_core::word_graph::WordGraph;
 
 const TEXTAREA_ID: &str = "parley-transcript";
+const CLEAR_CONFIRM_CANCEL_ID: &str = "clear-confirm-cancel";
 const AUTO_FORMAT_CHAR_LIMIT: usize = 500;
 
 /// Read the textarea's selectionStart / selectionEnd from the DOM.
@@ -57,6 +58,16 @@ fn scroll_textarea_to_bottom() {
     let _ = web_sys::window()
         .unwrap()
         .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 0);
+}
+
+fn focus_clear_confirm_cancel() {
+    if let Some(window) = web_sys::window()
+        && let Some(doc) = window.document()
+        && let Some(el) = doc.get_element_by_id(CLEAR_CONFIRM_CANCEL_ID)
+        && let Ok(button) = el.dyn_into::<web_sys::HtmlElement>()
+    {
+        let _ = button.focus();
+    }
 }
 
 fn defer_ui_update(update: impl FnOnce() + 'static) {
@@ -930,6 +941,7 @@ pub fn App() -> Element {
             .unwrap_or(false)
     });
     let mut transfer_feedback: Signal<Option<String>> = use_signal(|| None);
+    let mut show_clear_confirm = use_signal(|| false);
 
     // ── Formatting settings (lifted to AppSettings/Root) ────────────
     // Spec `docs/global-reformat-spec.md` §3. The settings drawer is
@@ -998,6 +1010,12 @@ pub fn App() -> Element {
         let _ = (transcript)();
         if (auto_scroll)() {
             scroll_textarea_to_bottom();
+        }
+    });
+
+    use_effect(move || {
+        if show_clear_confirm() {
+            defer_ui_update(focus_clear_confirm_cancel);
         }
     });
 
@@ -2507,6 +2525,13 @@ pub fn App() -> Element {
 
     // ── Clear ───────────────────────────────────────────────────────
     let on_clear = move |_| {
+        show_clear_confirm.set(true);
+    };
+    let on_cancel_clear = move |_| {
+        show_clear_confirm.set(false);
+    };
+    let on_confirm_clear = move |_| {
+        show_clear_confirm.set(false);
         transcript.set(String::new());
         partial.set(String::new());
         partial2.set(String::new());
@@ -2594,6 +2619,18 @@ pub fn App() -> Element {
         || !(partial)().is_empty()
         || (multi && !(partial2)().is_empty())
         || has_live;
+    let is_stopping = state == RecState::Stopping;
+    let can_record = state == RecState::Idle || (state == RecState::Stopped && !has_text);
+    let can_stop = state == RecState::Recording;
+    let can_end_turn = state == RecState::Recording && !multi;
+    let can_continue = state == RecState::Stopped && has_text;
+    let can_transfer = has_text && !is_stopping;
+    let can_clear = has_text && !is_stopping;
+    let can_reformat = anthropic_configured()
+        && has_text
+        && !reformatting()
+        && !is_stopping
+        && !(reformat_model_config_id)().is_empty();
     let s1_name_val = (speaker1_name)();
     let s2_name_val = (speaker2_name)();
     let tm = (transfer_mode)();
@@ -2675,16 +2712,17 @@ pub fn App() -> Element {
                                     "{partial}"
                                 }
                             }
-                            button {
-                                class: "btn btn-endturn-inline",
-                                onclick: on_end_turn1,
-                                "\u{23ce} End Turn"
-                            }
                         } else {
                             span { class: "current-turn-label current-turn-idle", "{s1_name_val}" }
                             p { class: "current-turn-text current-turn-placeholder",
                                 "Not recording"
                             }
+                        }
+                        button {
+                            class: "btn btn-endturn-inline",
+                            disabled: state != RecState::Recording,
+                            onclick: on_end_turn1,
+                            "\u{23ce} End Turn"
                         }
                     }
                     div { class: "current-turn current-turn-half",
@@ -2697,16 +2735,17 @@ pub fn App() -> Element {
                                     "{partial2}"
                                 }
                             }
-                            button {
-                                class: "btn btn-endturn-inline",
-                                onclick: on_end_turn2,
-                                "\u{23ce} End Turn"
-                            }
                         } else {
                             span { class: "current-turn-label current-turn-idle", "{s2_name_val}" }
                             p { class: "current-turn-text current-turn-placeholder",
                                 "Not recording"
                             }
+                        }
+                        button {
+                            class: "btn btn-endturn-inline",
+                            disabled: state != RecState::Recording,
+                            onclick: on_end_turn2,
+                            "\u{23ce} End Turn"
                         }
                     }
                 }
@@ -2731,137 +2770,170 @@ pub fn App() -> Element {
 
             // ── Button bar ──────────────────────────────────────────
             div { class: "button-bar",
-                if state == RecState::Idle || (state == RecState::Stopped && !has_text) {
-                    button { class: "btn btn-record", onclick: on_record, "\u{25cf} Record" }
+                button {
+                    class: "btn btn-record",
+                    disabled: !can_record,
+                    onclick: on_record,
+                    "\u{25cf} Record"
                 }
-                if state == RecState::Recording {
-                    button { class: "btn btn-stop", onclick: on_stop, "\u{25a0} Stop" }
-                    if !multi {
-                        button { class: "btn btn-endturn", onclick: on_end_turn1, "\u{23ce} End Turn" }
-                    }
+                button {
+                    class: "btn btn-stop",
+                    disabled: !can_stop,
+                    onclick: on_stop,
+                    "\u{25a0} Stop"
                 }
-                if state == RecState::Stopping {
-                    button { class: "btn btn-stop", disabled: true, "\u{25a0} Stop" }
-                    if !multi {
-                        button { class: "btn btn-endturn", disabled: true, "\u{23ce} End Turn" }
-                    }
+                button {
+                    class: "btn btn-continue",
+                    disabled: !can_continue,
+                    onclick: on_continue,
+                    "\u{25cf} Continue"
                 }
-                if state == RecState::Stopped && has_text {
-                    button { class: "btn btn-continue", onclick: on_continue, "\u{25cf} Continue" }
+                button {
+                    class: "btn btn-endturn",
+                    disabled: !can_end_turn,
+                    onclick: on_end_turn1,
+                    "\u{23ce} End Turn"
                 }
                 // Transfer combo button
-                if has_text {
-                    div { class: "transfer-combo",
-                        button {
-                            class: "btn btn-transfer-main",
-                            disabled: state == RecState::Stopping,
-                            onclick: on_transfer,
-                            if let Some(ref feedback) = fb {
-                                "{feedback}"
-                            } else {
-                                "{tm.label()}"
-                            }
+                div { class: "transfer-combo",
+                    button {
+                        class: "btn btn-transfer-main",
+                        disabled: !can_transfer,
+                        onclick: on_transfer,
+                        if let Some(ref feedback) = fb {
+                            "{feedback}"
+                        } else {
+                            "{tm.label()}"
                         }
-                        button {
-                            class: "btn btn-transfer-arrow",
-                            onclick: move |_| {
-                                let is_open = *show_transfer_menu.peek();
-                                show_transfer_menu.set(!is_open);
-                            },
-                            "\u{25be}"
+                    }
+                    button {
+                        class: "btn btn-transfer-arrow",
+                        disabled: !can_transfer,
+                        onclick: move |_| {
+                            let is_open = *show_transfer_menu.peek();
+                            show_transfer_menu.set(!is_open);
+                        },
+                        "\u{25be}"
+                    }
+                    if (show_transfer_menu)() && can_transfer {
+                        div {
+                            class: "transfer-overlay",
+                            onclick: move |_| show_transfer_menu.set(false),
                         }
-                        if (show_transfer_menu)() {
-                            div {
-                                class: "transfer-overlay",
-                                onclick: move |_| show_transfer_menu.set(false),
+                        div { class: "transfer-menu",
+                            button {
+                                class: if tm == TransferMode::Copy { "transfer-option active" } else { "transfer-option" },
+                                onclick: move |_| {
+                                    transfer_mode.set(TransferMode::Copy);
+                                    save("parley_transfer_mode", TransferMode::Copy.cookie_value());
+                                    show_transfer_menu.set(false);
+                                },
+                                if tm == TransferMode::Copy {
+                                    "\u{2713} Copy"
+                                } else {
+                                    "  Copy"
+                                }
                             }
-                            div { class: "transfer-menu",
-                                button {
-                                    class: if tm == TransferMode::Copy { "transfer-option active" } else { "transfer-option" },
-                                    onclick: move |_| {
-                                        transfer_mode.set(TransferMode::Copy);
-                                        save("parley_transfer_mode", TransferMode::Copy.cookie_value());
-                                        show_transfer_menu.set(false);
+                            button {
+                                class: if tm == TransferMode::TxtFile { "transfer-option active" } else { "transfer-option" },
+                                onclick: move |_| {
+                                    transfer_mode.set(TransferMode::TxtFile);
+                                    save("parley_transfer_mode", TransferMode::TxtFile.cookie_value());
+                                    show_transfer_menu.set(false);
+                                },
+                                if tm == TransferMode::TxtFile {
+                                    "\u{2713} TXT File"
+                                } else {
+                                    "  TXT File"
+                                }
+                            }
+                            button {
+                                class: if tm == TransferMode::MdFile { "transfer-option active" } else { "transfer-option" },
+                                onclick: move |_| {
+                                    transfer_mode.set(TransferMode::MdFile);
+                                    save("parley_transfer_mode", TransferMode::MdFile.cookie_value());
+                                    show_transfer_menu.set(false);
+                                },
+                                if tm == TransferMode::MdFile {
+                                    "\u{2713} MD File"
+                                } else {
+                                    "  MD File"
+                                }
+                            }
+                            button {
+                                class: "transfer-option disabled",
+                                disabled: true,
+                                "  VS Code (coming soon)"
+                            }
+                            hr { class: "transfer-divider" }
+                            label { class: "transfer-option transfer-checkbox",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{prompt_filename}",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let v = evt.checked();
+                                        prompt_filename.set(v);
+                                        save("parley_prompt_filename", if v { "true" } else { "false" });
                                     },
-                                    if tm == TransferMode::Copy {
-                                        "\u{2713} Copy"
-                                    } else {
-                                        "  Copy"
-                                    }
                                 }
-                                button {
-                                    class: if tm == TransferMode::TxtFile { "transfer-option active" } else { "transfer-option" },
-                                    onclick: move |_| {
-                                        transfer_mode.set(TransferMode::TxtFile);
-                                        save("parley_transfer_mode", TransferMode::TxtFile.cookie_value());
-                                        show_transfer_menu.set(false);
-                                    },
-                                    if tm == TransferMode::TxtFile {
-                                        "\u{2713} TXT File"
-                                    } else {
-                                        "  TXT File"
-                                    }
-                                }
-                                button {
-                                    class: if tm == TransferMode::MdFile { "transfer-option active" } else { "transfer-option" },
-                                    onclick: move |_| {
-                                        transfer_mode.set(TransferMode::MdFile);
-                                        save("parley_transfer_mode", TransferMode::MdFile.cookie_value());
-                                        show_transfer_menu.set(false);
-                                    },
-                                    if tm == TransferMode::MdFile {
-                                        "\u{2713} MD File"
-                                    } else {
-                                        "  MD File"
-                                    }
-                                }
-                                button {
-                                    class: "transfer-option disabled",
-                                    disabled: true,
-                                    "  VS Code (coming soon)"
-                                }
-                                hr { class: "transfer-divider" }
-                                label { class: "transfer-option transfer-checkbox",
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: "{prompt_filename}",
-                                        onchange: move |evt: Event<FormData>| {
-                                            let v = evt.checked();
-                                            prompt_filename.set(v);
-                                            save("parley_prompt_filename", if v { "true" } else { "false" });
-                                        },
-                                    }
-                                    "Prompt for filename"
-                                }
+                                "Prompt for filename"
                             }
                         }
                     }
                 }
-                if has_text {
-                    button {
-                        class: "btn btn-clear",
-                        disabled: state == RecState::Stopping,
-                        onclick: on_clear,
-                        "Clear"
-                    }
+                button {
+                    class: "btn btn-clear",
+                    disabled: !can_clear,
+                    onclick: on_clear,
+                    "Clear"
                 }
                 // The combo `▾` dropdown was removed when the picker
                 // moved into Settings → Reformatting (single global
                 // home, applies to both Transcribe and Conversation
                 // modes). Spec `docs/global-reformat-spec.md` §4.
-                if anthropic_configured() {
-                    button {
-                        class: "btn btn-reformat-main",
-                        style: "border-radius: 8px;",
-                        onclick: on_reformat,
-                        disabled: !has_text
-                            || reformatting()
-                            || state == RecState::Stopping
-                            || (reformat_model_config_id)().is_empty(),
-                        if reformatting() {
-                            "Reformatting\u{2026}"
-                        } else {
-                            "\u{00b6} Reformat"
+                button {
+                    class: "btn btn-reformat-main",
+                    style: "border-radius: 8px;",
+                    onclick: on_reformat,
+                    disabled: !can_reformat,
+                    if reformatting() {
+                        "Reformatting\u{2026}"
+                    } else {
+                        "\u{00b6} Reformat"
+                    }
+                }
+            }
+
+            if (show_clear_confirm)() {
+                div { class: "confirm-overlay",
+                    div {
+                        class: "confirm-dialog",
+                        role: "dialog",
+                        aria_modal: "true",
+                        aria_labelledby: "clear-confirm-title",
+                        tabindex: "0",
+                        onkeydown: move |evt| {
+                            let key = evt.key();
+                            if matches!(key, Key::Enter | Key::Escape) {
+                                evt.prevent_default();
+                                show_clear_confirm.set(false);
+                            }
+                        },
+                        h2 { id: "clear-confirm-title", "Clear transcript?" }
+                        p { "This will remove the current transcript and live turn text." }
+                        div { class: "confirm-actions",
+                            button {
+                                id: CLEAR_CONFIRM_CANCEL_ID,
+                                class: "btn btn-confirm-cancel",
+                                autofocus: true,
+                                onclick: on_cancel_clear,
+                                "Cancel"
+                            }
+                            button {
+                                class: "btn btn-clear",
+                                onclick: on_confirm_clear,
+                                "Clear"
+                            }
                         }
                     }
                 }
@@ -3237,18 +3309,24 @@ body {
     cursor: pointer;
     transition: background 0.15s, transform 0.1s;
 }
-.btn:active { transform: scale(0.97); }
+.btn:active:not(:disabled) { transform: scale(0.97); }
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 
 .btn-record { background: #e94560; color: #fff; }
-.btn-record:hover { background: #ff6b81; }
+.btn-record:hover:not(:disabled) { background: #ff6b81; }
 .btn-stop { background: #e94560; color: #fff; }
-.btn-stop:hover { background: #ff6b81; }
+.btn-stop:hover:not(:disabled) { background: #ff6b81; }
 .btn-continue { background: #4ecca3; color: #1a1a2e; }
-.btn-continue:hover { background: #6ee6bb; }
+.btn-continue:hover:not(:disabled) { background: #6ee6bb; }
 .btn-endturn { background: #0f3460; color: #e0e0e0; }
-.btn-endturn:hover { background: #1a4a7a; }
+.btn-endturn:hover:not(:disabled) { background: #1a4a7a; }
 .btn-clear { background: transparent; color: #8888aa; border: 1px solid #8888aa; }
-.btn-clear:hover { color: #e0e0e0; border-color: #e0e0e0; }
+.btn-clear:hover:not(:disabled) { color: #e0e0e0; border-color: #e0e0e0; }
+.btn-confirm-cancel { background: #0f3460; color: #e0e0e0; }
+.btn-confirm-cancel:hover:not(:disabled) { background: #1a4a7a; }
 /* Format combo button */
 .format-combo {
     position: relative;
@@ -3261,8 +3339,7 @@ body {
     border-radius: 8px 0 0 8px;
     padding: 0.65rem 1rem;
 }
-.btn-reformat-main:hover { color: #e0d0f0; border-color: #e0d0f0; }
-.btn-reformat-main:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-reformat-main:hover:not(:disabled) { color: #e0d0f0; border-color: #e0d0f0; }
 .btn-reformat-arrow {
     background: transparent;
     color: #b8a9c9;
@@ -3324,7 +3401,7 @@ body {
     border-radius: 8px 0 0 8px;
     padding: 0.65rem 1rem;
 }
-.btn-transfer-main:hover { background: #1a4a7a; }
+.btn-transfer-main:hover:not(:disabled) { background: #1a4a7a; }
 .btn-transfer-arrow {
     background: #0f3460;
     color: #e0e0e0;
@@ -3333,7 +3410,42 @@ body {
     border-left: 1px solid #1a1a2e;
     font-size: 0.85rem;
 }
-.btn-transfer-arrow:hover { background: #1a4a7a; }
+.btn-transfer-arrow:hover:not(:disabled) { background: #1a4a7a; }
+.confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 120;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(0,0,0,0.58);
+}
+.confirm-dialog {
+    width: min(420px, 100%);
+    background: #16213e;
+    border: 1px solid #2a3960;
+    border-radius: 8px;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.45);
+    padding: 1.25rem;
+}
+.confirm-dialog:focus { outline: 2px solid #4ecca3; outline-offset: 2px; }
+.confirm-dialog h2 {
+    font-size: 1.1rem;
+    color: #e0e0e0;
+    margin-bottom: 0.5rem;
+}
+.confirm-dialog p {
+    color: #c0c0d0;
+    line-height: 1.5;
+    margin-bottom: 1rem;
+}
+.confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
 .transfer-overlay {
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;

@@ -1173,6 +1173,17 @@ pub fn ConversationView() -> Element {
                 opacity: 0.5;
                 cursor: not-allowed;
             }}
+            .convo-root .turn-audio-controls,
+            .convo-root .voice-controls {{
+                display: flex;
+                gap: 0.5rem;
+                align-items: center;
+                flex-wrap: wrap;
+            }}
+            .convo-root .turn-audio-controls {{
+                margin-top: 0.5rem;
+                gap: 0.4rem;
+            }}
             .convo-root .convo-transcript {{
                 background: #12284a;
                 border: 1px solid #2a3960;
@@ -1757,35 +1768,34 @@ pub fn ConversationView() -> Element {
                                     .is_some_and(|t| t == tid);
                                 let tid_owned = tid.clone();
                                 rsx! {
-                                    div { style: "margin-top: 0.5rem; display: flex; gap: 0.4rem;",
+                                    div { class: "turn-audio-controls",
                                         if is_live {
                                             // Live controls drive
                                             // the in-memory
                                             // MediaSourcePlayer.
-                                            if matches!(playback_status(), PlaybackStatus::Playing) {
-                                                button {
-                                                    class: "convo-send",
-                                                    style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
-                                                    onclick: move |_| {
-                                                        if let Some(p) = live_player.peek().clone() {
-                                                            p.pause();
-                                                            playback_status.set(PlaybackStatus::Paused);
-                                                        }
-                                                    },
-                                                    "Pause"
-                                                }
-                                            } else if matches!(playback_status(), PlaybackStatus::Paused) {
-                                                button {
-                                                    class: "convo-send",
-                                                    style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
-                                                    onclick: move |_| {
-                                                        if let Some(p) = live_player.peek().clone() {
-                                                            let _ = p.play();
-                                                            playback_status.set(PlaybackStatus::Playing);
-                                                        }
-                                                    },
-                                                    "Play"
-                                                }
+                                            button {
+                                                class: "convo-send",
+                                                style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
+                                                disabled: !matches!(playback_status(), PlaybackStatus::Playing),
+                                                onclick: move |_| {
+                                                    if let Some(p) = live_player.peek().clone() {
+                                                        p.pause();
+                                                        playback_status.set(PlaybackStatus::Paused);
+                                                    }
+                                                },
+                                                "Pause"
+                                            }
+                                            button {
+                                                class: "convo-send",
+                                                style: "padding: 0.2rem 0.6rem; font-size: 0.8rem;",
+                                                disabled: !matches!(playback_status(), PlaybackStatus::Paused),
+                                                onclick: move |_| {
+                                                    if let Some(p) = live_player.peek().clone() {
+                                                        let _ = p.play();
+                                                        playback_status.set(PlaybackStatus::Playing);
+                                                    }
+                                                },
+                                                "Play"
                                             }
                                             button {
                                                 class: "convo-send",
@@ -1910,10 +1920,9 @@ pub fn ConversationView() -> Element {
             } else {
                 // Voice composer. Live transcript shows the
                 // accumulating final text plus the most recent
-                // partial. The Start/Send buttons are mutually
-                // exclusive: Start while idle, Send while
-                // listening (force-flushes the trailing partial
-                // and submits via the side effect below).
+                // partial. Start and Send Turn stay mounted so the
+                // control positions do not shift while the voice
+                // hook moves between idle, listening, and finalizing.
                 div { style: "display: flex; flex-direction: column; gap: 0.5rem;",
                     div { class: "voice-transcript-bubble",
                         if voice.final_text.read().is_empty() && voice.interim_text.read().is_empty() {
@@ -1937,42 +1946,38 @@ pub fn ConversationView() -> Element {
                             }
                         }
                     }
-                    div { style: "display: flex; gap: 0.5rem; align-items: center;",
-                        if matches!(*voice.state.read(), VoiceState::Listening | VoiceState::Finalizing) {
-                            button {
-                                class: "convo-send",
-                                disabled: matches!(
-                                    status(),
-                                    SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
-                                )
-                                    || matches!(*voice.state.read(), VoiceState::Finalizing),
-                                onclick: move |_| {
-                                    // Force-end AssemblyAI; the
-                                    // hook transitions through
-                                    // Finalizing → Idle, and the
-                                    // use_effect below submits
-                                    // when the final text is ready.
-                                    voice.stop.call(());
-                                },
-                                if matches!(status(), SendStatus::Reformatting) {
-                                    "Cleaning up…"
-                                } else {
-                                    "Send Turn"
-                                }
-                            }
-                        } else {
-                            button {
-                                class: "convo-send",
-                                disabled: matches!(
+                    div { class: "voice-controls",
+                        button {
+                            class: "convo-send",
+                            disabled: !matches!(*voice.state.read(), VoiceState::Idle)
+                                || matches!(
                                     status(),
                                     SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
                                 ),
-                                onclick: move |_| voice.start.call(()),
-                                if matches!(status(), SendStatus::Reformatting) {
-                                    "Cleaning up…"
-                                } else {
-                                    "Start Turn"
-                                }
+                            onclick: move |_| voice.start.call(()),
+                            if matches!(status(), SendStatus::Reformatting) {
+                                "Cleaning up…"
+                            } else {
+                                "Start Turn"
+                            }
+                        }
+                        button {
+                            class: "convo-send",
+                            disabled: !matches!(*voice.state.read(), VoiceState::Listening)
+                                || matches!(
+                                    status(),
+                                    SendStatus::Sending | SendStatus::Streaming | SendStatus::Reformatting
+                                ),
+                            onclick: move |_| {
+                                // Force-end AssemblyAI; the hook transitions through
+                                // Finalizing → Idle, and the use_effect below submits
+                                // when the final text is ready.
+                                voice.stop.call(());
+                            },
+                            if matches!(status(), SendStatus::Reformatting) {
+                                "Cleaning up…"
+                            } else {
+                                "Send Turn"
                             }
                         }
                         if let VoiceState::Error(msg) = &*voice.state.read() {
