@@ -28,7 +28,7 @@ We need chunking that:
 - **G2.** Time-to-first-audio comparable to today's behavior. The first chunk is at most 2 sentences and falls back to 1 if the second is slow.
 - **G3.** Inter-chunk silence is spliced into the audio stream so the cache and replay paths are transparently correct.
 - **G4.** A `TtsProvider` trait with optional `SynthesisContext` hints lets adapters use provider-specific continuity features (e.g., ElevenLabs `previous_request_ids`) without leaking provider details into the orchestrator.
-- **G5.** All chunking parameters live in `ModelConfig` with sensible defaults, configurable per TTS model.
+- **G5.** All chunking parameters live in `ModelConfig` with sensible defaults, configurable per TTS model, then tunable by the active TTS provider when a provider needs different latency/continuity tradeoffs.
 - **G6.** Lists are grouped with their containing paragraph as one chunk, subject to the same caps.
 
 ### Non-Goals
@@ -82,9 +82,13 @@ pub trait TtsProvider: Send + Sync {
     /// generate matching silence frames at startup.
     fn output_format(&self) -> AudioFormat;
 
-    /// Whether this provider supports expressive annotation tags
-    /// (used by the annotator pass to decide whether to enable).
-    fn supports_expressive_tags(&self) -> bool;
+    /// Provider-specific tuning for the model's configured chunking
+    /// policy. The default returns `policy` unchanged.
+    fn tune_chunk_policy(&self, policy: ChunkPolicy) -> ChunkPolicy;
+
+    /// Provider-specific expression prompt text. Returning `None`
+    /// means this provider should not receive expression markup.
+    fn expression_tag_instruction(&self) -> Option<String>;
 }
 
 /// Hints for cross-chunk continuity. Providers that don't support
@@ -112,7 +116,7 @@ pub struct SynthesisContext {
 
 `ProviderContinuationState` is an enum with one variant per provider that needs it (initially just `ElevenLabsRequestId(String)`). Providers that don't need continuation state never construct or read it.
 
-The orchestrator builds `SynthesisContext` from the planner's output and the prior chunk's response metadata. It does not know what the provider will do with the hints.
+The orchestrator asks the active provider to tune the selected model's `ChunkPolicy` before constructing `ChunkPlanner`, then builds `SynthesisContext` from the planner's output and the prior chunk's response metadata. It does not know what the provider will do with the hints.
 
 ### 3.3 ChunkPlanner — Release Rules
 
@@ -173,7 +177,7 @@ first_chunk_silence_ms = 100
 ```
 
 | Parameter | Default | Job |
-|---|---|---|
+| --- | --- | --- |
 | `first_chunk_max_sentences` | 2 | Prefer 2-sentence first chunk for buffer runway |
 | `first_chunk_max_wait_ms` | 800 | Fall back to 1-sentence first chunk if 2nd is slow |
 | `paragraph_wait_ms` | 3000 | How long to wait for a paragraph break before falling back to sentence chunking |
@@ -205,6 +209,7 @@ The cache stores the spliced stream, so replay is byte-identical to live playbac
 The orchestrator maintains **at most one in-flight synthesis request per turn**. After releasing chunk N, the planner continues accumulating tokens into `pending`, but does not release chunk N+1 until chunk N's synthesis has completed.
 
 Rationale:
+
 - Provides natural backpressure without a feedback channel from the browser.
 - Synthesis time roughly matches audio playback time for paragraph-sized chunks (both ~1.5–3s for v3), so the listener never hears silence except for the configured paragraph silence.
 - Simple to reason about and test.
@@ -214,7 +219,7 @@ The cost: if synthesis is unusually slow (network blip, provider slowdown), a pa
 ### 3.7 Provider Behavior Summary
 
 | Provider | Continuity hint usage | Audio tags | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | ElevenLabs v3 (default) | None — v3 doesn't support stitching | Yes (via annotator) | Relies entirely on chunking + silence |
 | ElevenLabs Multilingual v2 | `previous_text` → `previous_request_ids` | No | Cross-chunk prosody handled by provider |
 | ElevenLabs Flash v2.5 | None at HTTP layer; future WebSocket adapter | No | Lowest latency; future optimization |
@@ -223,7 +228,7 @@ The cost: if synthesis is unusually slow (network blip, provider slowdown), a pa
 ### 3.8 Failure Modes
 
 | Failure | Behavior |
-|---|---|
+| --- | --- |
 | Provider error mid-turn | Surfaced as `OrchestratorEvent::TtsError`; further chunks for the turn are not dispatched. The text continues streaming as `OrchestratorEvent::Token` (text-only fallback). |
 | Provider error on first chunk | Same as above; user sees text but no audio. Logged. |
 | LLM idle past `idle_timeout_ms` with empty buffer | No-op; nothing to flush. |
@@ -315,14 +320,16 @@ Picked from a working model of the synthesis-and-playback pipeline; numbers are 
 - **`paragraph_silence_ms = 500`**: matches the natural pause a human takes between paragraphs. Long enough to mask synthesizer chunk discontinuity; short enough not to feel like a stall.
 - **`first_chunk_silence_ms = 100`**: enough that the first audio doesn't sound truncated at its leading edge, but not so much that it adds noticeable TTFA. Acts like the natural breath before someone starts speaking.
 
+Provider tuning may override these defaults. xAI REST currently disables the eager sentence-count first-chunk split and prevents the idle timer from firing before paragraph wait because it has no documented provider-side continuation field; see [xAI TTS Prosody Improvement 1 §8](xai-improve-1.md#8-chunk-continuity-strategy).
+
 ## 6. Test Plan
 
 | Component | Tests |
-|---|---|
+| --- | --- |
 | `ChunkPlanner` (pure, with fake `Clock`) | (1) Push 1 sentence, advance clock past `first_chunk_max_wait_ms` → 1-sentence first chunk released. (2) Push 2 sentences quickly → 2-sentence first chunk released. (3) Push 1 paragraph (3 sentences then `\n\n`) → released as one chunk at the paragraph break. (4) Push 5 sentences without paragraph break, advance clock past `paragraph_wait_ms` → released as 5-sentence chunk at latest sentence boundary. (5) Push text with no sentence terminators, advance clock past `paragraph_wait_ms + sentence_grace_ms` → released at latest whitespace. (6) Push 1500+ chars without sentence terminator → hard cap fires immediately, cut at last whitespace. (7) Push 1 sentence, advance clock past `idle_timeout_ms` without further pushes → idle flush fires. (8) Push paragraph followed by list (`-` lines) → `[paragraph + list]` block emitted as one chunk. (9) `finish()` flushes a non-terminated trailing sentence with `final_for_turn=true`. (10) Single-flight: chunk 2 not released until `synthesis_completed(0)` even when buffer is full of further content. (11) Indices monotonic from 0. |
 | `SilenceSplicer` | (1) Generated 500ms silence at 128kbps decodes to 500ms ± 25ms via `symphonia` or equivalent. (2) Splicing silence + TTS bytes produces a stream that decodes as continuous audio with the expected silence duration at start. (3) Splice for first chunk uses 100ms; subsequent chunks use 500ms. (4) Cache stores spliced bytes; replay returns identical bytes. |
-| Provider trait | (1) v3 adapter ignores `previous_text`. (2) v2 adapter (when implemented) sets `previous_request_ids` from `provider_state`. (3) `output_format()` reports correct sample rate and bitrate. (4) `supports_expressive_tags()` returns true for v3 and grok-speech, false for v2 and Flash. |
-| Orchestrator integration | Using a `MockTtsProvider` and a fake clock. (1) LLM emits 5 sentences across 8s with one `\n\n` after sentence 3 → 2 chunks dispatched: [1-2 sentences as first chunk], [paragraph through sentence 3], rest flushed at stream end. (2) LLM emits 1 long sentence (no terminator) for 4s → first-chunk fallback fires at 800ms with what's available; if nothing ends in a sentence, hard-cap or grace handles it. (3) `tts: None` in context → planner not constructed; behavior identical to text-only path. |
+| Provider trait | (1) v3 adapter ignores `previous_text`. (2) v2 adapter (when implemented) sets `previous_request_ids` from `provider_state`. (3) `output_format()` reports correct sample rate and bitrate. (4) `expression_tag_instruction()` returns provider-specific prompt text only for models whose translators can render expression markup safely. (5) `tune_chunk_policy()` returns the input unchanged by default and xAI overrides it for paragraph continuity. |
+| Orchestrator integration | Using a `MockTtsProvider` and a fake clock. (1) LLM emits 5 sentences across 8s with one `\n\n` after sentence 3 → 2 chunks dispatched: [1-2 sentences as first chunk], [paragraph through sentence 3], rest flushed at stream end. (2) LLM emits 1 long sentence (no terminator) for 4s → first-chunk fallback fires at 800ms with what's available; if nothing ends in a sentence, hard-cap or grace handles it. (3) `tts: None` in context → planner not constructed; behavior identical to text-only path. (4) Provider-tuned policy with eager first chunk disabled keeps a three-sentence first paragraph together. |
 
 ## 7. Migration & Compatibility
 

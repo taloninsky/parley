@@ -67,7 +67,7 @@ The integration should preserve Parley's provider philosophy: the orchestrator t
 | CART-08 | A non-2xx WS upgrade response or a `{"type":"error", "message":...}` JSON frame becomes `TtsError::Http { status, body }` or `TtsError::Protocol(..)` respectively. | Provider unit test for both failure modes. |
 | CART-09 | Word-timestamp JSON frames are parsed and discarded (logged at trace level). The audio output is unaffected. | Provider unit test sends a stream containing audio + a timestamp frame, asserts only audio + Done are emitted by `synthesize()`. |
 | CART-10 | `voices()` returns the catalog mapped into `VoiceDescriptor` and serves repeated calls within 24 hours from the in-memory cache. | Provider unit test calls `voices()` twice; only the first hits the mock HTTP `/voices` endpoint. |
-| CART-11 | `supports_expressive_tags()` is `true` because Sonic-3 honours inline `[laughter]` and SSML volume/speed/emotion tags. | Unit test asserts the trait method returns `true`. |
+| CART-11 | `expression_tag_instruction()` advertises only the Cartesia tags the provider translator renders safely. | Unit test asserts the instruction includes laugh/pause tags and excludes unsupported style tags. |
 | CART-12 | Cost calculation uses the pinned per-character rate. | Pure unit test for 1,000 characters. |
 | CART-13 | Cartesia integration has no orchestrator behavior changes beyond provider selection. | Orchestrator regression tests continue to pass with a mock provider. |
 
@@ -304,7 +304,7 @@ impl TtsProvider for CartesiaTts {
 
     fn output_format(&self) -> AudioFormat { AudioFormat::Pcm_S16LE_44100_Mono }
 
-    fn supports_expressive_tags(&self) -> bool { true }
+    fn expression_tag_instruction(&self) -> Option<String> { Some(cartesia_expression_instruction()) }
 
     async fn synthesize(
         &self,
@@ -418,7 +418,7 @@ impl TtsProvider for CartesiaTts {
 
 ### 8.2 Expressive tag policy
 
-Sonic-3 honours `[laughter]` plus SSML `<emotion>`, `<prosody>`, `<break>`, etc. We set `supports_expressive_tags() = true`, which lets the existing annotator pass inject tags into prompts where appropriate (per `docs/expressive-annotation-spec.md`). The annotator's tag vocabulary is a strict subset of what Cartesia accepts, so no per-provider tag translation is required in v1.
+Sonic-3 honours `[laughter]` plus SSML `<emotion>`, `<prosody>`, `<break>`, etc. `CartesiaTts::expression_tag_instruction()` advertises only the point tags the current translator renders safely: laugh, sigh, and pauses. Style/emotion wrappers wait for explicit spans or a provider-specific scoped renderer.
 
 If the annotator emits a tag Cartesia ignores, Sonic-3's documented behaviour is to read the tag silently or pass-through with no warning. We accept that for v1 and add a Cartesia-specific tag whitelist in v1.5 if listening tests show drift.
 
@@ -448,7 +448,7 @@ All tests live in `proxy/src/tts/cartesia.rs` using a mock WebSocket server (rec
 | `cost_uses_pinned_per_char_rate` | 1000 chars → `0.030` USD, asserted within float epsilon. |
 | `id_returns_stable_string` | `provider.id() == "cartesia"`. |
 | `output_format_is_mp3_44100_128` | Trait method returns the variant the silence splicer expects. |
-| `supports_expressive_tags_is_true` | Trait method returns `true`. |
+| `expression_instruction_matches_cartesia_supported_tags` | Trait instruction advertises only supported Cartesia tags. |
 
 Plus in `proxy/src/providers.rs`:
 

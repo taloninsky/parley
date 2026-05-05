@@ -202,16 +202,6 @@ impl TtsProvider for ElevenLabsTts {
         // Pinned to the value sent on the query string above.
         AudioFormat::Mp3_44100_128
     }
-
-    fn supports_expressive_tags(&self) -> bool {
-        // The pre-v3 family (our default `eleven_multilingual_v2`
-        // included) does not interpret v3's bracketed expressive
-        // tag set (`[whisper]`, `[laugh]`, etc.) — those tags would
-        // be read literally as text. The annotator pass uses this
-        // flag to gate tag injection, so it stays disabled until we
-        // (optionally) move back to a v3-family model.
-        false
-    }
 }
 
 #[cfg(test)]

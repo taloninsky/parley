@@ -4,7 +4,9 @@
 //! this vocabulary via an instruction the orchestrator auto-prepends
 //! to the persona system prompt. Each `TtsProvider` translates the
 //! neutral tags into its native syntax at synthesis time, so personas
-//! stay portable across providers.
+//! stay portable across providers. The active provider owns the exact
+//! prompt text shown to the LLM because each TTS model supports a
+//! different expression surface.
 //!
 //! This module lives in `parley-core` so both the orchestrator
 //! (auto-prepend) and the future browser-side stripping (display
@@ -94,9 +96,12 @@ pub const NEUTRAL_TAGS: &[NeutralTag] = &[
     },
 ];
 
-/// Build the canonical instruction the orchestrator auto-prepends to
-/// a persona's system prompt when the active TTS provider declares
-/// `supports_expressive_tags()` and the persona allows it.
+/// Build the canonical provider-neutral instruction for this vocabulary.
+///
+/// The orchestrator now asks the active TTS provider for its own
+/// expression instruction, because not every model supports every tag
+/// or scoping rule. Providers can still use this helper when their
+/// native expression surface matches the full neutral vocabulary.
 ///
 /// Kept as a standalone function (not a `const`) so we can format
 /// the tag list dynamically; the alternative would be a long

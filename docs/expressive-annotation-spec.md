@@ -7,13 +7,13 @@
 
 ## 1. Problem
 
-ElevenLabs v3 (and other tag-aware providers like xAI's planned grok-speech) accepts inline **audio tags** that direct prosody, emotion, and pacing: `[laughs]`, `[whispers]`, `[sighs]`, `[excited]`, `[curious]`, `[serious]`, `[long pause]`, ellipses for hesitation, etc. Bare narrative text without tags reads flat. ElevenLabs' own "Enhance" feature in their TTS playground demonstrates the lift: same model, same voice, but annotated text sounds *acted* rather than read.
+ElevenLabs v3 and xAI TTS accept inline **audio tags** that direct prosody, emotion, and pacing. ElevenLabs-style tags include `[laughs]`, `[whispers]`, `[sighs]`, `[excited]`, `[curious]`, `[serious]`, and `[long pause]`; xAI's current native point tags include `[pause]`, `[long-pause]`, `[laugh]`, and `[sigh]`, with scoped style wrappers deferred to [xAI TTS Prosody Improvement 1](xai-improve-1.md). Bare narrative text without tags reads flat. ElevenLabs' own "Enhance" feature in their TTS playground demonstrates the lift: same model, same voice, but annotated text sounds *acted* rather than read.
 
-The orchestrator currently sends raw text to ElevenLabs. We want a small, pluggable pass that runs **between the chunker and the TTS provider** to inject tags appropriate for each chunk.
+The orchestrator currently sends raw text to the active TTS provider. We want a small, pluggable pass that runs **between the chunker and the TTS provider** to inject tags appropriate for each chunk. The legal tag surface is provider-owned: every `TtsProvider` advertises its own expression instruction and translates only the tags/spans that model can render safely.
 
 This pass must be:
 
-- **Provider-aware.** Only runs when the active provider declares `supports_expressive_tags() == true`. Skips for ElevenLabs v2, Flash, OpenAI TTS, etc.
+- **Provider-aware.** Only runs when the active provider supplies an expression instruction. Skips for ElevenLabs v2, Flash, OpenAI TTS, etc.
 - **Concurrent-friendly.** The annotator for chunk N+1 runs while the synthesizer for chunk N is in flight. Serial annotation would push TTFA past acceptable.
 - **Cheap.** Per-chunk LLM call to a Haiku-class model. Tens of milliseconds; cents per turn.
 - **Failure-tolerant.** If the annotator errors or times out, the chunk is sent to TTS with its original text. The user gets less expressive audio, not no audio.
@@ -25,7 +25,7 @@ This pass must be:
 
 - **G1.** Define an `Annotator` trait and a default Haiku-backed implementation.
 - **G2.** Place the annotator in the chunk pipeline so it runs concurrently for the *next* chunk while the *current* chunk synthesizes.
-- **G3.** Provider-aware enablement based on [`TtsProvider::supports_expressive_tags()`](paragraph-tts-chunking-spec.md#32-provider-trait).
+- **G3.** Provider-aware enablement based on whether [`TtsProvider::expression_tag_instruction()`](paragraph-tts-chunking-spec.md#32-provider-trait) returns an instruction.
 - **G4.** Inter-list-item pacing handled here: ellipses for v3, `<break time="0.3s"/>` for tag-aware providers that prefer SSML-like syntax, plain text for unsupported providers.
 - **G5.** Graceful degradation on annotator failure.
 - **G6.** Test coverage for tag injection, no-op pass-through, fallback on error, and ordering preservation under concurrency.
@@ -55,7 +55,7 @@ flowchart LR
 Per turn, the orchestrator runs an `AnnotatorQueue`:
 
 1. Receive `ReleasedChunk` from `ChunkPlanner`.
-2. If `provider.supports_expressive_tags()` is **false**, pass the chunk through unchanged.
+2. If `provider.expression_tag_instruction()` returns `None`, pass the chunk through unchanged.
 3. Otherwise, spawn an annotation task for the chunk and store its `JoinHandle` (or `oneshot::Receiver`) keyed by `chunk.index`.
 4. Dispatch chunks to TTS in **strictly increasing index order**: chunk N+1 only dispatches after chunk N has been sent to TTS, regardless of which annotation finished first.
 5. While chunk N is being synthesized (which takes longer than annotation), chunk N+1's annotation task runs concurrently and is typically already done by the time chunk N's synthesis finishes.
@@ -236,7 +236,7 @@ Each annotator call logs at debug level: chunk index, input character count, out
 | Component | Tests |
 |---|---|
 | `HaikuAnnotator` (with mock `LlmClient`) | (1) Simple paragraph in → annotated paragraph out (mock returns text with one tag injected). (2) Annotator output preserves all original words (assert by tokenized comparison). (3) Empty annotator output → returns `Err`. (4) Mock returns after timeout → returns `Err(Timeout)`. (5) Tone hint passed in `AnnotationContext` is forwarded into the system prompt (verify via mock's recorded request). (6) `ProviderKind::ElevenLabsV3` produces square-bracket tag syntax in the system prompt. |
-| `AnnotatorQueue` | (1) Single chunk, annotation succeeds → dispatched with annotated text. (2) Single chunk, annotation fails → dispatched with original text. (3) Three chunks enqueued with annotations completing in reverse order (chunk 2 finishes first, then 0, then 1) → dispatched in 0,1,2 order. (4) Provider with `supports_expressive_tags() == false` → annotator never invoked, chunks dispatched unchanged. (5) `enabled = false` in config → annotator never invoked even when provider supports tags. |
+| `AnnotatorQueue` | (1) Single chunk, annotation succeeds → dispatched with annotated text. (2) Single chunk, annotation fails → dispatched with original text. (3) Three chunks enqueued with annotations completing in reverse order (chunk 2 finishes first, then 0, then 1) → dispatched in 0,1,2 order. (4) Provider with no expression instruction → annotator never invoked, chunks dispatched unchanged. (5) `enabled = false` in config → annotator never invoked even when provider supports tags. |
 | Orchestrator integration | (1) ElevenLabs v3 turn with mock annotator: text reaches TTS provider with annotation tags. (2) ElevenLabs v2 turn (no tag support): text reaches TTS provider unchanged. (3) v3 turn with annotator failing on chunk 1: chunk 0 annotated, chunk 1 falls back to original, chunk 2 annotated; all dispatched in order; warning logged for chunk 1. (4) v3 turn where TTS for chunk 0 takes 2s and annotator for chunk 1 takes 200ms: chunk 1 dispatch happens immediately when chunk 0's TTS completes (annotation already finished). |
 | List pacing | (1) Chunk containing a `[paragraph + list]` block → annotated output contains `[break 0.3s]` markers between list items (verified via mock annotator that returns a stub annotation with breaks). (2) Same chunk with annotator disabled → reaches TTS with bare list newlines unchanged. |
 
@@ -251,7 +251,7 @@ Each annotator call logs at debug level: chunk index, input character count, out
 1. **Word-preservation enforcement.** Should we hard-reject annotator output that drops or adds words, or accept it with a warning? v1 accepts; tests document the divergence. Tighten if listening tests show drift.
 2. **Per-persona tone hint plumbing.** The `tone_hint` field is in `AnnotationContext` but `Persona` has no `tone` field today. Future work in [persona CRUD](persona-crud-spec.md). For v1, `tone_hint` is always `None`.
 3. **Annotator caching.** Same input text + same context could deterministically cache to the same annotated output. Skipped for v1 to avoid stale prompt risk; revisit if Haiku call cost becomes a real concern.
-4. **xAI grok-speech tag syntax.** Verify the legal tag set when grok-speech adapter is implemented; may need a separate `Annotator` impl or a syntax dispatch table inside `HaikuAnnotator`.
+4. **Provider-specific tag dialects.** xAI's current legal tag subset and scoped-wrapper bridge are documented in [xAI TTS Prosody Improvement 1](xai-improve-1.md). Longer-term explicit span data is still the preferred model for non-zero-width expression ranges.
 
 ## 8. Out-of-Scope Reminders
 

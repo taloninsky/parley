@@ -531,6 +531,20 @@ mod tests {
     }
 
     #[test]
+    fn r2_can_beat_first_chunk_fast_path_when_policy_disables_it() {
+        let mut policy = policy();
+        policy.first_chunk_max_sentences = 0;
+        let mut p = ChunkPlanner::new(policy);
+
+        let out = p.push("S1. S2. S3.\n\nNext paragraph.", 0);
+
+        let chunk = assert_one(out);
+        assert_eq!(chunk.index, 0);
+        assert_eq!(chunk.text, "S1. S2. S3.");
+        assert!(!chunk.final_for_turn);
+    }
+
+    #[test]
     fn r2_paragraph_with_list_groups_to_next_break() {
         let mut p = ChunkPlanner::new(policy());
         // Push the whole turn at once. R1 takes "S1. S2." first.

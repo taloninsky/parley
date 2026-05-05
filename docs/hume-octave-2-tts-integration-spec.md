@@ -56,7 +56,7 @@ The integration should preserve Parley's provider philosophy: the orchestrator t
 | HUME-04 | `HumeTts` sends `version: "2"`, exactly one utterance, a configured voice, `instant_mode: true`, and `num_generations: 1`. | Provider unit test records the JSON request body. |
 | HUME-05 | Successful streamed-file responses emit one or more `TtsChunk::Audio` frames followed by exactly one `TtsChunk::Done { characters }`. | Provider unit test using a streaming mock response. |
 | HUME-06 | Non-2xx responses become `TtsError::Http { status, body }`. | Provider unit test for 401/422 response. |
-| HUME-07 | Hume v1 does not claim ElevenLabs-style expressive tag support. | Unit test asserts `supports_expressive_tags() == false`. |
+| HUME-07 | Hume v1 does not advertise an expression instruction. | Unit test asserts `expression_tag_instruction()` returns `None`. |
 | HUME-08 | Hume audio is not spliced with mismatched MP3 silence. | Implementation either verifies Hume output matches `Mp3_44100_128` or updates the format/splicer model before enabling silence. |
 | HUME-09 | Hume cost calculation uses the documented configured pricing tier, defaulting to Creator overage until pricing config exists. | Pure unit test for 1,000 characters. |
 | HUME-10 | Hume implementation has no orchestrator behavior changes beyond provider selection and format-safe silence handling. | Orchestrator regression tests continue to pass with a mock provider. |
@@ -212,7 +212,7 @@ Trait behavior:
 | `id()` | Returns `"hume"`. |
 | `synthesize(request, ctx)` | Rejects empty text, posts one Octave 2 streamed-file request, maps response body chunks to `TtsChunk::Audio`, then emits `Done`. |
 | `output_format()` | Returns the verified format only; see [§7.3](#73-output-format-gate). |
-| `supports_expressive_tags()` | Returns `false` in v1. Hume expression is not ElevenLabs tag syntax. |
+| `expression_tag_instruction()` | Returns `None` in v1. Hume expression is not an inline tag syntax Parley can safely prompt for yet. |
 | `cost(characters)` | Uses configured Hume tier rate, defaulting to Creator overage: `$0.15 / 1,000` characters. |
 
 `SynthesisContext.previous_text`, `next_text_hint`, and `provider_state` are ignored in the streamed-file v1 path. They become useful after streamed JSON exposes `generation_id` continuation state.
@@ -288,14 +288,14 @@ This change should be made only when a second provider or Hume JSON work actuall
 
 Hume should force a cleanup of Parley's expression abstraction, but not in the first adapter.
 
-The current `supports_expressive_tags() -> bool` answers a narrow question: can the provider accept ElevenLabs-style inline tags without reading them aloud? Hume's expressive controls are different:
+The old `supports_expressive_tags() -> bool` answered a narrow question: can the provider accept ElevenLabs-style inline tags without reading them aloud? The live `TtsProvider` trait now asks each provider for `expression_tag_instruction()` instead. Hume's expressive controls are different:
 
 - Octave infers delivery from text and voice context.
 - Octave supports `speed` and `trailing_silence` across models.
 - Hume documents `[pause]` and `[long pause]` text markers.
 - Natural-language `description` acting instructions are Octave 1-only as of the current docs, with Octave 2 support coming.
 
-Therefore Hume v1 returns `false` for `supports_expressive_tags()`. A later expression slice should replace the boolean with capability data:
+Therefore Hume v1 should return `None` for `expression_tag_instruction()`. A later expression slice can add richer capability data:
 
 ```rust
 pub struct TtsExpressionCapabilities {

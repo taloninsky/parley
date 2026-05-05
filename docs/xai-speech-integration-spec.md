@@ -103,6 +103,8 @@ These must be resolved before implementation begins. Each carries BigDog's recom
 
 > **RESOLVED → (b) Pass-through only.** Persona prompts may instruct the LLM to use tags; no transformation in this spec. Tag semantics are owned by [expressive-annotation-spec.md](expressive-annotation-spec.md).
 
+Follow-up design: [xAI TTS Prosody Improvement 1](xai-improve-1.md) narrows the first implementation slice for xAI-native expression tags and scoped-span follow-up work.
+
 **Question:** xAI TTS supports inline speech tags (`[laugh]`, `[sigh]`, `[pause]`) and wrapping tags (`<whisper>`, `<slow>`, `<singing>`). How does the assistant's generated text feed these in? Three places they might come from: (1) the LLM generates them directly, (2) the persona system-prompt instructs the LLM to use them, (3) a dedicated post-LLM formatter inserts them. Does v1 support any of these?
 
 **Options considered:**
@@ -313,7 +315,7 @@ The `Cost` return type is deliberate: matches `TtsProvider::cost(u32) -> Cost` a
 
 - `id()` → `"xai"`.
 - `output_format()` → `AudioFormat::Mp3_44100_128` in v1 (we request `sample_rate=44100, bit_rate=128000` on `POST /v1/tts` so the existing `SilenceSplicer` can splice matching silence). Other codecs are available from xAI but not wired until the format enum expands.
-- `supports_expressive_tags()` → `true`. xAI renders `[laugh]`, `<whisper>`, etc. natively ([§5.4](#54-tts--rest-unary)).
+- `expression_tag_instruction()` → provider-specific prompt text for the xAI tags/spans that `XaiTts::translate_expression_tags()` can render safely. xAI renders `[laugh]`, `<whisper>`, etc. natively ([§5.4](#54-tts--rest-unary)).
 - `cost(characters)` → `characters * 4.20 / 1_000_000.0` USD.
 - `synthesize(TtsRequest, SynthesisContext)` → unary `POST /v1/tts` per chunk. `SynthesisContext.previous_text` is ignored in v1 (xAI's REST endpoint has no documented prosody-continuity hint); `provider_state` is `None`. WS streaming with cross-chunk continuity is a follow-up — see [§12.1](#121-xai-tts-websocket-streaming).
 
@@ -684,7 +686,7 @@ Captured here as Gavin reviews the spec; each resolution tightens the build targ
 - **OQ-03 → Option (a) — Voice Agent API (`/v1/realtime`) is explicitly out of scope.** Gavin's rationale: parley intentionally mixes different models across STT / LLM / TTS stages; a unified vendor socket collapses that boundary and removes that freedom. Reinforces [Philosophy §6](philosophy.md).
 - **OQ-04 → Option (a) — permanent coexistence.** Users may mix providers across profiles indefinitely; no deprecation roadmap for AssemblyAI or ElevenLabs.
 - **OQ-06 → Option (b) — diarization on by default, multichannel deferred.** `diarize=true` is the shipped default for xAI STT; per-word `speaker` indexes are projected into the word-graph `speaker_lane`. Multichannel waits on the capture pipeline (§12.4).
-- **OQ-07 → Option (b) — pass-through speech tags.** xAI receives `text` verbatim (tags preserved); transformation / annotation strategy is owned by [expressive-annotation-spec.md](expressive-annotation-spec.md), not this spec.
+- **OQ-07 → Option (b) — pass-through speech tags.** xAI receives provider-native tags in `text` when present; neutral-to-xAI transformation / annotation strategy is owned by [expressive-annotation-spec.md](expressive-annotation-spec.md) and narrowed for the first xAI slice in [xAI TTS Prosody Improvement 1](xai-improve-1.md), not this base integration spec.
 - **OQ-08 → Yes, minimal.** `TurnProvenance` gains `stt_cost: Option<Cost>` and `tts_cost: Option<Cost>` as specified in §7. No aggregation / display UI in this spec.
 
 ### 14.1 Derived from the above

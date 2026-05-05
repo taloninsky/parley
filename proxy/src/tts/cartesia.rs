@@ -392,10 +392,8 @@ impl TtsProvider for CartesiaTts {
         AudioFormat::Pcm_S16LE_44100_Mono
     }
 
-    fn supports_expressive_tags(&self) -> bool {
-        // Sonic-3 honours `[laughter]` plus SSML volume/speed/emotion
-        // tags. Spec §8.2.
-        true
+    fn expression_tag_instruction(&self) -> Option<String> {
+        Some(cartesia_expression_instruction())
     }
 
     fn translate_expression_tags(&self, text: &str) -> String {
@@ -416,6 +414,23 @@ impl TtsProvider for CartesiaTts {
             })
             .collect())
     }
+}
+
+fn cartesia_expression_instruction() -> String {
+    "You may annotate spoken responses with these Cartesia Sonic-3-compatible expression tags inline. \
+     Use them sparingly and only when they enhance meaning; most sentences should carry no tags. \
+     Place each tag exactly where the cue should land in the audio.\n\n\
+     Available tags:\n\
+     - {laugh} — Actual short laugh sound.\n\
+     - {sigh} — Short audible exhale. Use sparingly.\n\
+     - {pause:short} — Deliberate beat around 250ms.\n\
+     - {pause:medium} — Deliberate beat around 700ms.\n\
+     - {pause:long} — Deliberate beat around 1.5s.\n\n\
+     Example: \"That's a good question. {pause:short} Let me think about it. {sigh} \
+     I do not want to overstate the answer.\"\n\n\
+     Do not invent new tags. Do not nest tags. Do not write provider-native Cartesia markup like \
+     <break>; use only the brace tags above."
+        .to_string()
 }
 
 /// Map Parley's neutral expression tags to Cartesia Sonic-3's native
@@ -472,9 +487,14 @@ mod tests {
     }
 
     #[test]
-    fn supports_expressive_tags_is_true() {
+    fn expression_instruction_matches_cartesia_supported_tags() {
         let p = CartesiaTts::new("k", reqwest::Client::new());
-        assert!(p.supports_expressive_tags());
+        let instruction = p.expression_tag_instruction().unwrap();
+        assert!(instruction.contains("{laugh}"));
+        assert!(instruction.contains("{pause:short}"));
+        assert!(!instruction.contains("{soft}"));
+        assert!(!instruction.contains("{thoughtful}"));
+        assert!(instruction.contains("Do not write provider-native Cartesia markup"));
     }
 
     #[test]

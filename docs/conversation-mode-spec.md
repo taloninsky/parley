@@ -276,9 +276,13 @@ compact_at_token_pct = 70             # trigger compaction at 70% of model's con
 preserve_recent_turns = 6             # always keep the last N turns uncompacted
 ```
 
-### 6.4 Expression Annotation Layer (Provider-Neutral)
+### 6.4 Expression Annotation Layer (Provider-Specific Surface)
 
-For TTS to deliver emotionally appropriate speech, the LLM must annotate its responses with expression cues. Different TTS providers use different syntaxes (ElevenLabs v3 uses inline `[bracket]` tags; Hume Octave uses style prompts; Azure uses SSML). To keep personas portable across providers, Parley defines a **provider-neutral expression annotation set** that the LLM emits, and each `TtsProvider` translates to its native syntax at synthesis time.
+For TTS to deliver emotionally appropriate speech, the LLM must annotate its responses with expression cues. Different TTS providers use different syntaxes and different scoping rules: xAI uses inline events plus XML-like wrappers, Cartesia Sonic-3 accepts point events and break tags, and ElevenLabs model families differ by version. Therefore the active `TtsProvider` owns both the expression instruction shown to the LLM and the translation into provider-native text.
+
+The orchestrator does not maintain one universal prompt. At dispatch time, if `persona.tts.use_expression_annotations = true`, it asks the active provider for `TtsProvider::expression_tag_instruction()`. Providers return only the tags/spans they can render safely. The orchestrator then calls `TtsProvider::translate_expression_tags()` on each chunk before synthesis.
+
+The brace-tag shape remains the cross-provider wire format in the assistant response, but the advertised vocabulary is provider-specific. Personas stay portable because they describe character and tone; the provider trait decides the legal expression surface for the current TTS model.
 
 #### Neutral Expression Vocabulary (v1)
 
@@ -304,37 +308,25 @@ For TTS to deliver emotionally appropriate speech, the LLM must annotate its res
 
 The vocabulary intentionally targets **conversational range**, not theatrical extremes. Whisper/shout-style tags are excluded because they are wrong-register for the parents-at-the-table use case. The vocabulary is expected to grow based on empirical use.
 
-#### How the LLM Knows About These Tags
+#### How the LLM Knows About Tags
 
-The orchestrator **auto-prepends** a canonical instruction to each persona's system prompt at dispatch time (gated by `persona.tts.use_expression_annotations`). The instruction lists the available tags with one-line descriptions and a short example, e.g.:
+The orchestrator **auto-prepends** the active provider's instruction to each persona's system prompt at dispatch time (gated by `persona.tts.use_expression_annotations`). The instruction lists only the tags that provider can currently render, with one-line descriptions and a short example.
 
-> *"You may annotate your responses with these expression tags inline. Use them sparingly and only when they enhance meaning. Tags: `{warm}`, `{empathetic}`, ... Example: 'That's a great question. {pause:short} {thoughtful} Let me think about it.'"*
+For example, Cartesia may advertise `{laugh}`, `{sigh}`, and pause tags because those map cleanly to point events. xAI may additionally advertise `{soft}`, `{thoughtful}`, `{emphasis}`, and `{excited}` because its provider implementation can turn those into scoped wrappers over the following sentence or clause.
 
 Personas describe their *character*. Plumbing (the tag instruction) is added uniformly by the orchestrator. Personas that need different behavior can opt out via `use_expression_annotations = false` and write whatever instruction they want directly into their system prompt.
 
 #### Per-Provider Translation
 
-Each `TtsProvider` implementation is responsible for translating the neutral tags into its native expression syntax. v1 ships with `ElevenLabsTts` (eleven_v3), which translates approximately as follows:
+Each `TtsProvider` implementation is responsible for translating the tags it advertised into its native expression syntax.
 
-| Neutral | ElevenLabs v3 |
+| Provider/model | Advertised expression surface |
 |---|---|
-| `{warm}` | Stage direction or emotional adjective injected into surrounding context |
-| `{laugh}` | `[laughs]` |
-| `{sigh}` | `[sighs]` |
-| `{soft}` | `[whispers]` (v3's whisper is conversational-soft, not stage-whisper) |
-| `{excited}` | `[excited]` |
-| `{sad}` | `[sad]` |
-| `{amused}` | `[amused]` |
-| `{sarcastic}` | `[sarcastic]` |
-| `{confused}` | `[confused]` |
-| `{questioning}` | Rendered as inline punctuation cue (rising contour) |
-| `{thoughtful}` | `[thoughtful]` if available, else stage direction |
-| `{empathetic}` | Stage direction |
-| `{concerned}` | `[concerned]` if available, else stage direction |
-| `{emphasis}` | SSML `<emphasis>` or surrounding context cue |
-| `{pause:short\|medium\|long}` | `[pause]` tag or ellipsis padding |
+| xAI grok-tts | `{laugh}`, `{sigh}`, pause tags, plus scoped style cues `{soft}`, `{thoughtful}`, `{emphasis}`, `{excited}` rendered through xAI wrappers. |
+| Cartesia Sonic-3 | `{laugh}`, `{sigh}`, and pause tags rendered as `[laughter]`, `[sigh]`, and SSML break tags. |
+| ElevenLabs multilingual v2 | No expression instruction; tags are not requested because this model family would read v3-style tags literally. |
 
-Some translations are lossy or approximate. That is the price of provider-agnostic encoding. The gain is that personas don't need to be rewritten when the TTS provider changes.
+Some translations are still lossy or approximate, but the loss is explicit and provider-local. A provider must not advertise a tag until its translator can render that tag safely.
 
 ### 6.2 Model Configs
 

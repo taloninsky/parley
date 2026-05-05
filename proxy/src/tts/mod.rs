@@ -19,7 +19,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use parley_core::chat::Cost;
-use parley_core::tts::VoiceDescriptor;
+use parley_core::tts::{ChunkPolicy, VoiceDescriptor};
 use thiserror::Error;
 
 // Re-exports kept here so the orchestrator and HTTP layer can
@@ -396,21 +396,32 @@ pub trait TtsProvider: Send + Sync {
     /// `SilenceSplicer` to pick a matching silence frame.
     fn output_format(&self) -> AudioFormat;
 
-    /// Whether this provider understands ElevenLabs-style expressive
-    /// annotation tags (e.g. `[whisper]`, `[laugh]`). The annotator
-    /// pass uses this to decide whether to inject tags into prompts.
-    fn supports_expressive_tags(&self) -> bool;
+    /// Provider-specific tuning for the model's configured chunking
+    /// policy. Providers with no continuation channel can prefer
+    /// larger paragraph-shaped requests; providers with strong native
+    /// continuation can keep lower-latency defaults.
+    fn tune_chunk_policy(&self, policy: ChunkPolicy) -> ChunkPolicy {
+        policy
+    }
+
+    /// Provider-specific instruction to prepend to the LLM system
+    /// prompt when expression annotations are enabled for the active
+    /// persona. Each TTS model must advertise only the tags/spans its
+    /// own translator can render safely.
+    ///
+    /// Returning `None` means the orchestrator should not ask the LLM
+    /// to emit expression markup for this provider.
+    fn expression_tag_instruction(&self) -> Option<String> {
+        None
+    }
 
     /// Translate Parley's neutral expression vocabulary
     /// (`{warm}`, `{laugh}`, `{pause:short}`, …; see
     /// [`parley_core::expression`]) into this provider's native tag
     /// syntax. Called once per chunk just before [`Self::synthesize`].
     ///
-    /// The default implementation strips every neutral tag — that's
-    /// the right thing for providers that don't honor any expressive
-    /// markup (xAI grok-tts today). Providers that do support tags
-    /// override and emit native equivalents (`[laughs]` for ElevenLabs
-    /// v3, `[laughter]` plus SSML-ish wrappers for Cartesia Sonic-3).
+    /// The default implementation strips every neutral tag. Providers
+    /// that do support tags override and emit native equivalents.
     /// Pure / synchronous: no I/O on the hot path.
     fn translate_expression_tags(&self, text: &str) -> String {
         parley_core::expression::strip_neutral_tags(text)

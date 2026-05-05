@@ -471,7 +471,14 @@ impl ConversationOrchestrator {
                 && ctx.tts_cache.is_some()
                 && ctx.tts_hub.is_some()
                 && ctx.tts_voice_id.is_some();
-            let chunk_policy = model.tts_chunking;
+            let chunk_policy = if tts_enabled {
+                ctx.tts
+                    .as_ref()
+                    .map(|provider| provider.tune_chunk_policy(model.tts_chunking))
+                    .unwrap_or(model.tts_chunking)
+            } else {
+                model.tts_chunking
+            };
             let mut tts = if tts_enabled {
                 match TtsTurn::open(&ctx, &session_id, ai_turn_id.clone()).await {
                     Ok(t) => Some(t),
@@ -1055,9 +1062,9 @@ fn has_synthesizable_content(text: &str) -> bool {
     text.chars().any(|c| c.is_alphanumeric())
 }
 
-/// persona allows it AND the active TTS provider can render expressive
-/// tags, prepends the canonical neutral-vocabulary instruction so the
-/// LLM learns the `{warm}`, `{laugh}`, `{pause:short}`, … tag set.
+/// persona allows it AND the active TTS provider supplies an expression
+/// instruction, prepends that provider's instruction so the LLM only
+/// learns the tags/spans the selected TTS model can actually use.
 ///
 /// Spec: `docs/conversation-mode-spec.md` §6.4. Personas can opt out
 /// via `persona.tts.use_expression_annotations = false` and bake
@@ -1068,14 +1075,16 @@ fn build_system_prompt(
     tts: Option<&dyn TtsProvider>,
 ) -> Result<String, OrchestratorError> {
     let body = resolve_system_prompt(&persona.system_prompt, prompts_dir)?;
-    let should_prepend = persona.tts.use_expression_annotations
-        && tts.map(|p| p.supports_expressive_tags()).unwrap_or(false);
-    if !should_prepend {
+    let instruction = if persona.tts.use_expression_annotations {
+        tts.and_then(|p| p.expression_tag_instruction())
+    } else {
+        None
+    };
+    let Some(instruction) = instruction else {
         return Ok(body);
-    }
-    let mut out =
-        String::with_capacity(body.len() + 1024 + parley_core::expression::NEUTRAL_TAGS.len() * 32);
-    out.push_str(&parley_core::expression::expression_tag_instruction());
+    };
+    let mut out = String::with_capacity(body.len() + instruction.len() + 2);
+    out.push_str(&instruction);
     // Two newlines so the auto-prepended block is visibly separate
     // from the persona's own system prompt body. The LLM sees a clear
     // section boundary, not a run-on paragraph.
@@ -1497,6 +1506,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_prompt_adds_expression_instruction_when_tts_supports_tags() {
+        let provider = Arc::new(MockProvider::new(
+            "p",
+            vec![MockItem::Text("ok".into())],
+            TokenUsage::default(),
+        ));
+        let captured_handle = provider.captured_handle();
+        let mock_tts = StdArc::new(MockTtsProvider::new(vec![MockTtsCall::Ok {
+            audio_chunks: vec![vec![1, 2, 3]],
+            characters: 2,
+        }]));
+        let (o, _, _) = build_with_tts(
+            sample_persona("scholar", "m1", "BE BRIEF"),
+            sample_model("m1"),
+            provider,
+            mock_tts,
+        );
+
+        let _ = drain(&o, "hi").await;
+
+        let captured = captured_handle.lock().unwrap().clone().expect("captured");
+        assert_eq!(captured[0].role, parley_core::chat::ChatRole::System);
+        assert!(
+            captured[0]
+                .content
+                .starts_with("MOCK TTS EXPRESSION INSTRUCTION")
+        );
+        assert!(captured[0].content.ends_with("BE BRIEF"));
+    }
+
+    #[tokio::test]
     async fn system_prompt_file_is_read_from_prompts_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
         let prompt_path = tmp.path().join("scholar.md");
@@ -1592,6 +1632,7 @@ mod tests {
         script: StdMutex<Vec<MockTtsCall>>,
         captured: StdMutex<Vec<TtsRequest>>,
         captured_ctx: StdMutex<Vec<crate::tts::SynthesisContext>>,
+        tuned_chunk_policy: Option<parley_core::tts::ChunkPolicy>,
     }
 
     impl MockTtsProvider {
@@ -1600,6 +1641,18 @@ mod tests {
                 script: StdMutex::new(script),
                 captured: StdMutex::new(Vec::new()),
                 captured_ctx: StdMutex::new(Vec::new()),
+                tuned_chunk_policy: None,
+            }
+        }
+        fn with_tuned_chunk_policy(
+            script: Vec<MockTtsCall>,
+            tuned_chunk_policy: parley_core::tts::ChunkPolicy,
+        ) -> Self {
+            Self {
+                script: StdMutex::new(script),
+                captured: StdMutex::new(Vec::new()),
+                captured_ctx: StdMutex::new(Vec::new()),
+                tuned_chunk_policy: Some(tuned_chunk_policy),
             }
         }
         fn captured(&self) -> Vec<TtsRequest> {
@@ -1652,8 +1705,14 @@ mod tests {
         fn output_format(&self) -> crate::tts::AudioFormat {
             crate::tts::AudioFormat::Mp3_44100_128
         }
-        fn supports_expressive_tags(&self) -> bool {
-            true
+        fn tune_chunk_policy(
+            &self,
+            policy: parley_core::tts::ChunkPolicy,
+        ) -> parley_core::tts::ChunkPolicy {
+            self.tuned_chunk_policy.unwrap_or(policy)
+        }
+        fn expression_tag_instruction(&self) -> Option<String> {
+            Some("MOCK TTS EXPRESSION INSTRUCTION".into())
         }
     }
 
@@ -2076,5 +2135,43 @@ mod tests {
             calls[0].text,
         );
         assert_eq!(ctxs[1].chunk_index, 1);
+    }
+
+    #[tokio::test]
+    async fn tts_provider_chunk_policy_tuning_keeps_first_paragraph_together() {
+        let llm = Arc::new(MockProvider::new(
+            "p",
+            vec![MockItem::Text("One. Two. Three.\n\nNext paragraph.".into())],
+            TokenUsage::default(),
+        ));
+        let mut tuned = parley_core::tts::ChunkPolicy::default();
+        tuned.first_chunk_max_sentences = 0;
+        tuned.idle_timeout_ms = tuned.paragraph_wait_ms;
+        let mock_tts = StdArc::new(MockTtsProvider::with_tuned_chunk_policy(
+            vec![
+                MockTtsCall::Ok {
+                    audio_chunks: vec![vec![0x01]],
+                    characters: 16,
+                },
+                MockTtsCall::Ok {
+                    audio_chunks: vec![vec![0x02]],
+                    characters: 15,
+                },
+            ],
+            tuned,
+        ));
+        let (o, _hub, _tmp) = build_with_tts(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            llm,
+            mock_tts.clone(),
+        );
+
+        let _events = drain(&o, "hi").await;
+
+        let calls = mock_tts.captured();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].text, "One. Two. Three.");
+        assert_eq!(calls[1].text, "Next paragraph.");
     }
 }

@@ -26,7 +26,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use parley_core::chat::Cost;
-use parley_core::tts::VoiceDescriptor;
+use parley_core::tts::{ChunkPolicy, VoiceDescriptor};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -205,10 +205,19 @@ impl TtsProvider for XaiTts {
         AudioFormat::Mp3_44100_128
     }
 
-    fn supports_expressive_tags(&self) -> bool {
-        // xAI's models don't interpret ElevenLabs-style bracketed
-        // expressive tags; they'd be read literally.
-        false
+    fn tune_chunk_policy(&self, policy: ChunkPolicy) -> ChunkPolicy {
+        let mut tuned = policy;
+        tuned.first_chunk_max_sentences = 0;
+        tuned.idle_timeout_ms = tuned.idle_timeout_ms.max(tuned.paragraph_wait_ms);
+        tuned
+    }
+
+    fn expression_tag_instruction(&self) -> Option<String> {
+        Some(xai_expression_instruction())
+    }
+
+    fn translate_expression_tags(&self, text: &str) -> String {
+        translate_for_xai(text)
     }
 
     async fn voices(&self) -> Result<Vec<VoiceDescriptor>, TtsError> {
@@ -344,6 +353,128 @@ fn title_case(s: &str) -> String {
     match chars.next() {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+fn xai_expression_instruction() -> String {
+    "You may annotate spoken responses with these xAI-compatible expression tags inline. \
+     Use them sparingly and only when they enhance meaning; most sentences should carry no tags. \
+     Place event tags exactly where the cue should land. Place style tags immediately before the \
+     sentence or clause they should color; Parley will render the style through the next strong \
+     punctuation boundary.\n\n\
+     Available tags:\n\
+     - {laugh} — Actual short laugh sound.\n\
+     - {sigh} — Short audible exhale. Use sparingly.\n\
+     - {pause:short} — Deliberate short beat.\n\
+     - {pause:medium} — Deliberate longer beat.\n\
+     - {pause:long} — Deliberate long beat.\n\
+     - {soft} — Quieter, intimate delivery for the following sentence or clause.\n\
+     - {thoughtful} — Slower, considered delivery for the following sentence or clause.\n\
+     - {emphasis} — Stress the following word or short phrase.\n\
+     - {excited} — Faster, animated delivery for the following sentence or clause.\n\n\
+     Example: \"That's a good question. {pause:short} {thoughtful}Let me think about it. \
+     {soft}I hear you.\"\n\n\
+     Do not invent new tags. Do not nest tags. Do not write provider-native xAI tags like \
+     [pause] or <soft>; use only the brace tags above."
+        .to_string()
+}
+
+/// Map Parley's neutral tags to xAI's native speech-event tags.
+///
+/// Parley's current neutral expression model only gives us inline point
+/// markers. xAI's style controls are scoped wrappers, so selected style cues
+/// open a wrapper around the following text unit and close at the next strong
+/// punctuation boundary. Broad emotional labels without a close native control
+/// still strip rather than pretending we know how to render them.
+fn translate_for_xai(text: &str) -> String {
+    use parley_core::expression::{Segment, split_into_segments};
+
+    let mut out = String::with_capacity(text.len());
+    let mut pending_styles: Vec<&'static str> = Vec::new();
+    let mut open_styles: Vec<&'static str> = Vec::new();
+    for segment in split_into_segments(text) {
+        match segment {
+            Segment::Text(text) => {
+                push_text_for_xai(text, &mut out, &mut pending_styles, &mut open_styles)
+            }
+            Segment::Tag(id) => match id {
+                "laugh" => out.push_str("[laugh]"),
+                "sigh" => out.push_str("[sigh]"),
+                "pause:short" => out.push_str("[pause]"),
+                "pause:medium" | "pause:long" => out.push_str("[long-pause]"),
+                "soft" => pending_styles.push("soft"),
+                "emphasis" => pending_styles.push("emphasis"),
+                "thoughtful" => pending_styles.push("slow"),
+                "excited" => pending_styles.push("fast"),
+                _ => {}
+            },
+        }
+    }
+    close_styles(&mut out, &mut open_styles);
+    out
+}
+
+fn push_text_for_xai(
+    text: &str,
+    out: &mut String,
+    pending_styles: &mut Vec<&'static str>,
+    open_styles: &mut Vec<&'static str>,
+) {
+    if open_styles.is_empty() && !pending_styles.is_empty() {
+        let body_start = text
+            .char_indices()
+            .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx));
+        let Some(body_start) = body_start else {
+            out.push_str(text);
+            return;
+        };
+
+        out.push_str(&text[..body_start]);
+        open_pending_styles(out, pending_styles, open_styles);
+        push_text_with_open_styles(&text[body_start..], out, open_styles);
+    } else {
+        push_text_with_open_styles(text, out, open_styles);
+    }
+}
+
+fn open_pending_styles(
+    out: &mut String,
+    pending_styles: &mut Vec<&'static str>,
+    open_styles: &mut Vec<&'static str>,
+) {
+    for style in pending_styles.drain(..) {
+        out.push('<');
+        out.push_str(style);
+        out.push('>');
+        open_styles.push(style);
+    }
+}
+
+fn push_text_with_open_styles(text: &str, out: &mut String, open_styles: &mut Vec<&'static str>) {
+    if open_styles.is_empty() {
+        out.push_str(text);
+        return;
+    }
+
+    if let Some(end) = style_scope_end(text) {
+        out.push_str(&text[..end]);
+        close_styles(out, open_styles);
+        out.push_str(&text[end..]);
+    } else {
+        out.push_str(text);
+    }
+}
+
+fn style_scope_end(text: &str) -> Option<usize> {
+    text.char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '.' | '!' | '?' | ';').then_some(idx + ch.len_utf8()))
+}
+
+fn close_styles(out: &mut String, open_styles: &mut Vec<&'static str>) {
+    while let Some(style) = open_styles.pop() {
+        out.push_str("</");
+        out.push_str(style);
+        out.push('>');
     }
 }
 
@@ -534,7 +665,103 @@ mod tests {
         let p = XaiTts::new("k", reqwest::Client::new());
         assert_eq!(p.id(), "xai");
         assert_eq!(p.output_format(), AudioFormat::Mp3_44100_128);
-        assert!(!p.supports_expressive_tags());
+    }
+
+    #[test]
+    fn tune_chunk_policy_prefers_paragraph_continuity() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        let policy = ChunkPolicy {
+            first_chunk_max_sentences: 2,
+            paragraph_wait_ms: 3_000,
+            idle_timeout_ms: 1_500,
+            ..ChunkPolicy::default()
+        };
+
+        let tuned = p.tune_chunk_policy(policy);
+
+        assert_eq!(tuned.first_chunk_max_sentences, 0);
+        assert_eq!(tuned.paragraph_wait_ms, 3_000);
+        assert_eq!(tuned.idle_timeout_ms, 3_000);
+    }
+
+    #[test]
+    fn expression_instruction_matches_xai_supported_tags() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        let instruction = p.expression_tag_instruction().unwrap();
+        assert!(instruction.contains("{soft}"));
+        assert!(instruction.contains("{thoughtful}"));
+        assert!(instruction.contains("{pause:short}"));
+        assert!(!instruction.contains("{warm}"));
+        assert!(instruction.contains("Do not write provider-native xAI tags"));
+    }
+
+    #[test]
+    fn translate_expression_tags_maps_native_point_events() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags("Hold on {pause:short} I see it. {sigh} Okay {laugh} yes."),
+            "Hold on [pause] I see it. [sigh] Okay [laugh] yes.",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_maps_medium_and_long_pauses_to_long_pause() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags("First {pause:medium} second {pause:long} third"),
+            "First [long-pause] second [long-pause] third",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_wraps_supported_style_cues() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags(
+                "{soft}I hear you. {thoughtful}Let me think. This part is plain."
+            ),
+            "<soft>I hear you.</soft> <slow>Let me think.</slow> This part is plain.",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_wraps_emphasis_and_excited() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags(
+                "Please {emphasis}really consider this. {excited}That works!"
+            ),
+            "Please <emphasis>really consider this.</emphasis> <fast>That works!</fast>",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_keeps_style_open_across_point_events() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags("{soft}I hear {pause:short} you."),
+            "<soft>I hear [pause] you.</soft>",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_strips_unsupported_style_cues() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags("{warm}Hello.{empathetic} I hear you. {sarcastic}Really."),
+            "Hello. I hear you. Really.",
+        );
+    }
+
+    #[test]
+    fn translate_expression_tags_preserves_literal_text_and_malformed_braces() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert_eq!(
+            p.translate_expression_tags(
+                r#"Use config {\"voice\":\"eve\"}; then pause {pause:short}."#
+            ),
+            r#"Use config {\"voice\":\"eve\"}; then pause [pause]."#,
+        );
     }
 
     #[test]
