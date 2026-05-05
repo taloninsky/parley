@@ -1,7 +1,9 @@
 //! xAI `grok-tts` implementation of [`TtsProvider`].
 //!
-//! REST (unary) path only — the streaming WebSocket path is a Step 4
-//! WS follow-up (see `docs/xai-speech-integration-spec.md` §10.2).
+//! The unary REST path remains available as a fallback. The turn-level
+//! WebSocket path is the prosody-oriented path: it accepts `text.delta`
+//! frames and returns `audio.delta` frames inside one continuous xAI
+//! synthesis session.
 //!
 //! We pin the response codec to `Mp3_44100_128` so the existing
 //! [`crate::tts::silence`] splicer keeps working unchanged across
@@ -20,23 +22,32 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
-use futures::StreamExt;
+use base64::Engine;
+use futures::{SinkExt, StreamExt};
 use parley_core::chat::Cost;
 use parley_core::tts::{ChunkPolicy, VoiceDescriptor};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 use super::{
     AudioFormat, SynthesisContext, TtsChunk, TtsError, TtsProvider, TtsRequest, TtsStream,
+    TtsTextFrame, TtsTurnStreamRequest, TurnTextStream,
 };
 
 /// Default REST endpoint. Constructor takes an override so tests can
 /// point at a `wiremock` server.
 pub const XAI_TTS_REST_URL: &str = "https://api.x.ai/v1/tts";
+
+/// Default TTS WebSocket endpoint. Unlike REST, this accepts
+/// incremental `text.delta` frames for one continuous turn.
+pub const XAI_TTS_WS_URL: &str = "wss://api.x.ai/v1/tts";
 
 /// Default voices catalog endpoint (spec §5.6). 24-hour cache TTL
 /// matches the server-side contract.
@@ -78,6 +89,7 @@ pub const XAI_TTS_KNOWN_VOICES: &[&str] = &["eve", "ara", "rex", "sal", "leo"];
 pub struct XaiTts {
     api_key: Arc<str>,
     endpoint: Arc<str>,
+    ws_endpoint: Arc<str>,
     voices_endpoint: Arc<str>,
     client: reqwest::Client,
     voices_cache: Arc<Mutex<Option<VoicesCacheEntry>>>,
@@ -92,7 +104,13 @@ struct VoicesCacheEntry {
 impl XaiTts {
     /// Build a provider pointed at the production endpoints.
     pub fn new(api_key: impl Into<String>, client: reqwest::Client) -> Self {
-        Self::with_endpoints(api_key, XAI_TTS_REST_URL, XAI_TTS_VOICES_URL, client)
+        Self::with_all_endpoints(
+            api_key,
+            XAI_TTS_REST_URL,
+            XAI_TTS_WS_URL,
+            XAI_TTS_VOICES_URL,
+            client,
+        )
     }
 
     /// Build a provider with a custom synthesize endpoint. Voices URL
@@ -103,7 +121,13 @@ impl XaiTts {
         endpoint: impl Into<String>,
         client: reqwest::Client,
     ) -> Self {
-        Self::with_endpoints(api_key, endpoint, XAI_TTS_VOICES_URL, client)
+        Self::with_all_endpoints(
+            api_key,
+            endpoint,
+            XAI_TTS_WS_URL,
+            XAI_TTS_VOICES_URL,
+            client,
+        )
     }
 
     /// Build a provider with overrides for both the synthesize and
@@ -115,9 +139,23 @@ impl XaiTts {
         voices_endpoint: impl Into<String>,
         client: reqwest::Client,
     ) -> Self {
+        Self::with_all_endpoints(api_key, endpoint, XAI_TTS_WS_URL, voices_endpoint, client)
+    }
+
+    /// Build a provider with overrides for synthesize, WebSocket, and
+    /// voices endpoints. Tests use this to point the WS path at a
+    /// local fixture without changing the REST fixture.
+    pub fn with_all_endpoints(
+        api_key: impl Into<String>,
+        endpoint: impl Into<String>,
+        ws_endpoint: impl Into<String>,
+        voices_endpoint: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
         Self {
             api_key: api_key.into().into(),
             endpoint: endpoint.into().into(),
+            ws_endpoint: ws_endpoint.into().into(),
             voices_endpoint: voices_endpoint.into().into(),
             client,
             voices_cache: Arc::new(Mutex::new(None)),
@@ -195,6 +233,118 @@ impl TtsProvider for XaiTts {
         Ok(Box::pin(stream))
     }
 
+    fn supports_turn_text_stream(&self) -> bool {
+        true
+    }
+
+    async fn open_turn_text_stream(
+        &self,
+        request: TtsTurnStreamRequest,
+    ) -> Result<TurnTextStream, TtsError> {
+        let voice = if request.voice_id.is_empty() {
+            XAI_TTS_DEFAULT_VOICE.to_string()
+        } else {
+            request.voice_id
+        };
+        let url = format!(
+            "{}?language={}&voice={}&codec=mp3&sample_rate={}&bit_rate={}",
+            self.ws_endpoint,
+            XAI_TTS_DEFAULT_LANGUAGE,
+            urlencoding::encode(&voice),
+            XAI_TTS_SAMPLE_RATE,
+            XAI_TTS_BIT_RATE,
+        );
+        let mut ws_request = url
+            .into_client_request()
+            .map_err(|e| TtsError::Transport(format!("bad ws url: {e}")))?;
+        let bearer = format!("Bearer {}", self.api_key.as_ref())
+            .parse()
+            .map_err(|e| TtsError::Other(format!("bearer header: {e}")))?;
+        ws_request.headers_mut().insert("Authorization", bearer);
+
+        let (ws, _resp) =
+            tokio_tungstenite::connect_async(ws_request)
+                .await
+                .map_err(|e| match e {
+                    tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                        let status = resp.status().as_u16();
+                        let body = resp
+                            .body()
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).to_string())
+                            .unwrap_or_default();
+                        TtsError::Http { status, body }
+                    }
+                    other => TtsError::Transport(other.to_string()),
+                })?;
+        let (mut ws_sink, mut ws_stream) = ws.split();
+        let (text_tx, mut text_rx) = mpsc::channel::<TtsTextFrame>(64);
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        let billable_characters = Arc::new(AtomicU32::new(0));
+        let forwarded_characters = billable_characters.clone();
+
+        tokio::spawn(async move {
+            while let Some(frame) = text_rx.recv().await {
+                match frame {
+                    TtsTextFrame::Delta(delta) => {
+                        forwarded_characters
+                            .fetch_add(delta.chars().count() as u32, Ordering::Relaxed);
+                        let payload = json!({ "type": "text.delta", "delta": delta });
+                        if ws_sink
+                            .send(Message::Text(payload.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    TtsTextFrame::Done => break,
+                }
+            }
+            if ws_sink
+                .send(Message::Text(json!({ "type": "text.done" }).to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = close_rx.await;
+            let _ = ws_sink.send(Message::Close(None)).await;
+        });
+
+        let mut close_signal = Some(close_tx);
+        let stream = try_stream! {
+            while let Some(msg) = ws_stream.next().await {
+                let msg = msg.map_err(|e| TtsError::Transport(e.to_string()))?;
+                match msg {
+                    Message::Text(text) => match parse_ws_tts_text(&text)? {
+                        XaiWsTtsFrame::Audio(bytes) => {
+                            if !bytes.is_empty() {
+                                yield TtsChunk::Audio(bytes);
+                            }
+                        }
+                        XaiWsTtsFrame::Done => {
+                            if let Some(tx) = close_signal.take() {
+                                let _ = tx.send(());
+                            }
+                            let characters = billable_characters.load(Ordering::Relaxed);
+                            yield TtsChunk::Done { characters };
+                            break;
+                        }
+                        XaiWsTtsFrame::Ignore => continue,
+                    },
+                    Message::Close(_) => break,
+                    Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                }
+            }
+        };
+
+        Ok(TurnTextStream {
+            text_tx,
+            audio: Box::pin(stream),
+        })
+    }
+
     fn cost(&self, characters: u32) -> Cost {
         Cost::from_usd(characters as f64 * XAI_TTS_COST_PER_CHAR_USD)
     }
@@ -259,6 +409,39 @@ impl TtsProvider for XaiTts {
         let voices = body.into_descriptors();
         self.store_voices_cache(&voices);
         Ok(voices)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum XaiWsTtsFrame {
+    Audio(Vec<u8>),
+    Done,
+    Ignore,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiWsTextFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    delta: Option<String>,
+}
+
+fn parse_ws_tts_text(text: &str) -> Result<XaiWsTtsFrame, TtsError> {
+    let frame: XaiWsTextFrame = serde_json::from_str(text)
+        .map_err(|e| TtsError::Protocol(format!("xai tts ws json: {e}")))?;
+    match frame.kind.as_str() {
+        "audio.delta" => {
+            let delta = frame
+                .delta
+                .ok_or_else(|| TtsError::Protocol("xai tts audio.delta missing delta".into()))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(delta)
+                .map_err(|e| TtsError::Protocol(format!("xai tts audio.delta base64: {e}")))?;
+            Ok(XaiWsTtsFrame::Audio(bytes))
+        }
+        "audio.done" => Ok(XaiWsTtsFrame::Done),
+        _ => Ok(XaiWsTtsFrame::Ignore),
     }
 }
 
@@ -481,7 +664,11 @@ fn close_styles(out: &mut String, open_styles: &mut Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+
     use futures::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -491,6 +678,66 @@ mod tests {
             format!("{}/v1/tts", server.uri()),
             reqwest::Client::new(),
         )
+    }
+
+    fn provider_with_ws(ws_url: String) -> XaiTts {
+        XaiTts::with_all_endpoints(
+            "test-key",
+            "http://example.test/v1/tts",
+            ws_url,
+            "http://example.test/v1/tts/voices",
+            reqwest::Client::new(),
+        )
+    }
+
+    async fn spawn_mock_ws(
+        scripted: Vec<Message>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/");
+
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut captured = Vec::new();
+            while let Some(msg) = ws.next().await {
+                match msg.unwrap() {
+                    Message::Text(text) => {
+                        let done = text.contains(r#""type":"text.done""#);
+                        captured.push(text);
+                        if done {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => return captured,
+                    _ => {}
+                }
+            }
+            for msg in scripted {
+                ws.send(msg).await.unwrap();
+            }
+            let _ = ws.next().await;
+            captured
+        });
+
+        (url, handle)
+    }
+
+    fn server_audio(bytes: &[u8]) -> Message {
+        Message::Text(
+            json!({
+                "type": "audio.delta",
+                "delta": base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+            .to_string(),
+        )
+    }
+
+    fn server_done() -> Message {
+        Message::Text(json!({ "type": "audio.done", "trace_id": "trace-1" }).to_string())
     }
 
     #[tokio::test]
@@ -665,6 +912,82 @@ mod tests {
         let p = XaiTts::new("k", reqwest::Client::new());
         assert_eq!(p.id(), "xai");
         assert_eq!(p.output_format(), AudioFormat::Mp3_44100_128);
+    }
+
+    #[test]
+    fn turn_text_stream_capability_is_advertised() {
+        let p = XaiTts::new("k", reqwest::Client::new());
+        assert!(p.supports_turn_text_stream());
+    }
+
+    #[test]
+    fn parse_ws_tts_text_decodes_audio_delta() {
+        let frame = json!({
+            "type": "audio.delta",
+            "delta": base64::engine::general_purpose::STANDARD.encode(b"mp3"),
+        })
+        .to_string();
+        assert_eq!(
+            parse_ws_tts_text(&frame).unwrap(),
+            XaiWsTtsFrame::Audio(b"mp3".to_vec())
+        );
+    }
+
+    #[test]
+    fn parse_ws_tts_text_rejects_bad_audio_base64() {
+        let frame = json!({ "type": "audio.delta", "delta": "not base64!!" }).to_string();
+        match parse_ws_tts_text(&frame) {
+            Err(TtsError::Protocol(message)) => assert!(message.contains("base64")),
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ws_tts_text_marks_audio_done() {
+        let frame = json!({ "type": "audio.done", "trace_id": "trace-1" }).to_string();
+        assert_eq!(parse_ws_tts_text(&frame).unwrap(), XaiWsTtsFrame::Done);
+    }
+
+    #[tokio::test]
+    async fn open_turn_text_stream_sends_deltas_and_decodes_audio() {
+        let (ws_url, handle) = spawn_mock_ws(vec![server_audio(b"one"), server_done()]).await;
+        let session = provider_with_ws(ws_url)
+            .open_turn_text_stream(TtsTurnStreamRequest {
+                voice_id: "rex".into(),
+            })
+            .await
+            .unwrap();
+
+        session
+            .text_tx
+            .send(TtsTextFrame::Delta("Hello ".into()))
+            .await
+            .unwrap();
+        session
+            .text_tx
+            .send(TtsTextFrame::Delta("world.".into()))
+            .await
+            .unwrap();
+        session.text_tx.send(TtsTextFrame::Done).await.unwrap();
+
+        let mut audio_stream = session.audio;
+        let mut audio = Vec::new();
+        let mut done_characters = None;
+        while let Some(item) = audio_stream.next().await {
+            match item.unwrap() {
+                TtsChunk::Audio(bytes) => audio.extend(bytes),
+                TtsChunk::Done { characters } => done_characters = Some(characters),
+            }
+        }
+
+        assert_eq!(audio, b"one");
+        assert_eq!(done_characters, Some(12));
+        let captured = handle.await.unwrap();
+        assert_eq!(captured.len(), 3);
+        assert!(captured[0].contains(r#""type":"text.delta""#));
+        assert!(captured[0].contains(r#""delta":"Hello ""#));
+        assert!(captured[1].contains(r#""delta":"world.""#));
+        assert!(captured[2].contains(r#""type":"text.done""#));
     }
 
     #[test]

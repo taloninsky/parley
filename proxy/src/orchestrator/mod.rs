@@ -47,14 +47,19 @@ use parley_core::conversation::{ConversationSession, TurnId, TurnProvenance};
 use parley_core::model_config::{ModelConfig, ModelConfigId};
 use parley_core::persona::{Persona, PersonaId, SystemPrompt};
 use parley_core::speaker::SpeakerId;
-use parley_core::tts::{ChunkPlanner, ChunkPolicy, ReleasedChunk};
+use parley_core::tts::{
+    ChunkPlanner, ChunkPolicy, LookaheadPolicy, ParagraphLookaheadFeeder, ReleasedChunk,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::llm::{ChatOptions, LlmError, LlmProvider};
 use crate::tts::silence::SilenceSplicer;
-use crate::tts::{FsTtsCache, TtsBroadcastFrame, TtsChunk, TtsHub, TtsProvider, TtsRequest};
+use crate::tts::{
+    FsTtsCache, TtsBroadcastFrame, TtsChunk, TtsHub, TtsProvider, TtsRequest, TtsTextFrame,
+    TtsTurnStreamRequest,
+};
 
 /// One observable state in the per-turn lifecycle. This is a strict
 /// subset of spec §5: the audio-bound states (Capturing,
@@ -494,13 +499,46 @@ impl ConversationOrchestrator {
             } else {
                 None
             };
-            // The chunk planner mirrors `tts`: present iff TTS is
-            // wired and `TtsTurn::open` succeeded. Built from the
-            // model's [`ChunkPolicy`] so per-model tuning flows
-            // through automatically.
-            let mut planner: Option<ChunkPlanner> = tts
-                .as_ref()
-                .map(|_| ChunkPlanner::new(chunk_policy));
+            let mut turn_text_stream = None;
+            if tts.is_some()
+                && ctx
+                    .tts
+                    .as_ref()
+                    .is_some_and(|provider| provider.supports_turn_text_stream())
+            {
+                let provider = ctx.tts.as_ref().expect("tts provider present").clone();
+                let voice_id = ctx.tts_voice_id.clone().expect("tts_voice_id present");
+                match provider
+                    .open_turn_text_stream(TtsTurnStreamRequest { voice_id })
+                    .await
+                {
+                    Ok(stream) => {
+                        if let Some(t) = tts.as_mut() {
+                            for ev in t.start_turn_stream(&ctx, &chunk_policy).await {
+                                yield ev;
+                            }
+                        }
+                        turn_text_stream = Some(stream);
+                    }
+                    Err(e) => {
+                        yield OrchestratorEvent::Failed {
+                            message: format!(
+                                "tts turn stream failed to open; falling back to chunked synthesis: {e}"
+                            ),
+                        };
+                    }
+                }
+            }
+
+            // The chunk planner mirrors `tts` only for providers that
+            // do not have an active turn-level stream. Built from the
+            // model's [`ChunkPolicy`] so per-model tuning flows through
+            // automatically.
+            let mut planner: Option<ChunkPlanner> = if tts.is_some() && turn_text_stream.is_none() {
+                Some(ChunkPlanner::new(chunk_policy))
+            } else {
+                None
+            };
 
             let mut accumulated = String::new();
             let mut final_usage = TokenUsage::default();
@@ -508,50 +546,146 @@ impl ConversationOrchestrator {
 
             futures::pin_mut!(token_stream);
 
-            // Periodic tick to fire the planner's timer-driven
-            // rules (R3 paragraph wait, R5 idle timeout) when the
-            // LLM is silent. 250 ms keeps timer resolution well
-            // below the smallest configurable window
-            // (`first_chunk_max_wait_ms = 800`). Only constructed
-            // when TTS is on so text-only turns don't pay for it.
-            let mut tick_interval = if planner.is_some() {
-                let mut iv = tokio::time::interval(
-                    std::time::Duration::from_millis(250),
-                );
-                iv.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Delay,
-                );
-                // `interval` fires immediately on first poll;
-                // discard that tick so we don't double-fire timer
-                // rules at t=0.
-                iv.tick().await;
-                Some(iv)
-            } else {
-                None
-            };
+            if let Some(mut turn_stream) = turn_text_stream {
+                let provider = ctx.tts.as_ref().expect("tts provider present").clone();
+                let mut feeder = ParagraphLookaheadFeeder::new(LookaheadPolicy {
+                    hard_cap_chars: chunk_policy.hard_cap_chars,
+                    ..LookaheadPolicy::default()
+                });
+                let mut llm_done = false;
+                let mut text_done_sent = false;
+                let mut audio_done = false;
+                let mut tts_failed = false;
 
-            // Main streaming loop. Inside each iteration we pull
-            // *one* event source — a token or a tick — produce at
-            // most one released chunk from the planner, then
-            // synchronously drain the single-flight dispatch chain
-            // that one chunk unlocks before looping back. This
-            // satisfies the spec §3.6 single-flight invariant
-            // without any cross-task coordination.
-            let mut llm_done = false;
-            while !llm_done {
-                // Read a single event source. Returns the chunk
-                // (if any) that the planner released as a result.
-                let released: Option<ReleasedChunk> = if let Some(iv) = tick_interval.as_mut() {
+                while !llm_done || (!audio_done && !tts_failed) {
                     tokio::select! {
-                        biased;
-                        item = token_stream.next() => match item {
+                        item = token_stream.next(), if !llm_done => match item {
                             Some(Ok(ChatToken::TextDelta { text })) => {
                                 accumulated.push_str(&text);
-                                let chunk = planner
-                                    .as_mut()
-                                    .and_then(|p| p.push(&text, clock.now_ms()).into_iter().next());
+                                for delta in feeder.push(&text) {
+                                    if let Err(message) = send_turn_stream_text(&provider, &turn_stream.text_tx, &delta).await {
+                                        yield OrchestratorEvent::Failed { message: message.clone() };
+                                        if let Some(t) = tts.as_mut() { t.abort(message).await; }
+                                        tts_failed = true;
+                                        break;
+                                    }
+                                }
                                 yield OrchestratorEvent::Token { delta: text };
-                                chunk
+                            }
+                            Some(Ok(ChatToken::Done { usage })) => {
+                                if let Some(u) = usage { final_usage = u; }
+                                llm_done = true;
+                            }
+                            Some(Err(e)) => {
+                                yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
+                                llm_errored = true;
+                                llm_done = true;
+                            }
+                            None => {
+                                llm_done = true;
+                            }
+                        },
+                        audio = turn_stream.audio.next(), if !audio_done && !tts_failed => {
+                            if let Some(t) = tts.as_mut() {
+                                let (events, done) = t.dispatch_turn_stream_frame(audio).await;
+                                for ev in events { yield ev; }
+                                audio_done = done;
+                            } else {
+                                audio_done = true;
+                            }
+                        }
+                    }
+
+                    if llm_done && !llm_errored && !text_done_sent && !tts_failed {
+                        for delta in feeder.finish() {
+                            if let Err(message) = send_turn_stream_text(&provider, &turn_stream.text_tx, &delta).await {
+                                yield OrchestratorEvent::Failed { message: message.clone() };
+                                if let Some(t) = tts.as_mut() { t.abort(message).await; }
+                                tts_failed = true;
+                                break;
+                            }
+                        }
+                        if !tts_failed {
+                            if turn_stream.text_tx.send(TtsTextFrame::Done).await.is_err() {
+                                let message = "tts text stream closed".to_string();
+                                yield OrchestratorEvent::Failed { message: message.clone() };
+                                if let Some(t) = tts.as_mut() { t.abort(message).await; }
+                                tts_failed = true;
+                            }
+                            text_done_sent = true;
+                        }
+                    }
+                }
+            } else {
+                // Periodic tick to fire the planner's timer-driven
+                // rules (R3 paragraph wait, R5 idle timeout) when the
+                // LLM is silent. 250 ms keeps timer resolution well
+                // below the smallest configurable window
+                // (`first_chunk_max_wait_ms = 800`). Only constructed
+                // when TTS is on so text-only turns don't pay for it.
+                let mut tick_interval = if planner.is_some() {
+                    let mut iv = tokio::time::interval(std::time::Duration::from_millis(250));
+                    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // `interval` fires immediately on first poll;
+                    // discard that tick so we don't double-fire timer
+                    // rules at t=0.
+                    iv.tick().await;
+                    Some(iv)
+                } else {
+                    None
+                };
+
+                // Main streaming loop. Inside each iteration we pull
+                // *one* event source — a token or a tick — produce at
+                // most one released chunk from the planner, then
+                // synchronously drain the single-flight dispatch chain
+                // that one chunk unlocks before looping back. This
+                // satisfies the spec §3.6 single-flight invariant
+                // without any cross-task coordination.
+                let mut llm_done = false;
+                while !llm_done {
+                    // Read a single event source. Returns the chunk
+                    // (if any) that the planner released as a result.
+                    let released: Option<ReleasedChunk> = if let Some(iv) = tick_interval.as_mut() {
+                        tokio::select! {
+                            biased;
+                            item = token_stream.next() => match item {
+                                Some(Ok(ChatToken::TextDelta { text })) => {
+                                    accumulated.push_str(&text);
+                                    let chunk = planner
+                                        .as_mut()
+                                        .and_then(|p| p.push(&text, clock.now_ms()).into_iter().next());
+                                    yield OrchestratorEvent::Token { delta: text };
+                                    chunk
+                                }
+                                Some(Ok(ChatToken::Done { usage })) => {
+                                    if let Some(u) = usage { final_usage = u; }
+                                    None
+                                }
+                                Some(Err(e)) => {
+                                    yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
+                                    llm_errored = true;
+                                    llm_done = true;
+                                    None
+                                }
+                                None => {
+                                    llm_done = true;
+                                    None
+                                }
+                            },
+                            _ = iv.tick() => {
+                                planner
+                                    .as_mut()
+                                    .and_then(|p| p.tick(clock.now_ms()).into_iter().next())
+                            }
+                        }
+                    } else {
+                        // Text-only path: no chunker, no ticks.
+                        match token_stream.next().await {
+                            Some(Ok(ChatToken::TextDelta { text })) => {
+                                accumulated.push_str(&text);
+                                yield OrchestratorEvent::Token { delta: text };
+                                None
                             }
                             Some(Ok(ChatToken::Done { usage })) => {
                                 if let Some(u) = usage { final_usage = u; }
@@ -567,59 +701,43 @@ impl ConversationOrchestrator {
                                 llm_done = true;
                                 None
                             }
-                        },
-                        _ = iv.tick() => {
-                            planner
-                                .as_mut()
-                                .and_then(|p| p.tick(clock.now_ms()).into_iter().next())
                         }
-                    }
-                } else {
-                    // Text-only path: no chunker, no ticks.
-                    match token_stream.next().await {
-                        Some(Ok(ChatToken::TextDelta { text })) => {
-                            accumulated.push_str(&text);
-                            yield OrchestratorEvent::Token { delta: text };
-                            None
-                        }
-                        Some(Ok(ChatToken::Done { usage })) => {
-                            if let Some(u) = usage { final_usage = u; }
-                            None
-                        }
-                        Some(Err(e)) => {
-                            yield OrchestratorEvent::Failed { message: format_llm_error(&e) };
-                            llm_errored = true;
-                            llm_done = true;
-                            None
-                        }
-                        None => {
-                            llm_done = true;
-                            None
-                        }
-                    }
-                };
+                    };
 
-                // Single-flight dispatch chain. The planner only
-                // releases one chunk at a time (`try_release` short-
-                // circuits while `synthesis_in_flight` is true), so
-                // this inner loop can dispatch at most one chunk
-                // per LLM event — but `synthesis_completed` may
-                // unlock a second paragraph that was already
-                // waiting in the buffer, hence the `while`.
-                let mut next_chunk = released;
-                while let Some(chunk) = next_chunk.take() {
-                    let idx = chunk.index;
-                    if let Some(t) = tts.as_mut() {
-                        let events = t
-                            .dispatch_chunk(&ctx, chunk, &chunk_policy)
-                            .await;
-                        for ev in events { yield ev; }
+                    // Single-flight dispatch chain. The planner only
+                    // releases one chunk at a time (`try_release` short-
+                    // circuits while `synthesis_in_flight` is true), so
+                    // this inner loop can dispatch at most one chunk
+                    // per LLM event — but `synthesis_completed` may
+                    // unlock a second paragraph that was already
+                    // waiting in the buffer, hence the `while`.
+                    let mut next_chunk = released;
+                    while let Some(chunk) = next_chunk.take() {
+                        let idx = chunk.index;
+                        if let Some(t) = tts.as_mut() {
+                            let events = t.dispatch_chunk(&ctx, chunk, &chunk_policy).await;
+                            for ev in events { yield ev; }
+                        }
+                        if let Some(p) = planner.as_mut() {
+                            next_chunk = p
+                                .synthesis_completed(idx, clock.now_ms())
+                                .into_iter()
+                                .next();
+                        }
                     }
-                    if let Some(p) = planner.as_mut() {
-                        next_chunk = p
-                            .synthesis_completed(idx, clock.now_ms())
-                            .into_iter()
-                            .next();
+                }
+
+                // Flush remaining buffered text on stream end. R6
+                // (`finish`) bypasses single-flight and may emit
+                // multiple chunks at once when the buffer holds more
+                // than one paragraph; dispatch them serially so the
+                // cache and broadcast frames stay ordered.
+                if let Some(p) = planner.as_mut()
+                    && let Some(t) = tts.as_mut()
+                {
+                    for chunk in p.finish(clock.now_ms()) {
+                        let events = t.dispatch_chunk(&ctx, chunk, &chunk_policy).await;
+                        for ev in events { yield ev; }
                     }
                 }
             }
@@ -629,22 +747,6 @@ impl ConversationOrchestrator {
                 yield OrchestratorEvent::StateChanged { state: OrchestratorState::Failed };
                 yield OrchestratorEvent::StateChanged { state: OrchestratorState::Idle };
                 return;
-            }
-
-            // Flush remaining buffered text on stream end. R6
-            // (`finish`) bypasses single-flight and may emit
-            // multiple chunks at once when the buffer holds more
-            // than one paragraph; dispatch them serially so the
-            // cache and broadcast frames stay ordered.
-            if let Some(p) = planner.as_mut()
-                && let Some(t) = tts.as_mut()
-            {
-                for chunk in p.finish(clock.now_ms()) {
-                    let events = t
-                        .dispatch_chunk(&ctx, chunk, &chunk_policy)
-                        .await;
-                    for ev in events { yield ev; }
-                }
             }
 
             let (tts_characters, tts_cost) = if let Some(t) = tts.as_ref() {
@@ -979,6 +1081,87 @@ impl TtsTurn {
         events
     }
 
+    /// Start a turn-level streaming TTS session from the orchestrator's
+    /// perspective: publish `TtsStarted` and write the configured first
+    /// silence prefix before provider audio arrives.
+    async fn start_turn_stream(
+        &mut self,
+        ctx: &OrchestratorContext,
+        policy: &ChunkPolicy,
+    ) -> Vec<OrchestratorEvent> {
+        if self.aborted || self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        let mut events = vec![OrchestratorEvent::TtsStarted {
+            turn_id: self.turn_id.clone(),
+        }];
+
+        if let Some(splicer) = ctx.silence_splicer.as_ref() {
+            let bytes = splicer.silence(policy.first_chunk_silence_ms);
+            if !bytes.is_empty()
+                && let Err(e) = self.write_audio_bytes(bytes).await
+            {
+                events.push(OrchestratorEvent::Failed {
+                    message: format!("tts cache write failed: {e}"),
+                });
+                self.abort(format!("tts cache write failed: {e}")).await;
+            }
+        }
+        events
+    }
+
+    /// Consume one provider output frame from a turn-level streaming
+    /// session. Returns `(events, done)` where `done` means the
+    /// provider sent `TtsChunk::Done` and the audio stream is complete.
+    async fn dispatch_turn_stream_frame(
+        &mut self,
+        frame: Option<Result<TtsChunk, crate::tts::TtsError>>,
+    ) -> (Vec<OrchestratorEvent>, bool) {
+        if self.aborted {
+            return (Vec::new(), true);
+        }
+        let mut events = Vec::new();
+        match frame {
+            Some(Ok(TtsChunk::Audio(bytes))) => {
+                if let Err(e) = self.write_audio_bytes(bytes).await {
+                    events.push(OrchestratorEvent::Failed {
+                        message: format!("tts cache write failed: {e}"),
+                    });
+                    self.abort(format!("tts cache write failed: {e}")).await;
+                    return (events, true);
+                }
+                (events, false)
+            }
+            Some(Ok(TtsChunk::Done { characters })) => {
+                let idx = self.sentence_index;
+                self.sentence_index += 1;
+                self.total_characters = self.total_characters.saturating_add(characters);
+                events.push(OrchestratorEvent::TtsSentenceDone {
+                    turn_id: self.turn_id.clone(),
+                    sentence_index: idx,
+                    characters,
+                });
+                (events, true)
+            }
+            Some(Err(e)) => {
+                events.push(OrchestratorEvent::Failed {
+                    message: format!("tts stream error: {e}"),
+                });
+                self.abort(format!("tts stream error: {e}")).await;
+                (events, true)
+            }
+            None => {
+                events.push(OrchestratorEvent::Failed {
+                    message: "tts stream ended without Done frame".into(),
+                });
+                self.abort("tts stream ended without Done frame".into())
+                    .await;
+                (events, true)
+            }
+        }
+    }
+
     /// Write `bytes` to the cache and broadcast them to live
     /// subscribers in the spec-mandated order: cache first, then
     /// broadcast. The cache file is always at least as long as
@@ -1119,6 +1302,21 @@ fn resolve_system_prompt(
 /// the event stream.
 fn format_llm_error(e: &LlmError) -> String {
     e.to_string()
+}
+
+async fn send_turn_stream_text(
+    provider: &Arc<dyn TtsProvider>,
+    text_tx: &tokio::sync::mpsc::Sender<TtsTextFrame>,
+    text: &str,
+) -> Result<(), String> {
+    let synthesizable_text = provider.translate_expression_tags(text);
+    if !has_synthesizable_content(&synthesizable_text) {
+        return Ok(());
+    }
+    text_tx
+        .send(TtsTextFrame::Delta(synthesizable_text))
+        .await
+        .map_err(|_| "tts text stream closed".to_string())
 }
 
 // async-stream provides the `stream! { ... }` macro used in
@@ -1612,7 +1810,10 @@ mod tests {
 
     // ----- TTS wiring -----
 
-    use crate::tts::{FsTtsCache, TtsChunk, TtsError, TtsHub, TtsProvider, TtsRequest, TtsStream};
+    use crate::tts::{
+        FsTtsCache, TtsChunk, TtsError, TtsHub, TtsProvider, TtsRequest, TtsStream, TtsTextFrame,
+        TurnTextStream,
+    };
     use async_trait::async_trait;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
@@ -1633,6 +1834,8 @@ mod tests {
         captured: StdMutex<Vec<TtsRequest>>,
         captured_ctx: StdMutex<Vec<crate::tts::SynthesisContext>>,
         tuned_chunk_policy: Option<parley_core::tts::ChunkPolicy>,
+        turn_stream: StdMutex<Option<(Vec<Vec<u8>>, u32)>>,
+        captured_turn_frames: StdArc<StdMutex<Vec<TtsTextFrame>>>,
     }
 
     impl MockTtsProvider {
@@ -1642,6 +1845,18 @@ mod tests {
                 captured: StdMutex::new(Vec::new()),
                 captured_ctx: StdMutex::new(Vec::new()),
                 tuned_chunk_policy: None,
+                turn_stream: StdMutex::new(None),
+                captured_turn_frames: StdArc::new(StdMutex::new(Vec::new())),
+            }
+        }
+        fn with_turn_stream(audio_chunks: Vec<Vec<u8>>, characters: u32) -> Self {
+            Self {
+                script: StdMutex::new(Vec::new()),
+                captured: StdMutex::new(Vec::new()),
+                captured_ctx: StdMutex::new(Vec::new()),
+                tuned_chunk_policy: None,
+                turn_stream: StdMutex::new(Some((audio_chunks, characters))),
+                captured_turn_frames: StdArc::new(StdMutex::new(Vec::new())),
             }
         }
         fn with_tuned_chunk_policy(
@@ -1653,6 +1868,8 @@ mod tests {
                 captured: StdMutex::new(Vec::new()),
                 captured_ctx: StdMutex::new(Vec::new()),
                 tuned_chunk_policy: Some(tuned_chunk_policy),
+                turn_stream: StdMutex::new(None),
+                captured_turn_frames: StdArc::new(StdMutex::new(Vec::new())),
             }
         }
         fn captured(&self) -> Vec<TtsRequest> {
@@ -1660,6 +1877,9 @@ mod tests {
         }
         fn captured_ctx(&self) -> Vec<crate::tts::SynthesisContext> {
             self.captured_ctx.lock().unwrap().clone()
+        }
+        fn captured_turn_frames(&self) -> Vec<TtsTextFrame> {
+            self.captured_turn_frames.lock().unwrap().clone()
         }
     }
 
@@ -1696,6 +1916,39 @@ mod tests {
                     Ok(Box::pin(futures::stream::iter(frames)))
                 }
             }
+        }
+        fn supports_turn_text_stream(&self) -> bool {
+            self.turn_stream.lock().unwrap().is_some()
+        }
+        async fn open_turn_text_stream(
+            &self,
+            _request: crate::tts::TtsTurnStreamRequest,
+        ) -> Result<TurnTextStream, TtsError> {
+            let (audio_chunks, characters) = self
+                .turn_stream
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| TtsError::Other("turn stream script exhausted".into()))?;
+            let captured = self.captured_turn_frames.clone();
+            let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<TtsTextFrame>(64);
+            let stream = async_stream::try_stream! {
+                while let Some(frame) = text_rx.recv().await {
+                    let done = matches!(frame, TtsTextFrame::Done);
+                    captured.lock().unwrap().push(frame);
+                    if done {
+                        break;
+                    }
+                }
+                for bytes in audio_chunks {
+                    yield TtsChunk::Audio(bytes);
+                }
+                yield TtsChunk::Done { characters };
+            };
+            Ok(TurnTextStream {
+                text_tx,
+                audio: Box::pin(stream),
+            })
         }
         fn cost(&self, characters: u32) -> Cost {
             // $0.000015/char so the math matches ElevenLabsTts and
@@ -2173,5 +2426,73 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].text, "One. Two. Three.");
         assert_eq!(calls[1].text, "Next paragraph.");
+    }
+
+    #[tokio::test]
+    async fn turn_text_stream_coalesces_short_paragraphs_without_chunk_synthesis() {
+        let llm = Arc::new(MockProvider::new(
+            "p",
+            vec![
+                MockItem::Text("Right.\n\n".into()),
+                MockItem::Text("Exactly.\n\n".into()),
+                MockItem::Text("Now the body starts.".into()),
+            ],
+            TokenUsage::default(),
+        ));
+        let mock_tts = StdArc::new(MockTtsProvider::with_turn_stream(
+            vec![vec![0xAA, 0xBB]],
+            40,
+        ));
+        let (o, _hub, _tmp) = build_with_tts(
+            sample_persona("scholar", "m1", "x"),
+            sample_model("m1"),
+            llm,
+            mock_tts.clone(),
+        );
+
+        let events = drain(&o, "hi").await;
+
+        assert!(
+            mock_tts.captured().is_empty(),
+            "stream-capable provider should bypass chunked synthesize()"
+        );
+        assert_eq!(
+            mock_tts.captured_turn_frames(),
+            vec![
+                TtsTextFrame::Delta("Right.\n\nExactly.\n\n".into()),
+                TtsTextFrame::Delta("Now the body starts.".into()),
+                TtsTextFrame::Done,
+            ]
+        );
+
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, OrchestratorEvent::TtsStarted { .. }))
+            .count();
+        assert_eq!(started, 1);
+        let sentence_done = events.iter().find_map(|e| match e {
+            OrchestratorEvent::TtsSentenceDone {
+                sentence_index,
+                characters,
+                ..
+            } => Some((*sentence_index, *characters)),
+            _ => None,
+        });
+        assert_eq!(sentence_done, Some((0, 40)));
+        let finished_total = events.iter().find_map(|e| match e {
+            OrchestratorEvent::TtsFinished {
+                total_characters, ..
+            } => Some(*total_characters),
+            _ => None,
+        });
+        assert_eq!(finished_total, Some(40));
+
+        let snap = o.session_snapshot().await;
+        assert_eq!(
+            snap.turns[1].content,
+            "Right.\n\nExactly.\n\nNow the body starts."
+        );
+        let prov = snap.turns[1].provenance.as_ref().unwrap();
+        assert_eq!(prov.tts_characters, 40);
     }
 }

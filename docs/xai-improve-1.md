@@ -57,6 +57,7 @@ Conclusion: for this first slice, implement xAI point-tag support using the exis
 - Enable xAI as an expressive-tag-capable provider.
 - Translate safe point-shaped neutral tags into xAI native inline event tags.
 - Tune xAI REST chunking toward paragraph-shaped requests because the REST endpoint has no provider-side continuation field.
+- Add the provider-level xAI WebSocket TTS transport primitive and orchestrator paragraph-lookahead feeder so one synthesis session stays open for the whole assistant turn.
 - Add unit tests for xAI tag capability and tag translation.
 - Update stale comments/docs that say xAI cannot render expressive tags.
 - Preserve provider neutrality: persona prompts use `{warm}`, `{pause:short}`, etc., never raw `[pause]` or `<soft>` xAI syntax.
@@ -64,7 +65,6 @@ Conclusion: for this first slice, implement xAI point-tag support using the exis
 
 ### Out of Scope
 
-- Full xAI WebSocket TTS adapter.
 - Replacing the current `TtsProvider` trait with `TtsInput` / `ExpressionSpan`.
 - A Haiku-backed post-LLM annotator pass.
 - Raw xAI tags in persona files or user-authored prompts.
@@ -73,7 +73,7 @@ Conclusion: for this first slice, implement xAI point-tag support using the exis
 ### Deferred
 
 - Scoped expression spans for wrapping tags.
-- Long-lived xAI WebSocket per turn or per session.
+- Timer-based escape hatch for a lone short paragraph when the LLM stalls before producing more context.
 - Undocumented xAI request fields for previous/next text context.
 - Listening-test harness and saved A/B audio artifacts.
 - Rich provider expression capability data beyond `expression_tag_instruction()` for future span-aware renderers, as anticipated by [Hume Octave 2 TTS Integration §10](hume-octave-2-tts-integration-spec.md#10-expression-strategy).
@@ -95,6 +95,10 @@ Conclusion: for this first slice, implement xAI point-tag support using the exis
 | XAI-PROS-09 | Existing non-xAI providers keep their current expression behavior. | Existing ElevenLabs / Cartesia / orchestrator tests continue to pass. |
 | XAI-PROS-10 | `XaiTts::tune_chunk_policy()` disables the eager first-chunk sentence-count split and aligns idle timeout with paragraph wait. | xAI provider unit test. |
 | XAI-PROS-11 | The orchestrator uses the active TTS provider's tuned chunk policy before constructing `ChunkPlanner`. | Orchestrator regression test proving a tuned provider keeps a three-sentence first paragraph in one TTS request. |
+| XAI-PROS-12 | `TtsProvider` exposes an optional turn-level text stream contract; providers that do not support it remain on the chunked `synthesize()` path. | Default trait behavior returns `TtsError::Unsupported`; xAI capability unit test returns true. |
+| XAI-PROS-13 | `XaiTts::open_turn_text_stream()` opens `wss://api.x.ai/v1/tts`, sends repeated `text.delta` frames, sends one `text.done`, decodes `audio.delta` base64, and yields `Done` on `audio.done`. | xAI provider unit test against a local WebSocket fixture. |
+| XAI-PROS-14 | `ParagraphLookaheadFeeder` releases substantial paragraphs, coalesces short paragraphs, preserves paragraph separators, hard-caps pathological pending text, and drains final text at turn end. | `parley-core::tts::lookahead` unit tests. |
+| XAI-PROS-15 | The orchestrator uses the turn-level stream for providers that opt in, feeds translated paragraph-lookahead deltas, bypasses chunked `synthesize()`, writes incoming audio to the existing cache/hub path, and falls back to chunked synthesis when stream open fails. | Orchestrator regression test using a streaming-capable mock TTS provider. |
 
 ## 7. Initial Translation Table
 
@@ -125,6 +129,27 @@ xAI's REST `/v1/tts` path has no documented equivalent of ElevenLabs `previous_t
 Effect: when the LLM emits a complete paragraph quickly, xAI receives that paragraph as one synthesis request instead of two smaller requests. That gives xAI more local context for intonation and reduces audible request resets. When no paragraph break arrives, the existing paragraph wait, hard cap, and stream-end rules still bound latency and request size.
 
 This is provider-specific on purpose. Providers with native continuation can keep the lower-latency default policy; xAI REST trades some time-to-first-audio for fewer chunk boundaries.
+
+## 8.1 Paragraph Lookahead Streaming Direction
+
+The WebSocket path is the long-term fix for xAI's pitch/register resets. REST chunking still makes each paragraph an independent synthesis request; the WebSocket path keeps one provider-side session alive and lets Parley send `text.delta` frames as the LLM produces clean text units.
+
+The implemented path has three layers:
+
+- `TtsProvider` exposes an optional turn-level text stream contract.
+- `XaiTts` implements that contract with the verified [`wss://api.x.ai/v1/tts`](research/xai-ws-protocol.md#tts--wssapixai-v1tts) protocol.
+- `ConversationOrchestrator` uses `ParagraphLookaheadFeeder` for providers that opt in, sends translated `text.delta` frames, and writes incoming audio through the existing cache/hub path.
+
+The orchestrator behavior is intentionally conservative:
+
+- Keep one xAI WebSocket open for the assistant turn.
+- Buffer raw LLM tokens until expression tags and punctuation can be translated safely.
+- Send completed paragraphs promptly, preserving `\n\n` boundaries inside one continuous session.
+- Coalesce very short paragraphs before sending.
+- Continue writing `audio.delta` bytes into the existing cache and live broadcast path as soon as they arrive.
+- Fall back to the REST chunking path when the WebSocket open fails before any audio has been published.
+
+Deferred refinement: add a timer-based startup escape hatch for a lone short paragraph when the LLM pauses before producing more text. The first production path waits for another paragraph, a hard cap, or turn end.
 
 ## 9. Span Follow-Up Design
 

@@ -622,11 +622,14 @@ Documented checklist for Gavin to run once, against the live xAI API with a real
 
 ### 12.1 xAI TTS WebSocket Streaming
 
-Today both ElevenLabs and (per this spec) xAI TTS dispatch via unary HTTP per sentence, matching VS-3 in [conversation-voice-slice-spec.md §2.4](conversation-voice-slice-spec.md). xAI publishes a streaming WS endpoint ([§5.5](#55-tts--websocket-streaming)) that accepts `text.delta` frames and returns `audio.delta` frames — a different dispatch shape than the per-sentence loop the `ChunkPlanner` drives. Evaluating this means either:
-- Extending the `TtsProvider` trait with an optional `synthesize_stream(text_stream)` method, or
-- Swapping the orchestrator's dispatch loop to route whole-turn text directly to the provider when the provider opts in.
+ElevenLabs still dispatches through the chunked provider loop, matching VS-3 in [conversation-voice-slice-spec.md §2.4](conversation-voice-slice-spec.md). xAI now opts into the streaming WS endpoint ([§5.5](#55-tts--websocket-streaming)) through `XaiTts::open_turn_text_stream()` and the orchestrator's paragraph-lookahead stream branch (see [xAI TTS Prosody Improvement 1 §8.1](xai-improve-1.md#81-paragraph-lookahead-streaming-direction)). This path accepts `text.delta` frames and returns `audio.delta` frames inside one continuous provider-side synthesis session.
 
-Both are orchestrator-shape changes, not provider-shape changes, and therefore out of scope for this spec. A `ProviderContinuationState::XaiTts(...)` variant would likely fall out of that work.
+Implemented shape:
+
+- `TtsProvider::supports_turn_text_stream()` advertises opt-in support.
+- `TtsProvider::open_turn_text_stream()` returns a text-frame sender plus an audio stream.
+- `ConversationOrchestrator` feeds `ParagraphLookaheadFeeder` deltas to the provider and writes audio frames to the existing cache/hub path.
+- Providers that do not opt in, or providers whose stream fails to open before audio starts, stay on the existing chunked synthesis path.
 
 ### 12.2 Voice Agent API
 
@@ -667,7 +670,7 @@ If xAI exposes a short-lived-token endpoint analogous to AssemblyAI, move STT st
 
 ### 13.2 Out of Scope (Deferred / Tracked)
 
-- xAI TTS WebSocket streaming dispatch (§12.1). v1 routes xAI TTS through the existing per-sentence HTTP loop the orchestrator already drives for ElevenLabs.
+- Adaptive xAI TTS WebSocket lookahead tuning beyond the implemented paragraph feeder (§12.1), including timer-based release of a lone short paragraph.
 - Voice Agent API (§12.2).
 - STT direct-connect for xAI (§12.3).
 - Multichannel capture pipeline (§12.4).

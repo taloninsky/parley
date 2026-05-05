@@ -12,9 +12,11 @@
 //! Spec reference: `docs/conversation-voice-slice-spec.md` §4.1.
 
 pub mod chunking;
+pub mod lookahead;
 pub mod sentence;
 
 pub use chunking::{ChunkPlanner, ChunkPolicy, ReleasedChunk};
+pub use lookahead::{LookaheadPolicy, ParagraphLookaheadFeeder};
 pub use sentence::{SentenceChunk, SentenceChunker};
 
 use serde::{Deserialize, Serialize};

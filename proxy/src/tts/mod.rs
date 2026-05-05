@@ -21,6 +21,7 @@ use futures::Stream;
 use parley_core::chat::Cost;
 use parley_core::tts::{ChunkPolicy, VoiceDescriptor};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 // Re-exports kept here so the orchestrator and HTTP layer can
 // reference `crate::tts::Foo` instead of going through the
@@ -108,6 +109,35 @@ pub enum TtsError {
 /// like `LlmProvider::stream_chat` so the orchestrator's loop shape
 /// is symmetric.
 pub type TtsStream = Pin<Box<dyn Stream<Item = Result<TtsChunk, TtsError>> + Send>>;
+
+/// One turn-level streaming TTS request. Unlike [`TtsRequest`], this
+/// does not carry all text up front; callers feed text deltas through
+/// [`TurnTextStream::text_tx`] while audio arrives concurrently.
+#[derive(Debug, Clone)]
+pub struct TtsTurnStreamRequest {
+    /// Voice identifier as understood by the provider.
+    pub voice_id: String,
+}
+
+/// Text input sent to a turn-level streaming TTS session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TtsTextFrame {
+    /// Additional synthesizable text. Providers may buffer or forward
+    /// it immediately depending on their native protocol.
+    Delta(String),
+    /// No more text will arrive for this turn.
+    Done,
+}
+
+/// Full-duplex turn-level TTS session. The caller sends text frames
+/// into `text_tx`; the provider emits audio frames on `audio`.
+pub struct TurnTextStream {
+    /// Text input sink. Dropping this sender is equivalent to sending
+    /// [`TtsTextFrame::Done`].
+    pub text_tx: mpsc::Sender<TtsTextFrame>,
+    /// Provider audio output stream.
+    pub audio: TtsStream,
+}
 
 /// Audio container/codec shape a [`TtsProvider`] returns. The enum
 /// exists so the `SilenceSplicer` can pick matching zero-energy
@@ -391,6 +421,28 @@ pub trait TtsProvider: Send + Sync {
         request: TtsRequest,
         ctx: SynthesisContext,
     ) -> Result<TtsStream, TtsError>;
+
+    /// Whether this provider supports one continuous TTS session for
+    /// a whole assistant turn. Providers that return `true` should
+    /// implement [`Self::open_turn_text_stream`].
+    fn supports_turn_text_stream(&self) -> bool {
+        false
+    }
+
+    /// Open a full-duplex turn-level text stream. This is the native
+    /// shape for providers such as xAI's TTS WebSocket, where Parley
+    /// can send `text.delta` frames while audio frames arrive from the
+    /// same session. REST-style providers keep the default
+    /// `Unsupported` implementation and continue using paragraph
+    /// chunking through [`Self::synthesize`].
+    async fn open_turn_text_stream(
+        &self,
+        _request: TtsTurnStreamRequest,
+    ) -> Result<TurnTextStream, TtsError> {
+        Err(TtsError::Unsupported(
+            "turn-level text streaming is not supported by this provider".into(),
+        ))
+    }
 
     /// Audio format produced by [`Self::synthesize`]. Used by the
     /// `SilenceSplicer` to pick a matching silence frame.
